@@ -18,4 +18,4 @@ The Toledo project definition is packaged at `src/toledo_orchestrator/projects/t
 
 The first milestone is deliberately read-only. It has no general routing, database, UI, implementation worktree, remote execution, or automatic retry after an unknown provider invocation.
 
-This repository is intentionally unsynced per the implementation plan and currently has no backup remote. Configure an approved remote separately before treating it as durable against local disk loss.
+The working repository remains outside OneDrive. Its `origin` is a bare durability mirror at `C:\Users\sammo\OneDrive\Documents\toledo-orchestrator.git`; push each accepted local commit with `git push origin main`. The mirror protects the only-copy failure once OneDrive sync completes, while avoiding a synced working tree. It is not a substitute for a future independent hosted backup if stronger disaster recovery is needed.
