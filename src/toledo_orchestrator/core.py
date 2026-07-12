@@ -10,15 +10,31 @@ import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
+from .locking import run_lock
 from .project import ProjectDefinition, load_projects
 
 
 ALLOWED_NEXT = frozenset({"continue", "ready", "human"})
 FENCE = re.compile(r"```orchestrator\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE)
+SENTINEL = re.compile(r"^ORCHESTRATOR_DIRECTIVE_V2:\s*(\{[^\r\n]*\})\s*$", re.MULTILINE)
+SENTINEL_LINE = re.compile(r"^ORCHESTRATOR_DIRECTIVE_V2:.*(?:\r?\n|$)", re.MULTILINE)
 RUN_ID = re.compile(r"run_\d{8}T\d{6}Z_[0-9a-f]{8}")
+
+
+T = TypeVar("T")
+
+
+def _locked_run(method: Callable[..., T]) -> Callable[..., T]:
+    @wraps(method)
+    def wrapper(self: "Orchestrator", run_id: str, *args: Any, **kwargs: Any) -> T:
+        with run_lock(self._run_dir(run_id)):
+            return method(self, run_id, *args, **kwargs)
+
+    return wrapper
 
 
 def sha256(data: bytes) -> str:
@@ -74,6 +90,26 @@ def extract_directive(text: str) -> Directive | None:
         native = None
     if isinstance(native, dict) and native.get("next") in ALLOWED_NEXT:
         return Directive(next=native["next"], ignored_fields=tuple(sorted(key for key in native if key != "next")), source="native")
+    sentinel_candidates: list[tuple[re.Match[str], dict[str, Any]]] = []
+    for match in SENTINEL.finditer(text):
+        try:
+            value = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("next") in ALLOWED_NEXT:
+            sentinel_candidates.append((match, value))
+    sentinel_final = [(match, value) for match, value in sentinel_candidates if not text[match.end():].strip()]
+    if sentinel_final:
+        _, value = sentinel_final[-1]
+        sentinel_lines = list(SENTINEL_LINE.finditer(text))
+        values = {candidate["next"] for _, candidate in sentinel_candidates}
+        return Directive(
+            next=value["next"],
+            ignored_fields=tuple(sorted(key for key in value if key != "next")),
+            source="sentinel-v2",
+            conflict=len(sentinel_lines) != 1 or len(values) > 1,
+            valid_block_count=len(sentinel_lines),
+        )
     candidates: list[tuple[re.Match[str], dict[str, Any]]] = []
     for match in FENCE.finditer(text):
         try:
@@ -104,6 +140,9 @@ def has_substantive_work(text: str, directive: Directive | None) -> bool:
 
 def work_product_text(text: str) -> str:
     """Remove process-control fences from the derivative work-product channel."""
+    final_sentinel = [match for match in SENTINEL.finditer(text) if not text[match.end():].strip()]
+    if final_sentinel:
+        return SENTINEL_LINE.sub("", text).strip()
     return FENCE.sub("", text).strip()
 
 
@@ -120,6 +159,13 @@ class ProviderResult:
     usage: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     response_text: str | None = None
+    configured_model: str = "provider-default"
+    configured_reasoning: str = "provider-default"
+    observed_reasoning: str | None = None
+    model_usage: dict[str, Any] = field(default_factory=dict)
+    observation_source: str | None = None
+    observation_error: str | None = None
+    session_action: str = "new"
 
     @property
     def text(self) -> str:
@@ -149,6 +195,28 @@ class ProviderAdapter:
 
     def invoke(self, route: str, prompt: bytes, working_directory: Path) -> ProviderResult:
         raise NotImplementedError
+
+    def invoke_configured(
+        self,
+        route: str,
+        prompt: bytes,
+        working_directory: Path,
+        *,
+        model: str = "provider-default",
+        reasoning: str = "provider-default",
+        permission: str = "read-only",
+        session_action: str = "new",
+        session_id: str | None = None,
+        timeout: int | None = None,
+    ) -> ProviderResult:
+        """Compatibility path for fixture/custom adapters that do not need CLI flags."""
+        if session_action == "continue" and not session_id:
+            raise ValueError("continuing a provider session requires a session id")
+        result = self.invoke(route, prompt, working_directory)
+        result.configured_model = model
+        result.configured_reasoning = reasoning
+        result.session_action = session_action
+        return result
 
     @staticmethod
     def _probe(command: list[str], cwd: Path | None = None, timeout: int = 15) -> tuple[int, str, str]:
@@ -183,6 +251,49 @@ class CodexAdapter(ProviderAdapter):
         ]
         stdout, stderr, exit_code, elapsed = self._run(command, prompt, working_directory, self.timeout)
         return parse_codex_result(route, stdout, stderr, exit_code, elapsed)
+
+    def invoke_configured(
+        self,
+        route: str,
+        prompt: bytes,
+        working_directory: Path,
+        *,
+        model: str = "provider-default",
+        reasoning: str = "provider-default",
+        permission: str = "read-only",
+        session_action: str = "new",
+        session_id: str | None = None,
+        timeout: int | None = None,
+    ) -> ProviderResult:
+        if session_action not in {"new", "continue"}:
+            raise ValueError(f"unsupported Codex session action: {session_action}")
+        if session_action == "continue" and not session_id:
+            raise ValueError("continuing a Codex session requires a session id")
+        executable = self.executable_path()
+        common: list[str] = ["-c", 'approval_policy="never"', "--skip-git-repo-check", "--json"]
+        if model != "provider-default":
+            common.extend(["-m", model])
+        if reasoning != "provider-default":
+            common.extend(["-c", f'model_reasoning_effort="{reasoning}"'])
+        if session_action == "new":
+            command = [executable, "exec", "--sandbox", permission, *common, "-"]
+        else:
+            common.extend(["-c", f'sandbox_mode="{permission}"'])
+            command = [executable, "exec", "resume", *common, str(session_id), "-"]
+        stdout, stderr, exit_code, elapsed = self._run(command, prompt, working_directory, timeout or self.timeout)
+        result = parse_codex_result(route, stdout, stderr, exit_code, elapsed)
+        result.configured_model = model
+        result.configured_reasoning = reasoning
+        result.session_action = session_action
+        if result.session_id:
+            observed_model, observed_reasoning, source, error = observe_codex_rollout(result.session_id)
+            result.observed_model = result.observed_model or observed_model
+            result.observed_reasoning = observed_reasoning
+            result.observation_source = source
+            result.observation_error = error
+        else:
+            result.observation_error = "provider response did not include a session id"
+        return result
 
     def check(self) -> dict[str, Any]:
         executable = self.executable_path()
@@ -229,6 +340,38 @@ class ClaudeAdapter(ProviderAdapter):
         command = [self.executable_path(), "-p", "--output-format", "json", "--permission-mode", "plan"]
         stdout, stderr, exit_code, elapsed = self._run(command, prompt, working_directory, self.timeout)
         return parse_claude_result(route, stdout, stderr, exit_code, elapsed)
+
+    def invoke_configured(
+        self,
+        route: str,
+        prompt: bytes,
+        working_directory: Path,
+        *,
+        model: str = "provider-default",
+        reasoning: str = "provider-default",
+        permission: str = "read-only",
+        session_action: str = "new",
+        session_id: str | None = None,
+        timeout: int | None = None,
+    ) -> ProviderResult:
+        if session_action not in {"new", "continue"}:
+            raise ValueError(f"unsupported Claude session action: {session_action}")
+        if session_action == "continue" and not session_id:
+            raise ValueError("continuing a Claude session requires a session id")
+        mode = "plan" if permission == "read-only" else "acceptEdits"
+        command = [self.executable_path(), "-p", "--output-format", "json", "--permission-mode", mode]
+        if model != "provider-default":
+            command.extend(["--model", model])
+        if reasoning != "provider-default":
+            command.extend(["--effort", reasoning])
+        if session_action == "continue":
+            command.extend(["--resume", str(session_id)])
+        stdout, stderr, exit_code, elapsed = self._run(command, prompt, working_directory, timeout or self.timeout)
+        result = parse_claude_result(route, stdout, stderr, exit_code, elapsed)
+        result.configured_model = model
+        result.configured_reasoning = reasoning
+        result.session_action = session_action
+        return result
 
     def check(self) -> dict[str, Any]:
         executable = self.executable_path()
@@ -304,16 +447,54 @@ def parse_codex_result(route: str, stdout: bytes, stderr: bytes = b"", exit_code
     return ProviderResult("codex", route, stdout, stderr, effective_exit, elapsed_ms, observed_model, session_id, usage, provider_error, response)
 
 
+def observe_codex_rollout(session_id: str) -> tuple[str | None, str | None, str | None, str | None]:
+    """Best-effort local observation; rollout persistence is evidence, never a workflow dependency."""
+    root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
+    try:
+        matches = sorted(root.rglob(f"rollout-*-{session_id}.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if not matches:
+            matches = sorted(root.rglob(f"*{session_id}*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if not matches:
+            return None, None, None, "Codex rollout file was not found"
+        model = None
+        effort = None
+        for line in matches[0].read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = event.get("payload") if isinstance(event, dict) else None
+            event_type = event.get("type") if isinstance(event, dict) else None
+            payload_type = payload.get("type") if isinstance(payload, dict) else None
+            if event_type != "turn_context" and payload_type != "turn_context":
+                continue
+            target = payload if isinstance(payload, dict) else event
+            model = _nested_string(target, ("model",)) or model
+            effort = _nested_string(target, ("effort", "model_reasoning_effort")) or effort
+        if model or effort:
+            return model, effort, "codex-rollout", None
+        return None, None, "codex-rollout", "turn_context did not expose model or effort"
+    except OSError as error:
+        return None, None, None, f"Codex rollout observation failed: {error}"
+
+
 def parse_claude_result(route: str, stdout: bytes, stderr: bytes = b"", exit_code: int = 0, elapsed_ms: int = 0) -> ProviderResult:
     session_id = None
     observed_model = None
     usage: dict[str, Any] = {}
     provider_error = None
     response = None
+    model_usage: dict[str, Any] = {}
+    observation_source = None
     try:
         envelope = json.loads(stdout.decode("utf-8"))
         session_id = envelope.get("session_id")
         observed_model = envelope.get("model")
+        if isinstance(envelope.get("modelUsage"), dict):
+            model_usage = dict(envelope["modelUsage"])
+            observation_source = "claude-modelUsage"
+            if not observed_model and len(model_usage) == 1:
+                observed_model = next(iter(model_usage))
         if isinstance(envelope.get("result"), str):
             response = envelope["result"]
         for key in ("total_cost_usd", "duration_ms", "duration_api_ms", "num_turns"):
@@ -324,7 +505,11 @@ def parse_claude_result(route: str, stdout: bytes, stderr: bytes = b"", exit_cod
     except (UnicodeDecodeError, json.JSONDecodeError):
         pass
     effective_exit = exit_code or (1 if provider_error else 0)
-    return ProviderResult("claude", route, stdout, stderr, effective_exit, elapsed_ms, observed_model, session_id, usage, provider_error, response)
+    return ProviderResult(
+        "claude", route, stdout, stderr, effective_exit, elapsed_ms, observed_model, session_id,
+        usage, provider_error, response, model_usage=model_usage, observation_source=observation_source,
+        observation_error=None if observed_model or model_usage else "Claude result did not expose model usage",
+    )
 
 
 def result_text(result: ProviderResult) -> str:
@@ -460,7 +645,7 @@ class Orchestrator:
             "Using the complete original exchange below, return only one valid directive fence. Do not repeat or revise the work product.\n\n"
             "# Original stage prompt\n" + original_prompt.decode("utf-8", errors="strict") + "\n\n"
             "# Original provider output\n" + original_output + "\n\n"
-            "# Required correction\n```orchestrator\n{\"next\":\"continue\"}\n```\n"
+            "# Required correction\nORCHESTRATOR_DIRECTIVE_V2: {\"next\":\"continue\"}\n"
             "Replace `continue` with `ready` or `human` only if that is the justified control decision. Return no other text.\n"
         ).encode("utf-8")
 
@@ -491,6 +676,7 @@ class Orchestrator:
         state["turns"].append(record)
         return record
 
+    @_locked_run
     def advance(self, run_id: str) -> dict[str, Any]:
         state = self.state(run_id)
         if state["status"] in {"complete", "paused", "failed"}:
@@ -554,11 +740,13 @@ class Orchestrator:
         else:
             state["next_route"] = "claude-review"; state["status"] = "running"
 
+    @_locked_run
     def run_to_stop(self, run_id: str) -> dict[str, Any]:
         while self.state(run_id)["status"] not in {"complete", "paused", "failed"}:
             self.advance(run_id)
         return self.state(run_id)
 
+    @_locked_run
     def resume(self, run_id: str, decision: bytes) -> dict[str, Any]:
         state = self.state(run_id)
         if state["status"] != "paused":
@@ -574,6 +762,7 @@ class Orchestrator:
         self._save(run_id, state)
         return self.run_to_stop(run_id)
 
+    @_locked_run
     def attach_receipt(self, run_id: str, receipt_path: Path) -> dict[str, Any]:
         receipt = read_json(receipt_path)
         required = {"validation_id", "command", "source_revision", "environment", "host", "started_at", "finished_at", "exit_code", "stdout_path", "stderr_path", "stdout_sha256", "stderr_sha256"}

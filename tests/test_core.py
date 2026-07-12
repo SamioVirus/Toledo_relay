@@ -17,8 +17,10 @@ from toledo_orchestrator.core import (
     has_substantive_work,
     parse_claude_result,
     parse_codex_result,
+    observe_codex_rollout,
     result_text,
     sha256,
+    work_product_text,
 )
 from toledo_orchestrator.project import ProjectDefinition, ValidationDefinition
 
@@ -97,6 +99,30 @@ def test_directive_flags_conflicting_blocks_and_native_control_only_output():
     assert native and native.source == "native" and not has_substantive_work('{"next":"ready"}', native)
 
 
+def test_v2_sentinel_preserves_embedded_orchestrator_fence():
+    embedded = '```orchestrator\n{"next":"ready"}\n```'
+    output = f"Protocol example:\n{embedded}\n\nKeep this example.\nORCHESTRATOR_DIRECTIVE_V2: {{\"next\":\"continue\"}}"
+    directive = extract_directive(output)
+    assert directive and directive.next == "continue"
+    assert directive.source == "sentinel-v2" and directive.conflict is False
+    assert directive.valid_block_count == 1
+    work = work_product_text(output)
+    assert embedded in work
+    assert work == f"Protocol example:\n{embedded}\n\nKeep this example."
+    assert has_substantive_work(output, directive)
+
+
+def test_multiple_v2_sentinels_are_ambiguous_and_never_leak_into_work_product():
+    output = (
+        'Plan\nORCHESTRATOR_DIRECTIVE_V2: {"next":"continue"}\n'
+        'More work\nORCHESTRATOR_DIRECTIVE_V2: {"next":"ready"}'
+    )
+    directive = extract_directive(output)
+    assert directive and directive.next == "ready"
+    assert directive.conflict is True and directive.valid_block_count == 2
+    assert work_product_text(output) == "Plan\nMore work"
+
+
 def test_fixed_workflow_transports_substantive_outputs_in_project_context(tmp_path: Path, project: ProjectDefinition):
     codex = ScriptedAdapter("codex", [block("continue", "Concrete proposal"), block("ready", "Revised proposal")])
     claude = ScriptedAdapter("claude", [block("continue", "Concrete review finding")])
@@ -153,8 +179,26 @@ def test_claude_transcript_fixture_preserves_work_session_and_usage():
     result = parse_claude_result("claude-review", stdout)
     assert result.session_id == "claude-session-fixture"
     assert result.usage["total_cost_usd"] == 0.0123
+    assert result.observed_model == "claude-fable-5"
+    assert result.observation_source == "claude-modelUsage"
+    assert list(result.model_usage) == ["claude-fable-5"]
     assert result_text(result).startswith("Independent review finding.")
     assert extract_directive(result_text(result)).next == "continue"
+
+
+def test_codex_rollout_observation_is_best_effort_and_reads_effective_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "codex-home"
+    session_id = "019f57ad-4863-7671-b450-ad0d9c3cd25e"
+    rollout = home / "sessions" / "2026" / "07" / "12" / f"rollout-test-{session_id}.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        json.dumps({"type": "turn_context", "payload": {"model": "gpt-test", "effort": "xhigh"}}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    assert observe_codex_rollout(session_id) == ("gpt-test", "xhigh", "codex-rollout", None)
+    missing = observe_codex_rollout("missing")
+    assert missing[:3] == (None, None, None) and "not found" in missing[3]
 
 
 def test_provider_error_envelopes_never_become_work_product():

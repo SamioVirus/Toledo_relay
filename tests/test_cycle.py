@@ -1,0 +1,980 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from toledo_orchestrator.core import ClaudeAdapter, CodexAdapter, ProviderAdapter, ProviderResult, sha256
+from toledo_orchestrator.cycle import CycleOrchestrator
+from toledo_orchestrator.project import ProjectDefinition, ValidationDefinition
+from toledo_orchestrator.workflow import WorkflowDefinition, load_workflows
+
+
+FIXTURES = Path(__file__).with_name("fixtures")
+
+
+def response(next_value: str, work: str) -> str:
+    return f"{work}\n```orchestrator\n{{\"next\":\"{next_value}\"}}\n```"
+
+
+def sentinel(next_value: str, work: str) -> str:
+    return f'{work}\nORCHESTRATOR_DIRECTIVE_V2: {{"next":"{next_value}"}}'
+
+
+class SessionAdapter(ProviderAdapter):
+    def __init__(self, provider: str, scripted: list[tuple[str, str]], writer: bool = False) -> None:
+        self.provider = provider
+        self.scripted = iter(scripted)
+        self.writer = writer
+        self.invocations: list[dict[str, Any]] = []
+        self.counter = 0
+
+    def invoke(self, route: str, prompt: bytes, working_directory: Path) -> ProviderResult:
+        raise AssertionError("cycle tests must use invoke_configured")
+
+    def invoke_configured(self, route: str, prompt: bytes, working_directory: Path, **kwargs: Any) -> ProviderResult:
+        expected_route, output = next(self.scripted)
+        assert route == expected_route
+        action = kwargs["session_action"]
+        if action == "new":
+            self.counter += 1
+            session_id = f"{self.provider}-session-{self.counter}"
+        else:
+            session_id = kwargs["session_id"]
+            assert session_id
+        if self.writer and route in {"implementation", "implementation-repair"}:
+            target = working_directory / "built.txt"
+            previous = target.read_text(encoding="utf-8") if target.exists() else ""
+            target.write_text(previous + route + "\n", encoding="utf-8")
+        self.invocations.append({**kwargs, "route": route, "prompt": prompt, "cwd": working_directory, "session_id": session_id})
+        return ProviderResult(
+            self.provider,
+            route,
+            output.encode("utf-8"),
+            response_text=output,
+            session_id=session_id,
+            configured_model=kwargs["model"],
+            configured_reasoning=kwargs["reasoning"],
+            session_action=action,
+        )
+
+    def check(self) -> dict[str, object]:
+        return {"provider": self.provider, "ready": True, "generation": "fixture"}
+
+
+class ReviewMutatingAdapter(SessionAdapter):
+    def invoke_configured(self, route: str, prompt: bytes, working_directory: Path, **kwargs: Any) -> ProviderResult:
+        result = super().invoke_configured(route, prompt, working_directory, **kwargs)
+        if route == "implementation-review":
+            (working_directory / "post-review.txt").write_text("unreviewed\n", encoding="utf-8")
+        return result
+
+
+class FailedSecondNewAdapter(SessionAdapter):
+    def invoke_configured(self, route: str, prompt: bytes, working_directory: Path, **kwargs: Any) -> ProviderResult:
+        if not self.invocations:
+            return super().invoke_configured(route, prompt, working_directory, **kwargs)
+        expected_route, _ = next(self.scripted)
+        assert route == expected_route and kwargs["session_action"] == "new"
+        session_id = f"{self.provider}-failed-session"
+        self.invocations.append({**kwargs, "route": route, "prompt": prompt, "cwd": working_directory, "session_id": session_id})
+        return ProviderResult(
+            self.provider,
+            route,
+            b"",
+            stderr=b"failed",
+            exit_code=1,
+            session_id=session_id,
+            error="fixture failure",
+        )
+
+
+class ReusedSecondNewAdapter(SessionAdapter):
+    def invoke_configured(self, route: str, prompt: bytes, working_directory: Path, **kwargs: Any) -> ProviderResult:
+        if not self.invocations:
+            return super().invoke_configured(route, prompt, working_directory, **kwargs)
+        expected_route, output = next(self.scripted)
+        assert route == expected_route and kwargs["session_action"] == "new"
+        session_id = str(kwargs["session_id"])
+        self.invocations.append({**kwargs, "route": route, "prompt": prompt, "cwd": working_directory, "session_id": session_id})
+        return ProviderResult(
+            self.provider,
+            route,
+            output.encode("utf-8"),
+            response_text=output,
+            session_id=session_id,
+        )
+
+
+class CrossCycleReusingAdapter(SessionAdapter):
+    def invoke_configured(self, route: str, prompt: bytes, working_directory: Path, **kwargs: Any) -> ProviderResult:
+        prior_plans = sum(item["route"] == "planning-propose" for item in self.invocations)
+        if route != "planning-propose" or prior_plans == 0:
+            return super().invoke_configured(route, prompt, working_directory, **kwargs)
+        expected_route, output = next(self.scripted)
+        assert expected_route == route and kwargs["session_action"] == "new"
+        session_id = f"{self.provider}-session-1"
+        self.invocations.append({**kwargs, "route": route, "prompt": prompt, "cwd": working_directory, "session_id": session_id})
+        return ProviderResult(
+            self.provider,
+            route,
+            output.encode("utf-8"),
+            response_text=output,
+            session_id=session_id,
+        )
+
+
+class FailedThenReusedAdapter(ProviderAdapter):
+    provider = "codex"
+
+    def __init__(self) -> None:
+        self.invocations: list[dict[str, Any]] = []
+
+    def invoke(self, route: str, prompt: bytes, working_directory: Path) -> ProviderResult:
+        raise AssertionError("configured invocation required")
+
+    def invoke_configured(self, route: str, prompt: bytes, working_directory: Path, **kwargs: Any) -> ProviderResult:
+        self.invocations.append({**kwargs, "route": route, "prompt": prompt})
+        session_id = "codex-partial-session"
+        if len(self.invocations) == 1:
+            return ProviderResult("codex", route, b"", stderr=b"failed", exit_code=1, session_id=session_id)
+        output = sentinel("human", "Second attempt")
+        return ProviderResult(
+            "codex", route, output.encode("utf-8"), response_text=output, session_id=session_id
+        )
+
+    def check(self) -> dict[str, object]:
+        return {"provider": self.provider, "ready": True, "generation": "fixture"}
+
+
+@pytest.fixture
+def writable_project(tmp_path: Path) -> ProjectDefinition:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "AGENTS.md").write_text("# Instructions\n", encoding="utf-8")
+    (root / "plan.md").write_text("# Plan\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "seed"],
+        check=True,
+        capture_output=True,
+    )
+    return ProjectDefinition(
+        id="test",
+        root=root.resolve(),
+        read_only=True,
+        instruction_files=("AGENTS.md", "plan.md"),
+        validations=(),
+        implementation_enabled=True,
+        write_allowlist=(".",),
+        commit_on_accept=True,
+        allow_no_validations=True,
+        validation_requires_approval=False,
+    )
+
+
+def make_cycle(tmp_path: Path, project: ProjectDefinition, codex: ProviderAdapter, claude: ProviderAdapter) -> CycleOrchestrator:
+    return CycleOrchestrator(
+        tmp_path / "runtime",
+        {"codex": codex, "claude": claude},
+        {"test": project},
+        load_workflows(),
+    )
+
+
+def test_continuous_cycle_preserves_a_and_b_and_starts_fresh_c(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Initial plan")),
+        ("planning-revise", response("continue", "Revised plan")),
+        ("implementation", response("continue", "Implemented once")),
+        ("implementation-repair", response("continue", "Implemented repair")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", response("continue", "Plan finding")),
+        ("planning-review", response("ready", "Plan approved")),
+        ("implementation-review", response("continue", "Implementation defect")),
+        ("implementation-review", response("ready", "Implementation accepted")),
+        ("next-task", response("human", "Proposed next task")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Build the useful thing", "test")
+    state = app.run_to_stop(run_id)
+
+    assert state["status"] == "paused"
+    assert state["pending_human_decision"] == "next_task_approval"
+    assert state["working_revision"] != state["source_revision"]
+    assert not (writable_project.root / "built.txt").exists()
+    assert (Path(state["execution_worktree"]) / "built.txt").read_text(encoding="utf-8") == (
+        "implementation\nimplementation-repair\n"
+    )
+
+    planner = state["cycles"][0]["sessions"]["planner"]
+    reviewer = state["cycles"][0]["sessions"]["reviewer"]
+    implementer = state["cycles"][0]["sessions"]["implementer"]
+    assert planner["label"] == "A" and planner["active_session_id"] == "codex-session-1"
+    assert reviewer["label"] == "B" and reviewer["active_session_id"] == "claude-session-1"
+    assert implementer["label"] == "C" and implementer["active_session_id"] == "codex-session-2"
+    assert claude.invocations[0]["model"] == "claude-fable-5"
+    assert claude.invocations[2]["model"] == "claude-opus-4-8"
+    assert claude.invocations[-1]["route"] == "next-task"
+    assert claude.invocations[-1]["model"] == "claude-fable-5"
+    assert all(item["session_id"] == "claude-session-1" for item in claude.invocations)
+
+    handoff = state["cycles"][0]["approved_handoff"]
+    assert app.artifact(run_id, handoff).decode("utf-8") == "Revised plan"
+    implementation_prompt = next(item["prompt"] for item in codex.invocations if item["route"] == "implementation")
+    assert b"Revised plan" in implementation_prompt
+    assert b"Plan finding" not in implementation_prompt
+    assert state["cycles"][0]["completion_receipt"]
+    terminal = app.decide(run_id, "no")
+    assert terminal["status"] == "complete"
+    branch = terminal["execution_branch"]
+    assert subprocess.run(
+        ["git", "-C", str(writable_project.root), "show-ref", "--verify", f"refs/heads/{branch}"],
+        capture_output=True,
+    ).returncode == 0
+    cleaned = app.cleanup_worktree(run_id)
+    assert cleaned["execution_worktree_removed"] is True
+    assert not Path(terminal["execution_worktree"]).exists()
+    assert subprocess.run(
+        ["git", "-C", str(writable_project.root), "show-ref", "--verify", f"refs/heads/{branch}"],
+        capture_output=True,
+    ).returncode == 0
+
+
+def test_other_revises_next_task_in_same_reviewer_session(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Plan")),
+        ("implementation", response("continue", "Implementation")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", response("ready", "Plan ready")),
+        ("implementation-review", response("ready", "Implementation ready")),
+        ("next-task", response("human", "First next task")),
+        ("next-task-revise", response("human", "Revised next task")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Task", "test")
+    state = app.run_to_stop(run_id)
+    state = app.decide(run_id, "other", b"Make it smaller and evidence-first.\r\n")
+    assert state["status"] == "paused" and state["pending_human_decision"] == "next_task_approval"
+    assert claude.invocations[-1]["route"] == "next-task-revise"
+    assert claude.invocations[-1]["session_id"] == "claude-session-1"
+    assert b"Make it smaller and evidence-first.\r\n" in claude.invocations[-1]["prompt"]
+    assert app.show_turn(run_id, state["current_turn"]) == "Revised next task"
+
+
+def test_yes_starts_fresh_d_e_f_cycle_from_exact_claude_proposal(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan one")),
+        ("implementation", sentinel("continue", "Build one")),
+        ("planning-propose", sentinel("continue", "Plan two")),
+        ("implementation", sentinel("continue", "Build two")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Plan one ready")),
+        ("implementation-review", sentinel("ready", "Build one ready")),
+        ("next-task", sentinel("human", "Cycle two request\r\n")),
+        ("planning-review", sentinel("ready", "Plan two ready")),
+        ("implementation-review", sentinel("ready", "Build two ready")),
+        ("next-task", sentinel("human", "Cycle three request")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Cycle one request", "test")
+    first = app.run_to_stop(run_id)
+    first_revision = first["working_revision"]
+    second = app.decide(run_id, "yes")
+    assert second["cycle"] == 2 and second["pending_human_decision"] == "next_task_approval"
+    request_path = app._run_dir(run_id) / second["cycles"][1]["request_file"]
+    assert request_path.read_bytes() == b"Cycle two request"
+    sessions = second["cycles"][1]["sessions"]
+    assert sessions["planner"]["label"] == "D" and sessions["planner"]["active_session_id"] == "codex-session-3"
+    assert sessions["reviewer"]["label"] == "E" and sessions["reviewer"]["active_session_id"] == "claude-session-2"
+    assert sessions["implementer"]["label"] == "F" and sessions["implementer"]["active_session_id"] == "codex-session-4"
+    assert second["working_revision"] != first_revision
+    assert second["execution_branch"] == first["execution_branch"]
+    assert [item["model"] for item in claude.invocations] == [
+        "claude-fable-5", "claude-opus-4-8", "claude-fable-5",
+        "claude-fable-5", "claude-opus-4-8", "claude-fable-5",
+    ]
+    assert [item["session_id"] for item in claude.invocations[:3]] == ["claude-session-1"] * 3
+    assert [item["session_id"] for item in claude.invocations[3:]] == ["claude-session-2"] * 3
+
+
+def test_step_mode_pauses_before_d_and_accepts_d_override(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan one")),
+        ("implementation", sentinel("continue", "Build one")),
+        ("planning-propose", sentinel("human", "Plan two")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Plan ready")),
+        ("implementation-review", sentinel("ready", "Build ready")),
+        ("next-task", sentinel("human", "Cycle two request")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Cycle one", "test", run_mode="step")
+    state = app.run_to_stop(run_id)
+    while state.get("pending_human_decision") == "operator_step":
+        state = app.continue_step(run_id)
+    assert state["pending_human_decision"] == "next_task_approval"
+    before = state["current_turn"]
+    state = app.decide(run_id, "yes")
+    assert state["pending_human_decision"] == "operator_step"
+    assert state["cycle"] == 2 and state["current_turn"] == before and state["current_stage"] == "planning-propose"
+    override = app.set_next_turn_override(run_id, profile="codex-planning", session_action="new")
+    assert override["next_turn_override"]["target_stage"] == "planning-propose"
+    state = app.continue_step(run_id)
+    assert state["turns"][-1]["session_label"] == "D"
+
+
+def test_new_cycle_rejects_reuse_of_a_prior_physical_session(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = CrossCycleReusingAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan one")),
+        ("implementation", sentinel("continue", "Build one")),
+        ("planning-propose", sentinel("human", "Plan two")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Plan ready")),
+        ("implementation-review", sentinel("ready", "Build ready")),
+        ("next-task", sentinel("human", "Cycle two request")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Cycle one", "test")
+    app.run_to_stop(run_id)
+    state = app.decide(run_id, "yes")
+    assert state["cycle"] == 2
+    assert state["pending_human_decision"] == "provider_session_not_new"
+    assert state["cycles"][0]["sessions"]["planner"]["active_session_id"] == "codex-session-1"
+    new_planner = state["cycles"][1]["sessions"]["planner"]
+    assert new_planner["active_session_id"] is None and new_planner["history"] == []
+    assert state["turns"][-1]["session_promoted"] is False
+
+
+def test_retry_rejects_session_id_observed_on_failed_new_invocation(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = FailedThenReusedAdapter()
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    first = app.run_to_stop(run_id)
+    assert first["pending_human_decision"] == "provider_invocation_failed"
+    second = app.decide(run_id, "yes")
+    assert second["pending_human_decision"] == "provider_session_not_new"
+    planner = second["cycles"][0]["sessions"]["planner"]
+    assert planner["active_session_id"] is None and planner["history"] == []
+    assert second["turns"][-1]["session_promoted"] is False
+
+
+def test_missing_continuation_session_pauses_without_starting_over(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    state = app.state(run_id)
+    state["current_stage"] = "planning-revise"
+    state["status"] = "running"
+    app._save(run_id, state)
+    paused = app.advance(run_id)
+    assert paused["status"] == "paused"
+    assert paused["pending_human_decision"] == "provider_session_missing"
+    assert codex.invocations == []
+
+
+def test_provider_requested_human_direction_reaches_the_resumed_session(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("human", "Choose scope")),
+        ("planning-propose", sentinel("human", "Direction received")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    app.run_to_stop(run_id)
+    state = app.decide(run_id, "other", b"Use the narrow scope.\r\n")
+    assert state["pending_human_decision"] == "provider_requested_human"
+    assert codex.invocations[-1]["session_action"] == "continue"
+    assert b"# Immediate human direction" in codex.invocations[-1]["prompt"]
+    assert b"Use the narrow scope.\r\n" in codex.invocations[-1]["prompt"]
+
+
+def test_provider_command_builders_select_profile_and_resume(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    captured: list[list[str]] = []
+
+    def fake_run(command: list[str], prompt: bytes, cwd: Path, timeout: int):
+        captured.append(command)
+        if "codex" in command[0]:
+            return (FIXTURES / "codex_success.jsonl").read_bytes(), b"", 0, 10
+        return (FIXTURES / "claude_success.json").read_bytes(), b"", 0, 10
+
+    codex = CodexAdapter(executable="codex-test")
+    claude = ClaudeAdapter(executable="claude-test")
+    monkeypatch.setattr(codex, "_run", fake_run)
+    monkeypatch.setattr(claude, "_run", fake_run)
+    codex.invoke_configured(
+        "planning-revise", b"prompt", tmp_path, model="gpt-test", reasoning="xhigh",
+        permission="read-only", session_action="continue", session_id="codex-session-fixture",
+    )
+    claude.invoke_configured(
+        "implementation-review", b"prompt", tmp_path, model="claude-test-model", reasoning="max",
+        permission="read-only", session_action="continue", session_id="claude-session-fixture",
+    )
+    codex_command, claude_command = captured
+    assert codex_command[:3] == ["codex-test", "exec", "resume"]
+    assert "gpt-test" in codex_command and 'model_reasoning_effort="xhigh"' in codex_command
+    assert codex_command[-2:] == ["codex-session-fixture", "-"]
+    assert "--resume" in claude_command and "claude-session-fixture" in claude_command
+    assert "claude-test-model" in claude_command and "max" in claude_command
+
+
+def test_run_profiles_are_snapshotted_and_explicit_override_is_recorded(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [("planning-propose", response("human", "Need owner"))])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    workflow = app.workflows["continuous-development"]
+    workflow.profiles["codex-planning"] = replace(workflow.profiles["codex-planning"], effort="low", label="Changed default")
+    app.run_to_stop(run_id)
+    assert codex.invocations[0]["reasoning"] == "xhigh"
+
+    codex_override = SessionAdapter("codex", [("planning-propose", response("human", "Need owner"))])
+    app_override = make_cycle(tmp_path / "override", writable_project, codex_override, SessionAdapter("claude", []))
+    run_override = app_override.create_run(b"Task", "test")
+    workflow_override = app_override.workflows["continuous-development"]
+    workflow_override.profiles["codex-planning"] = replace(
+        workflow_override.profiles["codex-planning"], effort="low", label="Changed default"
+    )
+    state = app_override.set_next_turn_override(run_override, profile="codex-planning", session_action="new")
+    assert state["next_turn_override"]["profile_value"]["effort"] == "low"
+    app_override.run_to_stop(run_override)
+    assert codex_override.invocations[0]["reasoning"] == "low"
+
+
+def test_round_caps_allow_the_configured_number_of_corrections(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Plan 0")),
+        ("planning-revise", response("continue", "Plan 1")),
+        ("planning-revise", response("continue", "Plan 2")),
+        ("planning-revise", response("continue", "Plan 3")),
+    ])
+    claude = SessionAdapter("claude", [
+        ("planning-review", response("continue", "Finding 1")),
+        ("planning-review", response("continue", "Finding 2")),
+        ("planning-review", response("continue", "Finding 3")),
+        ("planning-review", response("continue", "Finding 4")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    state = app.run_to_stop(app.create_run(b"Task", "test"))
+    assert state["status"] == "paused" and state["pending_human_decision"] == "planning_round_cap_reached"
+    assert state["cycles"][0]["planning_round"] == 3
+    assert [item["route"] for item in codex.invocations].count("planning-revise") == 3
+
+    codex_impl = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Plan")),
+        ("implementation", response("continue", "Implementation 0")),
+        ("implementation-repair", response("continue", "Implementation 1")),
+        ("implementation-repair", response("continue", "Implementation 2")),
+    ], writer=True)
+    claude_impl = SessionAdapter("claude", [
+        ("planning-review", response("ready", "Plan ready")),
+        ("implementation-review", response("continue", "Finding 1")),
+        ("implementation-review", response("continue", "Finding 2")),
+        ("implementation-review", response("continue", "Finding 3")),
+    ])
+    app_impl = make_cycle(tmp_path / "implementation", writable_project, codex_impl, claude_impl)
+    state_impl = app_impl.run_to_stop(app_impl.create_run(b"Task", "test"))
+    assert state_impl["status"] == "paused"
+    assert state_impl["pending_human_decision"] == "implementation_round_cap_reached"
+    assert state_impl["cycles"][0]["implementation_round"] == 2
+    assert [item["route"] for item in codex_impl.invocations].count("implementation-repair") == 2
+
+
+def test_validation_and_post_review_mutations_cannot_escape_sealed_evidence(tmp_path: Path, writable_project: ProjectDefinition):
+    validation_project = replace(
+        writable_project,
+        validations=(ValidationDefinition(
+            "mutating-validation",
+            'python -c "from pathlib import Path; Path(\'generated.txt\').write_text(\'x\')"',
+            "local",
+        ),),
+        write_allowlist=("built.txt",),
+    )
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Plan")),
+        ("implementation", response("continue", "Implementation")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [("planning-review", response("ready", "Plan ready"))])
+    app = make_cycle(tmp_path, validation_project, codex, claude)
+    state = app.run_to_stop(app.create_run(b"Task", "test"))
+    assert state["status"] == "paused"
+    assert state["pending_human_decision"] == "implementation_boundary_failed"
+    assert "generated.txt" in state["errors"][-1]
+
+    codex_review = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Plan")),
+        ("implementation", response("continue", "Implementation")),
+    ], writer=True)
+    claude_review = ReviewMutatingAdapter("claude", [
+        ("planning-review", response("ready", "Plan ready")),
+        ("implementation-review", response("ready", "Looks good")),
+    ])
+    app_review = make_cycle(tmp_path / "review-mutation", writable_project, codex_review, claude_review)
+    review_state = app_review.run_to_stop(app_review.create_run(b"Task", "test"))
+    assert review_state["status"] == "paused"
+    assert review_state["pending_human_decision"] == "implementation_changed_after_review"
+
+
+def test_cycle_correction_chatter_cannot_supersede_primary_artifact(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", "Original plan"),
+        ("planning-propose", sentinel("continue", "correction chatter")),
+    ])
+    claude = SessionAdapter("claude", [("planning-review", sentinel("human", "Need owner input"))])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    state = app.run_to_stop(app.create_run(b"Task", "test"))
+    assert state["pending_human_decision"] == "provider_requested_human"
+    assert state["turns"][0]["artifact_type"] == "plan" and state["turns"][0]["substantive"] is True
+    assert state["turns"][1]["artifact_type"] == "directive-correction"
+    assert state["turns"][1]["correction"] is True and state["turns"][1]["substantive"] is False
+    assert app._latest_turn(state, "plan")["id"] == "turn.0001"
+    assert b"Original plan" in claude.invocations[0]["prompt"]
+    assert b"correction chatter" not in claude.invocations[0]["prompt"]
+
+
+def test_failed_or_reused_new_session_never_replaces_active_generation(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    for name, adapter_type, expected_reason in (
+        ("failed", FailedSecondNewAdapter, "provider_invocation_failed"),
+        ("reused", ReusedSecondNewAdapter, "provider_session_not_new"),
+    ):
+        codex = adapter_type("codex", [
+            ("planning-propose", sentinel("continue", "Plan")),
+            ("planning-revise", sentinel("human", "Revised")),
+        ])
+        claude = SessionAdapter("claude", [("planning-review", sentinel("continue", "Finding"))])
+        app = make_cycle(tmp_path / name, writable_project, codex, claude)
+        run_id = app.create_run(b"Task", "test", run_mode="step")
+        app.run_to_stop(run_id)
+        app.continue_step(run_id)
+        app.set_next_turn_override(run_id, session_action="new")
+        state = app.continue_step(run_id)
+        planner = state["cycles"][0]["sessions"]["planner"]
+        assert state["pending_human_decision"] == expected_reason
+        assert planner["active_session_id"] == "codex-session-1"
+        assert planner["active_generation"] == 1
+        assert len(planner["history"]) == 1 and planner["history"][0]["status"] == "active"
+        assert state["turns"][-1]["session_promoted"] is False
+
+
+def test_unknown_inflight_can_be_abandoned_restarted_or_cancelled(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan")),
+        ("planning-revise", sentinel("human", "Recovered revision")),
+    ])
+    claude = SessionAdapter("claude", [("planning-review", sentinel("continue", "Finding"))])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Task", "test", run_mode="step")
+    app.run_to_stop(run_id)
+    app.continue_step(run_id)
+    state = app.state(run_id)
+    state["status"] = "running"
+    state["pending_human_decision"] = None
+    state["inflight"] = {
+        "stage": "planning-revise",
+        "session_slot": "planner",
+        "session_action": "continue",
+        "session_id": "codex-session-1",
+        "started_at": "2026-07-12T12:00:00Z",
+    }
+    app._save(run_id, state)
+    paused = app.advance(run_id)
+    assert paused["pending_human_decision"] == "unknown_provider_invocation"
+    recovered = app.decide(run_id, "yes")
+    assert recovered["pending_human_decision"] == "provider_requested_human"
+    assert recovered["inflight"] is None and len(recovered["abandoned_invocations"]) == 1
+    assert codex.invocations[-1]["session_action"] == "new"
+    assert codex.invocations[-1]["session_id"] == "codex-session-2"
+    assert b"Recovery context" in codex.invocations[-1]["prompt"]
+    assert any(event["kind"] == "provider.invocation.abandoned" for event in recovered["events"])
+
+    cancel_app = make_cycle(tmp_path / "cancel", writable_project, SessionAdapter("codex", []), SessionAdapter("claude", []))
+    cancel_id = cancel_app.create_run(b"Task", "test")
+    cancel_state = cancel_app.state(cancel_id)
+    cancel_state["status"] = "running"
+    cancel_state["inflight"] = {"stage": "planning-propose", "started_at": "2026-07-12T12:00:00Z"}
+    cancel_app._save(cancel_id, cancel_state)
+    cancel_app.advance(cancel_id)
+    cancelled = cancel_app.decide(cancel_id, "no")
+    assert cancelled["status"] == "cancelled" and cancelled["inflight"] is None
+    assert cancel_app.cleanup_worktree(cancel_id)["execution_worktree_removed"] is True
+
+
+def test_create_run_rejects_dirty_source_before_creating_run(tmp_path: Path, writable_project: ProjectDefinition):
+    (writable_project.root / "uncommitted.txt").write_text("local work\n", encoding="utf-8")
+    app = make_cycle(tmp_path, writable_project, SessionAdapter("codex", []), SessionAdapter("claude", []))
+    with pytest.raises(ValueError, match="must be clean"):
+        app.create_run(b"Task", "test")
+    assert not app.runs_dir.exists() or not list(app.runs_dir.iterdir())
+    assert not list((tmp_path / "runtime" / "worktrees").glob("*"))
+    assert (writable_project.root / "uncommitted.txt").read_text(encoding="utf-8") == "local work\n"
+
+
+@pytest.mark.parametrize("drift", ["branch", "head"])
+def test_execution_worktree_identity_drift_pauses_before_provider(
+    tmp_path: Path, writable_project: ProjectDefinition, drift: str
+):
+    codex = SessionAdapter("codex", [("planning-propose", sentinel("human", "unused"))])
+    app = make_cycle(tmp_path / drift, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    worktree = Path(app.state(run_id)["execution_worktree"])
+    if drift == "branch":
+        subprocess.run(["git", "-C", str(worktree), "switch", "-c", "unexpected"], check=True, capture_output=True)
+    else:
+        subprocess.run(
+            [
+                "git", "-C", str(worktree), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                "commit", "--allow-empty", "-m", "unexpected",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    state = app.run_to_stop(run_id)
+    assert state["pending_human_decision"] == "execution_worktree_identity_changed"
+    assert ("branch_changed" if drift == "branch" else "revision_changed") in state["errors"][-1]
+    assert codex.invocations == [] and state["turns"] == []
+
+
+def test_validation_requires_explicit_approval_and_no_cancels(tmp_path: Path, writable_project: ProjectDefinition):
+    marker = tmp_path / "validation-ran.txt"
+    command = f'"{sys.executable}" -c "from pathlib import Path; Path({str(marker)!r}).write_text(\'ran\', encoding=\'utf-8\')"'
+    project = replace(
+        writable_project,
+        validations=(ValidationDefinition("safe-local", command, "local"),),
+        allow_no_validations=False,
+        validation_requires_approval=True,
+    )
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan")),
+        ("implementation", sentinel("continue", "Built")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Plan ready")),
+        ("implementation-review", sentinel("human", "Stop after validation")),
+    ])
+    app = make_cycle(tmp_path, project, codex, claude)
+    run_id = app.create_run(b"Task", "test")
+    paused = app.run_to_stop(run_id)
+    assert paused["pending_human_decision"] == "validation_execution_approval"
+    assert not marker.exists() and paused["pending_validation"]["commands"][0]["command"] == command
+    resumed = app.decide(run_id, "yes")
+    assert marker.read_text(encoding="utf-8") == "ran"
+    assert resumed["validations"]["safe-local"]["state"] == "passed"
+    assert resumed["pending_human_decision"] == "provider_requested_human"
+    assert [item["route"] for item in codex.invocations].count("implementation") == 1
+
+    no_marker = tmp_path / "no-validation.txt"
+    no_command = f'"{sys.executable}" -c "from pathlib import Path; Path({str(no_marker)!r}).write_text(\'ran\')"'
+    no_project = replace(project, validations=(ValidationDefinition("safe-local", no_command, "local"),))
+    no_app = make_cycle(
+        tmp_path / "no",
+        no_project,
+        SessionAdapter("codex", [
+            ("planning-propose", sentinel("continue", "Plan")),
+            ("implementation", sentinel("continue", "Built")),
+        ], writer=True),
+        SessionAdapter("claude", [("planning-review", sentinel("ready", "Plan ready"))]),
+    )
+    no_id = no_app.create_run(b"Task", "test")
+    no_app.run_to_stop(no_id)
+    cancelled = no_app.decide(no_id, "no")
+    assert cancelled["status"] == "cancelled" and not no_marker.exists()
+
+
+def _remote_validation_run(
+    tmp_path: Path, writable_project: ProjectDefinition
+) -> tuple[CycleOrchestrator, str, dict[str, Any]]:
+    project = replace(
+        writable_project,
+        validations=(
+            ValidationDefinition("local", f'"{sys.executable}" -c "print(\'ok\')"', "local"),
+            ValidationDefinition("remote", "docker compose config", "vps"),
+        ),
+        allow_no_validations=False,
+        validation_requires_approval=False,
+    )
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan")),
+        ("implementation", sentinel("continue", "Built")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Plan ready")),
+        ("implementation-review", sentinel("ready", "Implementation ready")),
+        ("next-task", sentinel("human", "Next task")),
+    ])
+    app = make_cycle(tmp_path, project, codex, claude)
+    run_id = app.create_run(b"Task", "test")
+    state = app.run_to_stop(run_id)
+    assert state["pending_human_decision"] == "validation_receipt_required"
+    return app, run_id, state
+
+
+def _write_remote_receipt(tmp_path: Path, state: dict[str, Any], **overrides: Any) -> Path:
+    stdout = tmp_path / "remote.stdout"
+    stderr = tmp_path / "remote.stderr"
+    stdout.write_bytes(b"remote ok\n")
+    stderr.write_bytes(b"")
+    receipt = {
+        "validation_id": "remote",
+        "command": "docker compose config",
+        "source_revision": state["working_revision"],
+        "patch_sha256": state["current_implementation_evidence"]["patch"]["sha256"],
+        "environment": "vps",
+        "host": "test-vps",
+        "started_at": "2026-07-12T12:00:00Z",
+        "finished_at": "2026-07-12T12:00:01Z",
+        "exit_code": 0,
+        "stdout_path": str(stdout),
+        "stderr_path": str(stderr),
+        "stdout_sha256": sha256(stdout.read_bytes()),
+        "stderr_sha256": sha256(stderr.read_bytes()),
+    }
+    receipt.update(overrides)
+    path = tmp_path / "remote-receipt.json"
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+    return path
+
+
+def test_required_remote_receipt_is_patch_bound_and_completes_acceptance(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    app, run_id, state = _remote_validation_run(tmp_path, writable_project)
+    with pytest.raises(ValueError, match="patch mismatch"):
+        app.attach_receipt(run_id, _write_remote_receipt(tmp_path, state, patch_sha256="wrong"))
+    unchanged = app.state(run_id)
+    assert unchanged["validations"]["remote"]["state"] == "pending_remote"
+    accepted = app.attach_receipt(run_id, _write_remote_receipt(tmp_path, state))
+    assert accepted["validations"]["remote"]["state"] == "passed"
+    assert accepted["working_revision"] != accepted["source_revision"]
+    assert accepted["completion_receipt"]
+    assert accepted["pending_human_decision"] == "next_task_approval"
+
+
+def test_failed_required_remote_receipt_routes_to_repair_without_committing(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    app, run_id, state = _remote_validation_run(tmp_path, writable_project)
+    # Supply the repair response after the receipt sends the run back to session C.
+    codex = app.adapters["codex"]
+    assert isinstance(codex, SessionAdapter)
+    codex.scripted = iter([("implementation-repair", sentinel("human", "Repair needed"))])
+    failed = app.attach_receipt(run_id, _write_remote_receipt(tmp_path, state, exit_code=1))
+    assert failed["working_revision"] == failed["source_revision"]
+    assert failed["completion_receipt"] is None
+    assert failed["validations"]["remote"]["state"] == "failed"
+    assert failed["pending_human_decision"] == "provider_requested_human"
+
+
+def test_run_uses_sealed_prompt_after_package_prompt_changes(
+    tmp_path: Path, writable_project: ProjectDefinition, monkeypatch: pytest.MonkeyPatch
+):
+    import toledo_orchestrator.cycle as cycle_module
+
+    package = tmp_path / "package"
+    package.mkdir()
+    shutil.copytree(Path(cycle_module.__file__).with_name("prompts"), package / "prompts")
+    fake_module = package / "cycle.py"
+    fake_module.write_text("# fixture\n", encoding="utf-8")
+    monkeypatch.setattr(cycle_module, "__file__", str(fake_module))
+    codex = SessionAdapter("codex", [("planning-propose", sentinel("human", "Plan"))])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    sealed = app.state(run_id)["prompt_library"]["planning-kickoff.md"]
+    (package / "prompts" / "planning-kickoff.md").write_text("MUTATED PROMPT\n", encoding="utf-8")
+    state = app.run_to_stop(run_id)
+    assert b"MUTATED PROMPT" not in codex.invocations[0]["prompt"]
+    prompt_bytes = app.artifact(run_id, sealed["path"])
+    assert sha256(prompt_bytes) == sealed["sha256"]
+    assert state["pending_human_decision"] == "provider_requested_human"
+
+
+def test_workflow_rejects_workspace_write_profile_on_planning_stage():
+    value = load_workflows()["continuous-development"].snapshot()
+    value["profiles"]["codex-planning"]["permission"] = "workspace-write"
+    with pytest.raises(ValueError, match="non-implementation stage planning-propose"):
+        WorkflowDefinition.from_value(value)
+
+
+def test_run_lock_excludes_another_process_without_state_corruption(tmp_path: Path, writable_project: ProjectDefinition):
+    app = make_cycle(tmp_path, writable_project, SessionAdapter("codex", []), SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    run_dir = app._run_dir(run_id)
+    before = (run_dir / "run.json").read_bytes()
+    source_root = Path(__file__).parents[1] / "src"
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from toledo_orchestrator.locking import run_lock\n"
+        "with run_lock(Path(sys.argv[1])):\n"
+        " print('LOCKED', flush=True)\n"
+        " sys.stdin.read(1)\n"
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(source_root) + os.pathsep + environment.get("PYTHONPATH", "")
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(run_dir)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    try:
+        assert process.stdout and process.stdout.readline().strip() == "LOCKED"
+        with pytest.raises(ValueError, match="active operation"):
+            app.set_next_turn_override(run_id, session_action="new")
+        assert (run_dir / "run.json").read_bytes() == before
+    finally:
+        if process.stdin:
+            process.stdin.write("x")
+            process.stdin.flush()
+        process.wait(timeout=5)
+    state = app.set_next_turn_override(run_id, session_action="new")
+    assert state["next_turn_override"]["session_action"] == "new"
+
+
+def test_registered_artifact_hashes_are_enforced_before_transport(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [("planning-propose", sentinel("human", "unused"))])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    state = app.state(run_id)
+    prompt_record = state["prompt_library"]["planning-kickoff.md"]
+    (app._run_dir(run_id) / prompt_record["path"]).write_text("tampered\n", encoding="utf-8")
+    paused = app.run_to_stop(run_id)
+    assert paused["pending_human_decision"] == "artifact_integrity_failed"
+    assert "hash mismatch" in paused["errors"][-1]
+    assert codex.invocations == []
+
+
+def test_validation_definitions_reject_traversal_duplicates_and_empty_commands(
+    writable_project: ProjectDefinition
+):
+    with pytest.raises(ValueError, match="invalid validation id"):
+        replace(
+            writable_project,
+            validations=(ValidationDefinition("../../escape", "echo x", "local"),),
+            allow_no_validations=False,
+        )
+    with pytest.raises(ValueError, match="duplicate validation id"):
+        replace(
+            writable_project,
+            validations=(
+                ValidationDefinition("tests", "echo one", "local"),
+                ValidationDefinition("tests", "echo two", "vps"),
+            ),
+            allow_no_validations=False,
+        )
+    with pytest.raises(ValueError, match="cannot be empty"):
+        replace(
+            writable_project,
+            validations=(ValidationDefinition("tests", "  ", "local"),),
+            allow_no_validations=False,
+        )
+
+
+def test_implementation_human_pauses_before_host_validation(tmp_path: Path, writable_project: ProjectDefinition):
+    marker = tmp_path / "must-not-run.txt"
+    command = f'"{sys.executable}" -c "from pathlib import Path; Path({str(marker)!r}).write_text(\'ran\')"'
+    project = replace(
+        writable_project,
+        validations=(ValidationDefinition("local", command, "local"),),
+        allow_no_validations=False,
+        validation_requires_approval=False,
+    )
+    app = make_cycle(
+        tmp_path,
+        project,
+        SessionAdapter("codex", [
+            ("planning-propose", sentinel("continue", "Plan")),
+            ("implementation", sentinel("human", "Need a decision before finishing")),
+        ], writer=True),
+        SessionAdapter("claude", [("planning-review", sentinel("ready", "Plan ready"))]),
+    )
+    state = app.run_to_stop(app.create_run(b"Task", "test"))
+    assert state["pending_human_decision"] == "provider_requested_human"
+    assert not marker.exists() and state["validations"] == {}
+
+
+def test_acceptance_commit_failure_is_persisted_as_pause(
+    tmp_path: Path, writable_project: ProjectDefinition, monkeypatch: pytest.MonkeyPatch
+):
+    import toledo_orchestrator.cycle as cycle_module
+
+    def fail_commit(*args: Any, **kwargs: Any) -> str:
+        raise ValueError("fixture commit failure")
+
+    monkeypatch.setattr(cycle_module, "commit_accepted_changes", fail_commit)
+    app = make_cycle(
+        tmp_path,
+        writable_project,
+        SessionAdapter("codex", [
+            ("planning-propose", sentinel("continue", "Plan")),
+            ("implementation", sentinel("continue", "Build")),
+        ], writer=True),
+        SessionAdapter("claude", [
+            ("planning-review", sentinel("ready", "Plan ready")),
+            ("implementation-review", sentinel("ready", "Build ready")),
+        ]),
+    )
+    state = app.run_to_stop(app.create_run(b"Task", "test"))
+    assert state["status"] == "paused"
+    assert state["pending_human_decision"] == "acceptance_commit_failed"
+    assert "fixture commit failure" in state["errors"][-1]
+
+
+def test_committed_but_unsaved_acceptance_is_reconciled_from_journal(
+    tmp_path: Path, writable_project: ProjectDefinition, monkeypatch: pytest.MonkeyPatch
+):
+    import toledo_orchestrator.cycle as cycle_module
+
+    original_commit = cycle_module.commit_accepted_changes
+
+    def commit_then_crash(*args: Any, **kwargs: Any) -> str:
+        original_commit(*args, **kwargs)
+        raise RuntimeError("simulated controller crash after git commit")
+
+    monkeypatch.setattr(cycle_module, "commit_accepted_changes", commit_then_crash)
+    app = make_cycle(
+        tmp_path,
+        writable_project,
+        SessionAdapter("codex", [
+            ("planning-propose", sentinel("continue", "Plan")),
+            ("implementation", sentinel("continue", "Build")),
+        ], writer=True),
+        SessionAdapter("claude", [
+            ("planning-review", sentinel("ready", "Plan ready")),
+            ("implementation-review", sentinel("ready", "Build ready")),
+        ]),
+    )
+    run_id = app.create_run(b"Task", "test")
+    with pytest.raises(RuntimeError, match="simulated controller crash"):
+        app.run_to_stop(run_id)
+    uncertain = app.state(run_id)
+    assert uncertain["pending_commit"] and uncertain["completion_receipt"] is None
+    monkeypatch.setattr(cycle_module, "commit_accepted_changes", original_commit)
+    reconciled = app.advance(run_id)
+    assert reconciled["pending_commit"] is None
+    assert reconciled["completion_receipt"]
+    assert reconciled["current_stage"] == "next-task"

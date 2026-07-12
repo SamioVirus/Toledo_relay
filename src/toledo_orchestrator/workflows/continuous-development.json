@@ -1,0 +1,153 @@
+{
+  "id": "continuous-development",
+  "label": "A/B/C Continuous Development",
+  "start_stage": "planning-propose",
+  "planning_round_cap": 3,
+  "implementation_round_cap": 2,
+  "next_task_stage": "next-task",
+  "next_task_revision_stage": "next-task-revise",
+  "profiles": {
+    "codex-planning": {
+      "label": "5.6 Sol · Very high",
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "xhigh",
+      "permission": "read-only",
+      "color": "#56c8ff",
+      "timeout_seconds": 1200
+    },
+    "claude-planning-review": {
+      "label": "Fable 5 · Extra",
+      "provider": "claude",
+      "model": "claude-fable-5",
+      "effort": "xhigh",
+      "permission": "read-only",
+      "color": "#ffb15a",
+      "timeout_seconds": 1200
+    },
+    "codex-implementation": {
+      "label": "5.6 Terra · High",
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "effort": "high",
+      "permission": "workspace-write",
+      "color": "#61e6a8",
+      "timeout_seconds": 1800
+    },
+    "claude-implementation-review": {
+      "label": "Opus 4.8 · Max",
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "effort": "max",
+      "permission": "read-only",
+      "color": "#ff7f73",
+      "timeout_seconds": 1500
+    }
+  },
+  "stages": {
+    "planning-propose": {
+      "title": "Ideas and why",
+      "phase": "planning",
+      "role": "planner",
+      "prompt_kind": "ideate",
+      "prompt_file": "planning-kickoff.md",
+      "profile": "codex-planning",
+      "session_slot": "planner",
+      "session_policy": "new-if-missing",
+      "artifact_type": "plan",
+      "context": ["request", "human-decisions"],
+      "transitions": {"continue": "planning-review", "ready": "planning-review", "human": "@pause:provider_requested_human"}
+    },
+    "planning-review": {
+      "title": "Skeptical plan review",
+      "phase": "planning-review",
+      "role": "reviewer",
+      "prompt_kind": "skeptic",
+      "prompt_file": "planning-review.md",
+      "profile": "claude-planning-review",
+      "session_slot": "reviewer",
+      "session_policy": "new-if-missing",
+      "artifact_type": "plan-review",
+      "context": ["request", "latest:plan", "human-decisions"],
+      "transitions": {"continue": "planning-revise", "ready": "@seal:approved-handoff:implementation", "human": "@pause:provider_requested_human"}
+    },
+    "planning-revise": {
+      "title": "Adjudicate and refine",
+      "phase": "planning",
+      "role": "planner",
+      "prompt_kind": "adjudicate",
+      "prompt_file": "planning-revise.md",
+      "profile": "codex-planning",
+      "session_slot": "planner",
+      "session_policy": "continue",
+      "artifact_type": "plan",
+      "context": ["request", "latest:plan", "latest:plan-review", "human-decisions"],
+      "transitions": {"continue": "planning-review", "ready": "planning-review", "human": "@pause:provider_requested_human"}
+    },
+    "implementation": {
+      "title": "Implement approved handoff",
+      "phase": "implementation",
+      "role": "implementer",
+      "prompt_kind": "implementation-kickoff",
+      "prompt_file": "implementation-kickoff.md",
+      "profile": "codex-implementation",
+      "session_slot": "implementer",
+      "session_policy": "new-if-missing",
+      "artifact_type": "implementation-report",
+      "context": ["approved-handoff"],
+      "transitions": {"continue": "implementation-review", "ready": "implementation-review", "human": "@pause:provider_requested_human"}
+    },
+    "implementation-review": {
+      "title": "Audit actual implementation",
+      "phase": "implementation-review",
+      "role": "reviewer",
+      "prompt_kind": "implementation-audit",
+      "prompt_file": "implementation-review.md",
+      "profile": "claude-implementation-review",
+      "session_slot": "reviewer",
+      "session_policy": "continue",
+      "artifact_type": "implementation-review",
+      "context": ["approved-handoff", "latest:implementation-report", "implementation-evidence", "human-decisions"],
+      "transitions": {"continue": "implementation-repair", "ready": "@complete:next-task", "human": "@pause:provider_requested_human"}
+    },
+    "implementation-repair": {
+      "title": "Correct verified findings",
+      "phase": "implementation",
+      "role": "implementer",
+      "prompt_kind": "correction",
+      "prompt_file": "implementation-repair.md",
+      "profile": "codex-implementation",
+      "session_slot": "implementer",
+      "session_policy": "continue",
+      "artifact_type": "implementation-report",
+      "context": ["approved-handoff", "latest:implementation-report", "latest:implementation-review", "implementation-evidence", "human-decisions"],
+      "transitions": {"continue": "implementation-review", "ready": "implementation-review", "human": "@pause:provider_requested_human"}
+    },
+    "next-task": {
+      "title": "Choose the next build",
+      "phase": "next-task",
+      "role": "reviewer",
+      "prompt_kind": "next-step",
+      "prompt_file": "next-task.md",
+      "profile": "claude-planning-review",
+      "session_slot": "reviewer",
+      "session_policy": "continue",
+      "artifact_type": "next-task-proposal",
+      "context": ["completion-receipt", "latest:implementation-review", "human-decisions"],
+      "transitions": {"continue": "@pause:next_task_approval", "ready": "@pause:next_task_approval", "human": "@pause:next_task_approval"}
+    },
+    "next-task-revise": {
+      "title": "Revise next-task proposal",
+      "phase": "next-task",
+      "role": "reviewer",
+      "prompt_kind": "human-other",
+      "prompt_file": "next-task-revise.md",
+      "profile": "claude-planning-review",
+      "session_slot": "reviewer",
+      "session_policy": "continue",
+      "artifact_type": "next-task-proposal",
+      "context": ["completion-receipt", "latest:next-task-proposal", "human-decisions"],
+      "transitions": {"continue": "@pause:next_task_approval", "ready": "@pause:next_task_approval", "human": "@pause:next_task_approval"}
+    }
+  }
+}
