@@ -1,0 +1,21 @@
+{
+  "id": "toledo",
+  "root": "C:\\Users\\sammo\\OneDrive\\Documents\\Toledo",
+  "read_only": true,
+  "instruction_files": [
+    "AGENTS.md",
+    "docs/agent-control/65-transport-first-orchestrator-implementation-plan.md"
+  ],
+  "validations": [
+    {
+      "id": "unit-tests",
+      "command": "python -m pytest -q",
+      "environment": "local"
+    },
+    {
+      "id": "compose-config",
+      "command": "docker compose config",
+      "environment": "vps"
+    }
+  ]
+}

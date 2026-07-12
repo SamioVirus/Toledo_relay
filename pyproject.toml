@@ -13,3 +13,6 @@ orchestrator = "toledo_orchestrator.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+toledo_orchestrator = ["projects/*.json", "prompts/*.md"]

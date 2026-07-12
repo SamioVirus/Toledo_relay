@@ -1,0 +1,11 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "result": "Independent review finding.\n```orchestrator\n{\"next\":\"continue\"}\n```",
+  "session_id": "claude-session-fixture",
+  "total_cost_usd": 0.0123,
+  "duration_ms": 1300,
+  "duration_api_ms": 900,
+  "num_turns": 2
+}

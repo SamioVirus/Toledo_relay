@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"codex-session-fixture"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"Concrete proposal with evidence.\n```orchestrator\n{\"next\":\"continue\"}\n```"}}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":40}}

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -26,12 +25,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     orchestrator = Orchestrator(runtime_dir=args.runtime_dir)
     if args.command == "check":
-        _emit({"codex": shutil.which("codex") is not None, "claude": shutil.which("claude") is not None, "runtime_dir": str(orchestrator.runtime_dir)}); return 0
+        result = orchestrator.check(); _emit(result); return 0 if result["ready"] else 1
     if args.command == "run":
         run_id = orchestrator.create_run(args.request_file.read_bytes(), args.project, args.workflow); _emit(orchestrator.run_to_stop(run_id)); return 0
     if args.command == "status": _emit(orchestrator.state(args.run_id)); return 0
     if args.command == "show":
-        path = orchestrator.runs_dir / args.run_id / "turns" / f"turn.{args.turn:04d}.output.md"; sys.stdout.write(path.read_text(encoding="utf-8")); return 0
+        sys.stdout.write(orchestrator.show_turn(args.run_id, args.turn)); return 0
     if args.command == "resume":
         payload = args.decision_file.read_bytes() if args.decision_file else args.decision.encode("utf-8"); _emit(orchestrator.resume(args.run_id, payload)); return 0
     if args.command == "validate": _emit(orchestrator.attach_receipt(args.run_id, args.receipt_file)); return 0
