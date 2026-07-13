@@ -279,7 +279,7 @@ function turnRow(turn) {
   row.dataset.session = turn.session_label;
   const colorClass = sessionColorClass(turn.session_label);
   const preview = (turnPreview(turn) || "Open the stored artifact.").replace(/\s+/g, " ").slice(0, 280);
-  const interstitialFile = turn.interstitial_file || turn.prompt_file;
+  const interstitialFile = turn.direction_file || turn.interstitial_file || turn.prompt_file;
   const tooltipId = `direction-${String(turn.id || "turn").replaceAll(".", "-")}`;
   row.innerHTML = `<button class="prompt-node" data-interstitial-path="${escapeHtml(turnArtifactPath(interstitialFile))}" aria-describedby="${escapeHtml(tooltipId)}" aria-label="Open ${escapeHtml(turn.prompt_label || turn.title)} direction"><span class="prompt-label">${escapeHtml(turn.prompt_label || promptShort(turn.prompt_kind))}</span><span class="prompt-tooltip" id="${escapeHtml(tooltipId)}" role="tooltip">Loading exact direction…</span></button><article class="turn-card ${escapeHtml(turn.provider)} ${colorClass}" tabindex="0" role="button" aria-label="Open ${escapeHtml(turn.title)} output"><div class="turn-card-head"><div class="actor"><span class="session-token">${escapeHtml(sessionDisplay(turn))}</span><div><h3>${escapeHtml(turn.title)}</h3><span class="route">${escapeHtml(turn.provider)} · ${escapeHtml(turn.role)}</span></div></div><span class="turn-number">${escapeHtml(turn.id)}</span></div><p class="turn-preview">${escapeHtml(preview)}</p><div class="chips"><span class="chip ${escapeHtml(turn.session_action)}">${escapeHtml(turn.session_action)} session</span><span class="chip">${escapeHtml(turn.profile_label || turn.profile)}</span><span class="chip">${escapeHtml(turn.permission)}</span><span class="chip">${Math.round((turn.elapsed_ms || 0)/1000)}s</span></div></article>`;
   const card = $(".turn-card", row);
@@ -291,7 +291,7 @@ function turnRow(turn) {
       openTurn(turn, "output");
     }
   });
-  prompt.addEventListener("click", () => openTurn(turn, "direction"));
+  prompt.addEventListener("click", () => openTurn(turn, turn.direction_file ? "direction" : "stance"));
   return row;
 }
 
@@ -360,12 +360,15 @@ function turnArtifactPath(file) {
 }
 
 async function openTurn(turn, tab = "output") {
-  const [direction, transport, output] = await Promise.all([
-    artifactText(turnArtifactPath(turn.interstitial_file || turn.prompt_file)),
+  const stancePath = turn.interstitial_file || turn.prompt_file;
+  const [stance, transport, output, direction] = await Promise.all([
+    artifactText(turnArtifactPath(stancePath)),
     artifactText(turnArtifactPath(turn.prompt_file)),
     artifactText(turnArtifactPath(turn.output_file)),
+    turn.direction_file ? artifactText(turnArtifactPath(turn.direction_file)) : Promise.resolve(undefined),
   ]);
-  inspectorPayload = {direction, transport, output, metadata: JSON.stringify(turn, null, 2)};
+  inspectorPayload = {stance, direction, transport, output, metadata: JSON.stringify(turn, null, 2)};
+  setDirectionTabLabel("Situational");
   $("#inspector-kicker").textContent = `${sessionDisplay(turn)} · ${turn.profile_label || turn.profile}`;
   $("#inspector-title").textContent = turn.title;
   const observed = turn.observed_model || turn.observed_reasoning
@@ -387,10 +390,15 @@ async function openArtifact(title, path) {
 async function openDecision(decision, index) {
   const content = await artifactText(decision.file);
   inspectorPayload = {direction:content, metadata:JSON.stringify(decision, null, 2)};
+  setDirectionTabLabel("Owner direction");
   $("#inspector-kicker").textContent = `HUMAN DIRECTION · ${String(index + 1).padStart(2, "0")}`;
   $("#inspector-title").textContent = humanizeReason(decision.reason);
   $("#inspector-meta").innerHTML = `<span class="chip">${escapeHtml(decision.choice)}</span><span class="chip">cycle ${escapeHtml(decision.cycle)}</span><span class="chip">after turn ${escapeHtml(decision.after_turn)}</span>`;
   openInspector("direction");
+}
+
+function setDirectionTabLabel(label) {
+  $(".inspector-tabs [data-tab=\"direction\"]").textContent = label;
 }
 
 function openInspector(tab) {

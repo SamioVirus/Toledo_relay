@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import re
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+
+from .director import DIRECTION_CONDITIONS
 
 
 SESSION_POLICIES = frozenset({"new", "continue", "new-if-missing"})
@@ -73,6 +75,7 @@ class StageDefinition:
     round_pause_reason: str | None = None
     repair_stage: str | None = None
     seal_source: str | None = None
+    direction: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_value(cls, stage_id: str, value: dict[str, Any]) -> "StageDefinition":
@@ -106,6 +109,18 @@ class StageDefinition:
             round_pause_reason = None
         if round_counter and not round_pause_reason:
             raise ValueError(f"round policy for stage {stage_id} requires pause_reason")
+        direction_value = value.get("direction", {})
+        if not isinstance(direction_value, dict):
+            raise ValueError(f"direction map for stage {stage_id} must be an object")
+        direction = {str(key): str(target) for key, target in direction_value.items()}
+        for condition, fragment in direction.items():
+            if condition not in DIRECTION_CONDITIONS:
+                raise ValueError(
+                    f"stage {stage_id} has unsupported direction condition {condition}; "
+                    f"expected one of {', '.join(DIRECTION_CONDITIONS)}"
+                )
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*\.md", fragment):
+                raise ValueError(f"invalid direction fragment for stage {stage_id}: {fragment}")
         return cls(
             id=stage_id,
             title=str(value.get("title", stage_id)),
@@ -126,6 +141,7 @@ class StageDefinition:
             round_pause_reason=round_pause_reason,
             repair_stage=str(value["repair_stage"]) if value.get("repair_stage") else None,
             seal_source=str(value["seal_source"]) if value.get("seal_source") else None,
+            direction=direction,
         )
 
 
@@ -353,6 +369,7 @@ class WorkflowDefinition:
                     ),
                     "repair_stage": stage.repair_stage,
                     "seal_source": stage.seal_source,
+                    "direction": dict(stage.direction),
                 }
                 for key, stage in self.stages.items()
             },
@@ -396,6 +413,7 @@ class WorkflowDefinition:
                     ),
                     "repair_stage": stage.repair_stage,
                     "seal_source": stage.seal_source,
+                    "direction": dict(stage.direction),
                 }
                 for key, stage in self.stages.items()
             },

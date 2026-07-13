@@ -1,0 +1,1 @@
+This stance has already run once in this cycle. Recheck the exact production path the prior turn claims is fixed — trace the real code, not its summary. A green suite can still hide a fake/real divergence, so confirm the specific correction against evidence before accepting it.

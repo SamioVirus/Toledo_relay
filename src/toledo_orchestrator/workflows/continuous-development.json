@@ -58,6 +58,7 @@
       "session_policy": "new-if-missing",
       "artifact_type": "plan",
       "context": ["request", "human-decisions"],
+      "direction": {"later_cycle": "direction-continuity.md"},
       "transitions": {"continue": "planning-review", "ready": "planning-review", "human": "@pause:provider_requested_human"}
     },
     "planning-review": {
@@ -74,6 +75,7 @@
       "context": ["request", "latest:plan", "human-decisions"],
       "round": {"counter": "planning", "cap": 3, "directive": "continue", "pause_reason": "planning_round_cap_reached"},
       "seal_source": "plan",
+      "direction": {"revisit": "direction-closure.md"},
       "transitions": {"continue": "planning-revise", "ready": "@seal:approved-handoff:implementation", "human": "@pause:provider_requested_human"}
     },
     "planning-revise": {
@@ -119,6 +121,7 @@
       "context": ["approved-handoff", "latest:implementation-report", "implementation-evidence", "human-decisions"],
       "round": {"counter": "implementation", "cap": 2, "directive": "continue", "pause_reason": "implementation_round_cap_reached"},
       "repair_stage": "implementation-repair",
+      "direction": {"revisit": "direction-recheck.md"},
       "transitions": {"continue": "implementation-repair", "ready": "@complete:next-task", "human": "@pause:provider_requested_human"}
     },
     "implementation-repair": {

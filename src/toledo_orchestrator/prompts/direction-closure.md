@@ -1,0 +1,1 @@
+This stance has already run once in this cycle. If the artifact is now a trustworthy handoff, approve it and move on — do not manufacture objections to prolong the loop. Hold only for a concrete unresolved blocker, named with the smallest correction.

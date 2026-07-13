@@ -44,6 +44,30 @@ The short prompts are first-class workflow actions rather than paraphrased task 
 - `Next`: return to project-level context and choose the next valid build.
 - `Redirect`: incorporate exact owner feedback and reopen the gate.
 
+## Situational direction (director)
+
+The named stance is stable; the owner's manual transcript shows the *situational* line matters as much
+— "how about now?" after a repair, or "seal it, stop inventing objections" on a second review pass.
+This is split so it respects the declarative, rename-safe stage contract above:
+
+- `director.py` is a **selector, not an author**. From two stage-agnostic facts — how many times this
+  exact stage has already run in the current cycle, and whether this is a later cycle — it returns which
+  situational *conditions* apply (`revisit`, `later_cycle`). It reads no stage IDs, counter names, or
+  prose, so renamed or custom stages stay correct. It is pure and never touches control flow.
+- The **language lives in prompt assets** (`prompts/direction-*.md`), editable at runtime like every
+  other prompt, and each **stage maps a condition to a fragment** in its `direction` table. So a
+  reviewer stage maps `revisit` → `direction-closure.md`, an auditor stage maps `revisit` →
+  `direction-recheck.md`, and the first planner stage maps `later_cycle` → `direction-continuity.md`.
+  Nothing is hard-coded to a workflow.
+
+On a stage's first run in the first cycle the director stays silent — the static stance prompt already
+carries that language, so the fragments hold only the genuinely new situational delta and are never a
+second copy of the stance. When fragments do apply they are assembled, written per turn to
+`turns/turn.NNNN.direction.md`, hash-registered in the run manifest, and injected into the transport
+prompt under `# Orchestrator direction`. It is a deterministic condition-selector today, not yet a
+judge; adding conditions or richer selection is the seam for later, more situational judging without
+turning the controller into a free-form graph.
+
 ## Stable orchestration law
 
 - Stay objective.
@@ -100,7 +124,8 @@ The local UI is a projection of the run files:
 - Stable color and label per logical session.
 - Profile badges remain distinct when B switches models.
 - Compact interstitial prompts sit on the center spine; hover previews and click inspection expose exact prompt bytes.
-- The compact interstitial direction is stored separately from the fully assembled transport prompt; both are inspectable.
+- The inspector exposes the base Stance, the Situational direction, and the full Transport prompt as separate views; the spine hover shows the situational direction when one applies and otherwise the stance.
+- Session-colored accents face the center spine (Codex on its right edge, Claude on its left) so each block visibly leans into the argument.
 - Sealed handoff and completion artifacts are visible milestones.
 - Overview/detail zoom and filters support long multi-cycle histories.
 - Yes/no/other records exact human decisions.

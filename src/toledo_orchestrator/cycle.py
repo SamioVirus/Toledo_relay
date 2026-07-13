@@ -31,6 +31,7 @@ from .core import (
     write_text,
 )
 from .configuration import load_configured_projects, load_configured_workflows
+from .director import DirectionContext, select_conditions
 from .locking import run_lock
 from .project import ProjectDefinition, load_projects
 from .validation import pending_required_validations, required_local_validations_passed, run_project_validations
@@ -248,6 +249,11 @@ class CycleOrchestrator:
             "orchestrator-law.md",
             "strict-contract.md",
             *(stage.prompt_file for stage in workflow_definition.stages.values()),
+            *(
+                fragment
+                for stage in workflow_definition.stages.values()
+                for fragment in stage.direction.values()
+            ),
         }
         prompt_library: dict[str, dict[str, str]] = {}
         for prompt_name in sorted(prompt_names):
@@ -382,6 +388,11 @@ class CycleOrchestrator:
                 "orchestrator-law.md",
                 "strict-contract.md",
                 *(stage.prompt_file for stage in workflow.stages.values()),
+                *(
+                    fragment
+                    for stage in workflow.stages.values()
+                    for fragment in stage.direction.values()
+                ),
             }
             prompt_files: dict[str, dict[str, Any]] = {}
             for prompt_name in sorted(prompt_names):
@@ -459,8 +470,9 @@ class CycleOrchestrator:
                 ("output_file", "output_sha256"),
                 ("raw_file", "raw_sha256"),
                 ("stderr_file", "stderr_sha256"),
+                ("direction_file", "direction_sha256"),
             ):
-                if f"turns/{turn.get(file_key)}" == normalized:
+                if turn.get(file_key) and f"turns/{turn.get(file_key)}" == normalized:
                     return str(turn.get(hash_key))
             if f"turns/{turn.get('id')}.json" == normalized:
                 return str(turn.get("metadata_sha256"))
@@ -538,6 +550,32 @@ class CycleOrchestrator:
             return "Implementation evidence", summary
         return None
 
+    def _compose_direction_text(self, state: dict[str, Any], stage: StageDefinition) -> str:
+        """Assemble the situational direction from workflow-configured fragments.
+
+        The controller detects generic conditions (has this exact stage already
+        run this cycle; is this a later cycle) without referencing any stage ID or
+        counter name, then reads the prose from the fragment the *stage* maps to
+        that condition. Stages with no ``direction`` mapping emit nothing.
+        """
+        if not stage.direction:
+            return ""
+        stage_visits = sum(
+            1
+            for turn in state["turns"]
+            if turn.get("cycle") == state["cycle"]
+            and turn.get("stage") == stage.id
+            and turn.get("substantive")
+            and not turn.get("correction")
+        )
+        context = DirectionContext(stage_visits=stage_visits, cycle=int(state["cycle"]))
+        fragments: list[str] = []
+        for condition in select_conditions(context):
+            fragment_name = stage.direction.get(condition)
+            if fragment_name:
+                fragments.append(self._prompt_file(state, fragment_name).strip())
+        return ("\n\n".join(fragments) + "\n") if fragments else ""
+
     def _prompt(
         self,
         state: dict[str, Any],
@@ -545,6 +583,7 @@ class CycleOrchestrator:
         profile: ProfileDefinition,
         session_action: str,
         session_label: str,
+        direction_text: str | None = None,
     ) -> bytes:
         project = self._project(state)
         sections = [
@@ -584,6 +623,8 @@ class CycleOrchestrator:
                 + json.dumps(abandoned_validations[-1], ensure_ascii=False, indent=2, sort_keys=True)
             )
         sections.append(self._prompt_file(state, stage.prompt_file).strip())
+        if direction_text and direction_text.strip():
+            sections.append("# Orchestrator direction\n" + direction_text.strip())
         immediate_decision_file: str | None = None
         if state.get("decisions"):
             latest_decision = state["decisions"][-1]
@@ -658,6 +699,7 @@ class CycleOrchestrator:
         directive: Directive | None,
         *,
         correction: bool = False,
+        direction_text: str | None = None,
     ) -> dict[str, Any]:
         number = state["current_turn"] + 1
         turn_id = f"turn.{number:04d}"
@@ -676,6 +718,11 @@ class CycleOrchestrator:
         interstitial = state.get("prompt_library", {}).get(stage.prompt_file, {})
         interstitial_file = str(interstitial.get("path", "")) or None
         interstitial_sha256 = str(interstitial.get("sha256", "")) or None
+        direction_name: str | None = None
+        direction_hash: str | None = None
+        if direction_text and direction_text.strip() and not correction:
+            direction_name = f"{turn_id}.direction.md"
+            direction_hash = write_text(turns / direction_name, direction_text)
         previous_session_id = slot.get("active_session_id")
         previously_seen = bool(
             result.session_id
@@ -717,6 +764,8 @@ class CycleOrchestrator:
             "prompt_file": prompt_name,
             "interstitial_file": interstitial_file,
             "interstitial_sha256": interstitial_sha256,
+            "direction_file": direction_name,
+            "direction_sha256": direction_hash,
             "output_file": text_name,
             "raw_file": raw_name,
             "stderr_file": stderr_name,
@@ -777,6 +826,7 @@ class CycleOrchestrator:
             "artifacts": {
                 "prompt": {"path": f"turns/{prompt_name}", "sha256": prompt_hash},
                 "interstitial": {"path": interstitial_file, "sha256": interstitial_sha256},
+                "direction": {"path": f"turns/{direction_name}" if direction_name else None, "sha256": direction_hash},
                 "output": {"path": f"turns/{text_name}", "sha256": output_hash},
                 "metadata": {"path": f"turns/{turn_id}.json", "sha256": metadata_hash},
             },
@@ -1080,8 +1130,9 @@ class CycleOrchestrator:
             state["errors"].append(str(error))
             self._save(run_id, state)
             return state
+        direction_text = self._compose_direction_text(state, stage)
         try:
-            prompt = self._prompt(state, stage, profile, action, slot["label"])
+            prompt = self._prompt(state, stage, profile, action, slot["label"], direction_text)
         except (OSError, ValueError) as error:
             state["status"] = "paused"
             state["pending_human_decision"] = "artifact_integrity_failed"
@@ -1126,7 +1177,7 @@ class CycleOrchestrator:
         session_mismatch = action == "continue" and result.session_id != session_id
         session_not_new = action == "new" and result.session_id in known_session_ids
         self._store_turn(state, stage, profile, slot=self._cycle(state)["sessions"][stage.session_slot], action=action,
-                         result=result, prompt=prompt, directive=directive)
+                         result=result, prompt=prompt, directive=directive, direction_text=direction_text)
         if post_provider_identity_error:
             state["status"] = "paused"
             state["pending_human_decision"] = "provider_changed_worktree_identity"

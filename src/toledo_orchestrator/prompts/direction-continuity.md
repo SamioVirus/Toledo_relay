@@ -1,0 +1,1 @@
+This cycle builds on an already-accepted branch. Read current repository evidence and extend what shipped rather than repeating completed work; treat any earlier "next" statement as a hypothesis to re-check, not a settled decision.

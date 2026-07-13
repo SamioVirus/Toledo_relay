@@ -446,6 +446,7 @@ def test_custom_prompt_and_renamed_round_stages_are_declarative(
                 "prompt_label": "Critic", "prompt_file": "custom-critic.md", "profile": "critic",
                 "session_slot": "skeptic", "session_policy": "new-if-missing", "artifact_type": "review",
                 "context": ["latest:plan"],
+                "direction": {"revisit": "custom-direction.md"},
                 "round": {"counter": "debate", "cap": 1, "directive": "continue", "pause_reason": "custom_round_cap"},
                 "transitions": {"continue": "revise-anything", "ready": "@pause:done", "human": "@pause:provider_requested_human"},
             },
@@ -465,6 +466,9 @@ def test_custom_prompt_and_renamed_round_stages_are_declarative(
     (custom_prompts / "custom-draft.md").write_text("# Begin from purpose\n", encoding="utf-8")
     (custom_prompts / "custom-critic.md").write_text("# Find the real weakness\n", encoding="utf-8")
     (custom_prompts / "custom-revise.md").write_text("# Judge the critique\n", encoding="utf-8")
+    (custom_prompts / "custom-direction.md").write_text(
+        "Recheck this renamed stage using runtime-local guidance.\n", encoding="utf-8"
+    )
     codex = SessionAdapter("codex", [
         ("draft-anything", sentinel("continue", "Draft")),
         ("revise-anything", sentinel("continue", "Revision")),
@@ -490,6 +494,14 @@ def test_custom_prompt_and_renamed_round_stages_are_declarative(
     assert app.artifact(state["run_id"], first_turn["interstitial_file"]).decode("utf-8").splitlines() == [
         "# Begin from purpose"
     ]
+    critic_turns = [turn for turn in state["turns"] if turn["stage"] == "critic-anything"]
+    assert critic_turns[0]["direction_file"] is None
+    assert critic_turns[1]["direction_file"] == f"{critic_turns[1]['id']}.direction.md"
+    direction = app.artifact(
+        state["run_id"], f"turns/{critic_turns[1]['direction_file']}"
+    ).decode("utf-8")
+    assert direction == "Recheck this renamed stage using runtime-local guidance.\n"
+    assert b"Recheck this renamed stage using runtime-local guidance." in claude.invocations[1]["prompt"]
 
 
 def test_legacy_v2_workflow_snapshot_recovers_caps_repairs_and_seal_source():
@@ -1135,6 +1147,22 @@ def test_workflow_rejects_prompt_namespace_and_sealed_type_path_escape():
     with pytest.raises(ValueError, match="unsupported context token"):
         WorkflowDefinition.from_value(bad_context)
 
+    bad_direction_condition = load_workflows()["continuous-development"].snapshot()
+    bad_direction_condition["id"] = "bad-direction-condition"
+    bad_direction_condition["stages"]["planning-review"]["direction"] = {
+        "second_guess": "direction-closure.md"
+    }
+    with pytest.raises(ValueError, match="unsupported direction condition second_guess"):
+        WorkflowDefinition.from_value(bad_direction_condition)
+
+    bad_direction_path = load_workflows()["continuous-development"].snapshot()
+    bad_direction_path["id"] = "bad-direction-path"
+    bad_direction_path["stages"]["planning-review"]["direction"] = {
+        "revisit": "../outside.md"
+    }
+    with pytest.raises(ValueError, match="invalid direction fragment"):
+        WorkflowDefinition.from_value(bad_direction_path)
+
 
 def test_create_run_rejects_dirty_source_before_creating_run(tmp_path: Path, writable_project: ProjectDefinition):
     (writable_project.root / "uncommitted.txt").write_text("local work\n", encoding="utf-8")
@@ -1494,3 +1522,65 @@ def test_committed_but_unsaved_acceptance_is_reconciled_from_journal(
     assert reconciled["pending_commit"] is None
     assert reconciled["completion_receipt"]
     assert reconciled["current_stage"] == "next-task"
+
+
+def test_situational_direction_selects_configured_fragments(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Plan")),
+        ("planning-revise", response("continue", "Revised plan")),
+        ("implementation", response("continue", "Implementation")),
+        ("implementation-repair", response("continue", "Repair")),
+        ("planning-propose", response("continue", "Cycle two plan")),
+        ("implementation", response("continue", "Cycle two build")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", response("continue", "First review finding")),
+        ("planning-review", response("ready", "Plan approved")),
+        ("implementation-review", response("continue", "Defect found")),
+        ("implementation-review", response("ready", "Implementation accepted")),
+        ("next-task", response("human", "Proposed next task")),
+        ("planning-review", response("ready", "Cycle two plan ready")),
+        ("implementation-review", response("ready", "Cycle two accepted")),
+        ("next-task", response("human", "Cycle three proposal")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Build the thing", "test")
+    state = app.run_to_stop(run_id)
+
+    def stage_turns(name):
+        return [t for t in state["turns"] if t["stage"] == name and t["substantive"] and not t["correction"]]
+
+    # First visit in cycle 1 stays silent — the stance prompt already carries that language.
+    first_ideate = stage_turns("planning-propose")[0]
+    assert first_ideate["direction_file"] is None
+    assert stage_turns("planning-review")[0]["direction_file"] is None
+    assert stage_turns("implementation-review")[0]["direction_file"] is None
+
+    # A revisited reviewer stage emits the closure fragment the workflow maps to it,
+    # and it is threaded into the exact transport prompt.
+    second_review = stage_turns("planning-review")[1]
+    assert second_review["direction_file"] == f"{second_review['id']}.direction.md"
+    closure = app.artifact(run_id, f"turns/{second_review['direction_file']}").decode("utf-8")
+    assert "do not manufacture objections" in closure
+    second_review_prompt = [
+        item["prompt"] for item in claude.invocations if item["route"] == "planning-review"
+    ][1].decode("utf-8")
+    assert "# Orchestrator direction" in second_review_prompt
+    assert "do not manufacture objections" in second_review_prompt
+
+    # A revisited audit after a repair emits the recheck fragment, not the closure one.
+    second_audit = stage_turns("implementation-review")[1]
+    recheck = app.artifact(run_id, f"turns/{second_audit['direction_file']}").decode("utf-8")
+    assert "fake/real divergence" in recheck
+
+    # Cycle two's first planner turn emits the later-cycle continuity fragment.
+    app.decide(run_id, "yes")
+    state = app.state(run_id)
+    cycle_two_ideate = next(
+        t for t in state["turns"]
+        if t["stage"] == "planning-propose" and t["cycle"] == 2 and t["substantive"]
+    )
+    continuity = app.artifact(run_id, f"turns/{cycle_two_ideate['direction_file']}").decode("utf-8")
+    assert "already-accepted branch" in continuity
