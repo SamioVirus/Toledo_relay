@@ -152,11 +152,13 @@ def make_handler(engine: CycleOrchestrator, workers: RunWorkers, nonce: str) -> 
         def _error(self, error: Exception, status: int = 400) -> None:
             self._send({"error": f"{type(error).__name__}: {error}"}, status)
 
-        def _read_json(self) -> dict[str, Any]:
+        def _read_body(self) -> bytes:
             length = int(self.headers.get("Content-Length", "0"))
-            if length > 1_000_000:
+            if length < 0 or length > 1_000_000:
                 raise ValueError("request body is too large")
-            data = self.rfile.read(length)
+            return self.rfile.read(length)
+
+        def _parse_json(self, data: bytes) -> dict[str, Any]:
             value = json.loads(data.decode("utf-8")) if data else {}
             if not isinstance(value, dict):
                 raise ValueError("JSON request body must be an object")
@@ -250,8 +252,12 @@ def make_handler(engine: CycleOrchestrator, workers: RunWorkers, nonce: str) -> 
 
         def do_POST(self) -> None:  # noqa: N802
             try:
+                # Drain the request body before rejecting authentication. On
+                # Windows, closing a connection with unread request bytes can
+                # reset the socket before the client receives the intended 403.
+                body = self._read_body()
                 self._authorize_write()
-                value = self._read_json()
+                value = self._parse_json(body)
                 parsed = urllib.parse.urlparse(self.path)
                 parts = [item for item in parsed.path.split("/") if item]
                 if parsed.path == "/api/runs":
