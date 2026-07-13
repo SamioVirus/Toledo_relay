@@ -120,6 +120,43 @@ def test_local_web_api_serves_ui_requires_nonce_and_blocks_artifact_traversal(tm
         thread.join(timeout=5)
 
 
+def test_head_endpoint_returns_only_change_detection_fields(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    run_id = "run_20260712T120000Z_1234abcd"
+    write_json(engine.runs_dir / run_id / "run.json", {
+        "run_id": run_id,
+        "schema_version": "toledo_orchestrator.run.v2",
+        "status": "paused",
+        "current_turn": 7,
+        "pending_human_decision": "next_task_approval",
+        "event_sequence": 42,
+        "events": [{"id": f"event.{n:06d}"} for n in range(42)],
+        "turns": [{"id": f"turn.{n:04d}", "output_file": f"turn.{n:04d}.output.md"} for n in range(7)],
+    })
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status, head = request_json(base + f"/api/runs/{run_id}/head")
+        assert status == 200
+        assert head == {
+            "run_id": run_id,
+            "event_sequence": 42,
+            "status": "paused",
+            "current_turn": 7,
+            "pending_human_decision": "next_task_approval",
+            "worker": {"active": False, "error": None},
+        }
+        # The head response must stay small: it never carries turns or events.
+        assert "turns" not in head and "events" not in head
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_background_worker_failure_is_persisted_in_run_state(tmp_path: Path):
     engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
     workers = RunWorkers()

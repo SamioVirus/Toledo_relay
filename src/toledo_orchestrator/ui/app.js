@@ -13,6 +13,7 @@ let currentRenderSignature = null;
 let runListSignature = null;
 let pollBusy = false;
 let pollCount = 0;
+let lastHeadSignature = null;
 let railReturnFocus = null;
 let settingsWorkflowId = null;
 const promptPreviewCache = new Map();
@@ -92,6 +93,7 @@ async function refreshRuns() {
 async function selectRun(runId) {
   currentRunId = runId;
   currentRenderSignature = null;
+  lastHeadSignature = null;
   closeRunRail();
   await refreshCurrent(true);
   await refreshRuns();
@@ -118,9 +120,16 @@ async function poll() {
   if (pollBusy) return;
   pollBusy = true;
   try {
-    await refreshCurrent();
+    let changed = true;
+    try {
+      const head = await api(`/api/runs/${encodeURIComponent(currentRunId)}/head`);
+      const signature = JSON.stringify([head.event_sequence, head.status, head.current_turn, head.pending_human_decision, head.worker]);
+      changed = signature !== lastHeadSignature;
+      lastHeadSignature = signature;
+    } catch { changed = true; }
+    if (changed) await refreshCurrent();
     pollCount += 1;
-    if (pollCount % 3 === 0) await refreshRuns();
+    if (pollCount % 5 === 0) await refreshRuns();
   } finally {
     pollBusy = false;
   }

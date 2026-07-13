@@ -190,6 +190,21 @@ def make_handler(engine: CycleOrchestrator, workers: RunWorkers, nonce: str) -> 
                     self._send(_run_summaries(engine, workers))
                     return
                 parts = [value for value in path.split("/") if value]
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "head":
+                    # Cheap change-detection so idle polling does not re-read every
+                    # turn artifact each tick. event_sequence advances on every run
+                    # event; worker status is not an event, so it is included too.
+                    run_id = parts[2]
+                    state = engine.state(run_id)
+                    self._send({
+                        "run_id": run_id,
+                        "event_sequence": state.get("event_sequence", 0),
+                        "status": state.get("status"),
+                        "current_turn": state.get("current_turn", 0),
+                        "pending_human_decision": state.get("pending_human_decision"),
+                        "worker": workers.status(run_id),
+                    })
+                    return
                 if len(parts) == 3 and parts[:2] == ["api", "runs"]:
                     run_id = parts[2]
                     state = _timeline_compatible(engine.state(run_id))
