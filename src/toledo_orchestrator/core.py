@@ -274,7 +274,7 @@ class CodexAdapter(ProviderAdapter):
         if model != "provider-default":
             common.extend(["-m", model])
         if reasoning != "provider-default":
-            common.extend(["-c", f'model_reasoning_effort="{reasoning}"'])
+            common.extend(["-c", f"model_reasoning_effort={json.dumps(reasoning)}"])
         if session_action == "new":
             command = [executable, "exec", "--sandbox", permission, *common, "-"]
         else:

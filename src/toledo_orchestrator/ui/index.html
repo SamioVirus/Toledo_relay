@@ -54,7 +54,7 @@
     <aside class="inspector" id="inspector" aria-hidden="true" hidden inert>
       <div class="inspector-head"><div><p class="eyebrow" id="inspector-kicker">ARTIFACT</p><h2 id="inspector-title">Inspector</h2></div><button id="close-inspector" aria-label="Close inspector">×</button></div>
       <div class="inspector-meta" id="inspector-meta"></div>
-      <div class="inspector-tabs" role="tablist" aria-label="Artifact views"><button class="active" data-tab="prompt" role="tab" aria-selected="true">Prompt</button><button data-tab="output" role="tab" aria-selected="false">Output</button><button data-tab="metadata" role="tab" aria-selected="false">Metadata</button></div>
+      <div class="inspector-tabs" role="tablist" aria-label="Artifact views"><button class="active" data-tab="direction" role="tab" aria-selected="true">Direction</button><button data-tab="transport" role="tab" aria-selected="false">Transport</button><button data-tab="output" role="tab" aria-selected="false">Output</button><button data-tab="metadata" role="tab" aria-selected="false">Metadata</button></div>
       <pre id="inspector-content"></pre>
     </aside>
   </div>
@@ -65,6 +65,10 @@
       <label>Project<select id="new-project"></select></label>
       <label>Workflow<select id="new-workflow"></select></label>
       <label>Run mode<select id="new-run-mode"><option value="auto">Auto — continue until a decision is needed</option><option value="step">Pause after each turn</option></select></label>
+      <section class="route-preflight" aria-labelledby="route-preflight-title">
+        <div class="route-preflight-head"><div><p class="eyebrow">ROUTE PREFLIGHT</p><h3 id="route-preflight-title">Who acts, and how</h3></div><span id="route-preflight-summary"></span></div>
+        <div id="new-run-preflight" class="route-preflight-strip"></div>
+      </section>
       <label>Request<textarea id="new-request" rows="11" placeholder="Describe the outcome, why it matters, constraints, and evidence you want. The planning session will develop the implementation handoff."></textarea></label>
       <div class="modal-actions"><button value="cancel" class="ghost-button">Cancel</button><button type="button" id="create-run" class="primary-button">Start planning</button></div>
     </form>
@@ -73,6 +77,7 @@
   <dialog id="settings-dialog" class="modal wide-modal">
     <form method="dialog">
       <div class="modal-head"><div><p class="eyebrow">CONTROL SURFACE</p><h2>Profiles and repositories</h2></div><button value="cancel" aria-label="Close">×</button></div>
+      <label class="settings-workflow-picker">Workflow<select id="settings-workflow"></select></label>
       <div class="settings-grid"><section><h3>Route profiles</h3><p>Display labels stay friendly; CLI model and effort values remain explicit.</p><div id="profile-settings"></div></section><section><h3>Projects</h3><p>Each run stays bound to one repository and executes implementation in an isolated worktree.</p><div id="project-settings"></div><button type="button" class="quiet-button" id="add-project-button">Add repository</button></section></div>
     </form>
   </dialog>

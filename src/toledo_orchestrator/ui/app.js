@@ -14,7 +14,9 @@ let runListSignature = null;
 let pollBusy = false;
 let pollCount = 0;
 let railReturnFocus = null;
+let settingsWorkflowId = null;
 const promptPreviewCache = new Map();
+const gateDrafts = new Map();
 
 async function api(path, options = {}) {
   const headers = {"Content-Type": "application/json", ...(options.headers || {})};
@@ -27,9 +29,26 @@ async function api(path, options = {}) {
 }
 
 function sessionColorClass(label) {
+  const logicalLabel = String(label || "?").match(/^([A-Z]+)(?:\.|$)/);
+  if (logicalLabel) {
+    let ordinal = 0;
+    for (const char of logicalLabel[1]) ordinal = ordinal * 26 + char.charCodeAt(0) - 64;
+    return `session-color-${(ordinal - 1) % 24}`;
+  }
   let hash = 0;
   for (const char of String(label || "?")) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-  return `session-color-${hash % 8}`;
+  return `session-color-${hash % 24}`;
+}
+
+function sessionDisplay(turn) {
+  const generation = turn.session_generation == null ? 1 : Number(turn.session_generation);
+  return `${turn.session_label || "?"}.${generation}`;
+}
+
+function sessionIdSuffix(sessionId) {
+  if (!sessionId) return "provider ID unavailable";
+  const value = String(sessionId);
+  return `provider …${value.slice(-8)}`;
 }
 
 function compactId(runId) {
@@ -88,6 +107,7 @@ function stateSignature(state) {
     gate: state.pending_human_decision,
     inflight: state.inflight,
     cycles: state.cycles,
+    decisions: state.decisions,
     events: state.events,
     worker: state.worker,
     override: state.next_turn_override,
@@ -139,14 +159,32 @@ function renderRun() {
   $("#empty-state").hidden = true;
   $("#timeline").hidden = false;
   const cycle = state.cycles?.[state.cycle - 1];
-  const heading = state.worker?.active ? `${state.inflight?.title || stageTitle(state.current_stage)} is running…` : stageTitle(state.current_stage);
+  const canRecover = state.schema_version === "toledo_orchestrator.run.v2" && ["created", "running"].includes(state.status) && !state.worker?.active;
+  const heading = canRecover
+    ? "Run interrupted — recovery available"
+    : state.worker?.active
+      ? `${state.inflight?.title || stageTitle(state.current_stage)} is running…`
+      : stageTitle(state.current_stage);
   const retryReasons = new Set(["operator_step", "provider_requested_human", "provider_invocation_failed", "provider_session_id_missing", "provider_session_missing", "provider_session_not_new", "provider_session_changed_unexpectedly", "missing_substantive_output", "malformed_directive", "unsupported_stage_directive", "invalid_next_turn_profile", "profile_permission_exceeds_stage", "background_operation_failed"]);
   const canOverride = state.schema_version === "toledo_orchestrator.run.v2" && state.current_stage && !state.inflight && (state.status === "created" || state.status === "running" || retryReasons.has(state.pending_human_decision));
-  $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(state.run_id)} · ${escapeHtml(state.status.toUpperCase())}</p><h2>${escapeHtml(heading || "Run complete")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">cycle ${state.cycle || 1}</span><span class="fact">${state.current_turn || 0} turns</span><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span>${state.execution_branch ? `<span class="fact">${escapeHtml(state.execution_branch)}</span>` : ''}${canOverride ? '<button class="quiet-button" id="next-turn-control">Override next turn ↗</button>' : ''}</div>`;
+  $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(state.run_id)} · ${escapeHtml(state.status.toUpperCase())}</p><h2>${escapeHtml(heading || "Run complete")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">cycle ${state.cycle || 1}</span><span class="fact">${state.current_turn || 0} turns</span><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span>${state.execution_branch ? `<span class="fact">${escapeHtml(state.execution_branch)}</span>` : ''}${canOverride ? '<button class="quiet-button" id="next-turn-control">Override next turn ↗</button>' : ''}${canRecover ? '<button class="accept-button" id="recover-run">Recover run</button>' : ''}</div>`;
   $("#next-turn-control")?.addEventListener("click", openNextTurnControl);
+  $("#recover-run")?.addEventListener("click", recoverCurrentRun);
   renderFilters(state);
   renderTimeline(state);
   if (state.worker?.error) showBanner(state.worker.error, "error");
+}
+
+async function recoverCurrentRun() {
+  const button = $("#recover-run");
+  if (button) button.disabled = true;
+  try {
+    await api(`/api/runs/${encodeURIComponent(currentRunId)}/recover`, {method:"POST", body:"{}"});
+    await refreshCurrent();
+  } catch (error) {
+    alert(error.message);
+    if (button) button.disabled = false;
+  }
 }
 
 function stageTitle(stageId) {
@@ -183,6 +221,14 @@ function renderTimeline(state) {
     block.dataset.cycle = cycle.number;
     block.innerHTML = `<div class="cycle-heading">${escapeHtml(cycle.id || `cycle.${String(cycle.number).padStart(4,"0")}`)} · ${escapeHtml(cycle.status || "active")}</div>`;
     const turns = (state.turns || []).filter((turn) => turn.cycle === cycle.number && visibleTurn(turn));
+    const decisions = (state.decisions || []).filter((decision) => Number(decision.cycle || 1) === Number(cycle.number));
+    const shownDecisions = new Set();
+    for (const [index, decision] of decisions.entries()) {
+      if (Number(decision.after_turn || 0) === 0) {
+        block.append(humanDecisionNode(decision, index));
+        shownDecisions.add(decision.file);
+      }
+    }
     let handoffShown = false;
     let completionShown = false;
     for (const turn of turns) {
@@ -195,9 +241,18 @@ function renderTimeline(state) {
         completionShown = true;
       }
       block.append(turnRow(turn));
+      for (const [index, decision] of decisions.entries()) {
+        if (Number(decision.after_turn) === Number(String(turn.id || "").split(".").at(-1))) {
+          block.append(humanDecisionNode(decision, index));
+          shownDecisions.add(decision.file);
+        }
+      }
     }
     if (cycle.approved_handoff && !handoffShown) block.append(milestone("Approved handoff sealed", cycle.approved_handoff, false));
     if (cycle.completion_receipt && !completionShown) block.append(milestone("Implementation accepted", cycle.completion_receipt, true));
+    for (const [index, decision] of decisions.entries()) {
+      if (!shownDecisions.has(decision.file)) block.append(humanDecisionNode(decision, index));
+    }
     if (state.cycle === cycle.number && state.worker?.active) {
       const active = document.createElement("div");
       active.className = "active-node";
@@ -214,6 +269,7 @@ function renderTimeline(state) {
     root.append(block);
   }
   hydratePromptPreviews();
+  hydrateDecisionPreviews();
 }
 
 function turnRow(turn) {
@@ -223,7 +279,9 @@ function turnRow(turn) {
   row.dataset.session = turn.session_label;
   const colorClass = sessionColorClass(turn.session_label);
   const preview = (turnPreview(turn) || "Open the stored artifact.").replace(/\s+/g, " ").slice(0, 280);
-  row.innerHTML = `<button class="prompt-node" data-prompt-path="turns/${escapeHtml(turn.prompt_file)}" data-tooltip="Loading exact prompt…" aria-label="Open ${escapeHtml(turn.title)} prompt">${escapeHtml(promptShort(turn.prompt_kind))}</button><article class="turn-card ${escapeHtml(turn.provider)} ${colorClass}" tabindex="0" role="button" aria-label="Open ${escapeHtml(turn.title)} output"><div class="turn-card-head"><div class="actor"><span class="session-token">${escapeHtml(turn.session_label)}</span><div><h3>${escapeHtml(turn.title)}</h3><span class="route">${escapeHtml(turn.provider)} · ${escapeHtml(turn.role)}</span></div></div><span class="turn-number">${escapeHtml(turn.id)}</span></div><p class="turn-preview">${escapeHtml(preview)}</p><div class="chips"><span class="chip ${escapeHtml(turn.session_action)}">${escapeHtml(turn.session_action)} session</span><span class="chip">${escapeHtml(turn.profile_label || turn.profile)}</span><span class="chip">${escapeHtml(turn.permission)}</span><span class="chip">${Math.round((turn.elapsed_ms || 0)/1000)}s</span></div></article>`;
+  const interstitialFile = turn.interstitial_file || turn.prompt_file;
+  const tooltipId = `direction-${String(turn.id || "turn").replaceAll(".", "-")}`;
+  row.innerHTML = `<button class="prompt-node" data-interstitial-path="${escapeHtml(turnArtifactPath(interstitialFile))}" aria-describedby="${escapeHtml(tooltipId)}" aria-label="Open ${escapeHtml(turn.prompt_label || turn.title)} direction"><span class="prompt-label">${escapeHtml(turn.prompt_label || promptShort(turn.prompt_kind))}</span><span class="prompt-tooltip" id="${escapeHtml(tooltipId)}" role="tooltip">Loading exact direction…</span></button><article class="turn-card ${escapeHtml(turn.provider)} ${colorClass}" tabindex="0" role="button" aria-label="Open ${escapeHtml(turn.title)} output"><div class="turn-card-head"><div class="actor"><span class="session-token">${escapeHtml(sessionDisplay(turn))}</span><div><h3>${escapeHtml(turn.title)}</h3><span class="route">${escapeHtml(turn.provider)} · ${escapeHtml(turn.role)}</span></div></div><span class="turn-number">${escapeHtml(turn.id)}</span></div><p class="turn-preview">${escapeHtml(preview)}</p><div class="chips"><span class="chip ${escapeHtml(turn.session_action)}">${escapeHtml(turn.session_action)} session</span><span class="chip">${escapeHtml(turn.profile_label || turn.profile)}</span><span class="chip">${escapeHtml(turn.permission)}</span><span class="chip">${Math.round((turn.elapsed_ms || 0)/1000)}s</span></div></article>`;
   const card = $(".turn-card", row);
   const prompt = $(".prompt-node", row);
   card.addEventListener("click", () => openTurn(turn, "output"));
@@ -233,7 +291,7 @@ function turnRow(turn) {
       openTurn(turn, "output");
     }
   });
-  prompt.addEventListener("click", () => openTurn(turn, "prompt"));
+  prompt.addEventListener("click", () => openTurn(turn, "direction"));
   return row;
 }
 
@@ -257,18 +315,39 @@ function milestone(label, path, accepted) {
   return row;
 }
 
-async function hydratePromptPreviews() {
-  for (const node of $$(".prompt-node[data-prompt-path]")) {
+function humanDecisionNode(decision, index) {
+  const row = document.createElement("div");
+  row.className = "decision-row";
+  const button = document.createElement("button");
+  button.className = "decision-node";
+  button.dataset.decisionPath = decision.file;
+  button.innerHTML = `<span class="decision-choice">Human · ${escapeHtml(humanizeReason(decision.choice || "direction"))}</span><span class="decision-reason">${escapeHtml(humanizeReason(decision.reason))}</span><span class="decision-preview">Open stored direction</span>`;
+  button.addEventListener("click", () => openDecision(decision, index));
+  row.append(button);
+  return row;
+}
+
+async function hydrateDecisionPreviews() {
+  for (const node of $$(".decision-node[data-decision-path]")) {
     try {
-      const cacheKey = `${currentRunId}:${node.dataset.promptPath}`;
+      const text = await artifactText(node.dataset.decisionPath);
+      const preview = text.replace(/\s+/g, " ").trim();
+      $(".decision-preview", node).textContent = preview || "Stored without additional text";
+    } catch { $(".decision-preview", node).textContent = "Decision artifact unavailable"; }
+  }
+}
+
+async function hydratePromptPreviews() {
+  for (const node of $$(".prompt-node[data-interstitial-path]")) {
+    try {
+      const cacheKey = `${currentRunId}:${node.dataset.interstitialPath}`;
       let preview = promptPreviewCache.get(cacheKey);
       if (!preview) {
-        const text = await artifactText(node.dataset.promptPath);
-        preview = text.slice(0, 1000) + (text.length > 1000 ? "\n…" : "");
+        preview = await artifactText(node.dataset.interstitialPath);
         promptPreviewCache.set(cacheKey, preview);
       }
-      node.dataset.tooltip = preview;
-    } catch { node.dataset.tooltip = "Prompt artifact unavailable"; }
+      $(".prompt-tooltip", node).textContent = preview;
+    } catch { $(".prompt-tooltip", node).textContent = "Direction artifact unavailable"; }
   }
 }
 
@@ -276,28 +355,42 @@ async function artifactText(path) {
   return api(`/api/runs/${encodeURIComponent(currentRunId)}/artifact?path=${encodeURIComponent(path)}`);
 }
 
+function turnArtifactPath(file) {
+  return String(file || "").includes("/") ? String(file) : `turns/${file}`;
+}
+
 async function openTurn(turn, tab = "output") {
-  const [prompt, output] = await Promise.all([
-    artifactText(`turns/${turn.prompt_file}`),
-    artifactText(`turns/${turn.output_file}`),
+  const [direction, transport, output] = await Promise.all([
+    artifactText(turnArtifactPath(turn.interstitial_file || turn.prompt_file)),
+    artifactText(turnArtifactPath(turn.prompt_file)),
+    artifactText(turnArtifactPath(turn.output_file)),
   ]);
-  inspectorPayload = {prompt, output, metadata: JSON.stringify(turn, null, 2)};
-  $("#inspector-kicker").textContent = `${turn.session_label} · ${turn.profile_label || turn.profile}`;
+  inspectorPayload = {direction, transport, output, metadata: JSON.stringify(turn, null, 2)};
+  $("#inspector-kicker").textContent = `${sessionDisplay(turn)} · ${turn.profile_label || turn.profile}`;
   $("#inspector-title").textContent = turn.title;
   const observed = turn.observed_model || turn.observed_reasoning
     ? `<span class="chip observed">observed ${escapeHtml(turn.observed_model || "model unknown")} · ${escapeHtml(turn.observed_reasoning || "effort unknown")}</span>`
     : `<span class="chip muted">observation unavailable${turn.observation_error ? ` · ${escapeHtml(turn.observation_error)}` : ""}</span>`;
-  $("#inspector-meta").innerHTML = `<span class="chip ${escapeHtml(turn.session_action)}">${escapeHtml(turn.session_action)}</span><span class="chip">configured ${escapeHtml(turn.configured_model)} · ${escapeHtml(turn.configured_reasoning)}</span>${observed}<span class="chip">${escapeHtml(turn.permission)}</span>`;
+  $("#inspector-meta").innerHTML = `<span class="chip ${escapeHtml(turn.session_action)}">${escapeHtml(turn.session_action)}</span><span class="chip">logical ${escapeHtml(sessionDisplay(turn))}</span><span class="chip">${escapeHtml(sessionIdSuffix(turn.session_id))}</span><span class="chip">configured ${escapeHtml(turn.configured_model)} · ${escapeHtml(turn.configured_reasoning)}</span>${observed}<span class="chip">${escapeHtml(turn.permission)}</span>`;
   openInspector(tab);
 }
 
 async function openArtifact(title, path) {
   const content = await artifactText(path);
-  inspectorPayload = {prompt:"", output:content, metadata:JSON.stringify({path}, null, 2)};
+  inspectorPayload = {output:content, metadata:JSON.stringify({path}, null, 2)};
   $("#inspector-kicker").textContent = "SEALED ARTIFACT";
   $("#inspector-title").textContent = title;
   $("#inspector-meta").innerHTML = `<span class="chip">${escapeHtml(path)}</span>`;
   openInspector("output");
+}
+
+async function openDecision(decision, index) {
+  const content = await artifactText(decision.file);
+  inspectorPayload = {direction:content, metadata:JSON.stringify(decision, null, 2)};
+  $("#inspector-kicker").textContent = `HUMAN DIRECTION · ${String(index + 1).padStart(2, "0")}`;
+  $("#inspector-title").textContent = humanizeReason(decision.reason);
+  $("#inspector-meta").innerHTML = `<span class="chip">${escapeHtml(decision.choice)}</span><span class="chip">cycle ${escapeHtml(decision.cycle)}</span><span class="chip">after turn ${escapeHtml(decision.after_turn)}</span>`;
+  openInspector("direction");
 }
 
 function openInspector(tab) {
@@ -307,8 +400,15 @@ function openInspector(tab) {
   inspector.inert = false;
   document.querySelector(".app-shell").classList.add("inspector-open");
   inspector.setAttribute("aria-hidden", "false");
+  syncInspectorTabs();
   selectInspectorTab(tab);
   $("#close-inspector").focus();
+}
+
+function syncInspectorTabs() {
+  $$(".inspector-tabs button").forEach((button) => {
+    button.hidden = inspectorPayload?.[button.dataset.tab] === undefined;
+  });
 }
 
 function closeInspector() {
@@ -323,6 +423,8 @@ function closeInspector() {
 }
 
 function selectInspectorTab(tab) {
+  const requested = $(`.inspector-tabs button[data-tab="${tab}"]`);
+  if (!requested || requested.hidden) tab = $$(".inspector-tabs button").find((button) => !button.hidden)?.dataset.tab;
   $$(".inspector-tabs button").forEach((button) => {
     const selected = button.dataset.tab === tab;
     button.classList.toggle("active", selected);
@@ -334,16 +436,18 @@ function selectInspectorTab(tab) {
 function bindGate(fragment) {
   const gate = $(".human-gate", fragment);
   const textarea = $("textarea", gate);
+  textarea.addEventListener("input", () => gateDrafts.set(gate.dataset.draftKey, textarea.value));
   $$('[data-choice]', gate).forEach((button) => button.addEventListener("click", async () => {
     const choice = button.dataset.choice;
     if (choice === "other" && !textarea.value.trim()) { textarea.focus(); return; }
     button.disabled = true;
     try {
       if (gate.dataset.reason === "operator_step") {
-        await api(`/api/runs/${encodeURIComponent(currentRunId)}/continue`, {method:"POST", body:"{}"});
+        await api(`/api/runs/${encodeURIComponent(currentRunId)}/continue`, {method:"POST", body:JSON.stringify({direction:textarea.value})});
       } else {
         await api(`/api/runs/${encodeURIComponent(currentRunId)}/decision`, {method:"POST", body:JSON.stringify({choice, text:choice === "other" ? textarea.value : ""})});
       }
+      gateDrafts.delete(gate.dataset.draftKey);
       await refreshCurrent();
     } catch (error) { alert(error.message); button.disabled = false; }
   }));
@@ -360,10 +464,11 @@ function configureGate(fragment, state) {
   const no = $('[data-choice="no"]', gate);
   const other = $('[data-choice="other"]', gate);
   const copy = {
-    operator_step: ["Ready for the next turn?", "Step mode paused before the next provider invocation. You can adjust the one-turn profile or session action above, then continue.", "Run next turn", "", "", ""],
-    next_task_approval: ["Is this the right next task?", "The proposal is preserved exactly. Accept it, finish the loop, or redirect Claude session B.", "Yes — start planning", "No — finish here", "Other — revise proposal", "Tell session B what to change"],
+    operator_step: ["Ready for the next turn?", "Step mode paused before the next provider invocation. You can adjust the one-turn profile or session action above, add a concise direction, then continue.", "Run next turn", "", "", "Optional direction for the next turn"],
+    next_task_approval: ["Is this the right next task?", "The proposal is preserved exactly. Accept it, finish the loop, or redirect the current strategic session.", "Yes — start planning", "No — finish here", "Other — revise proposal", "Tell the strategic session what to change"],
     validation_execution_approval: ["Run the validation commands?", "These commands execute on the host against the isolated implementation worktree. Review the pending commands before approving.", "Yes — run validation", "No — cancel run", "Other — send to repair", "Explain what session C must change before validation"],
     validation_receipt_required: ["Validation receipt required", `Attach the patch-bound receipt from a terminal with: python -m toledo_orchestrator validate ${state.run_id} --receipt-file "C:\\path\\to\\receipt.json"`, "", "No — cancel run", "Other — add direction", "Add receipt or validation guidance"],
+    unknown_validation_execution: ["Validation completion is unknown", "The controller stopped after host validation started but before a trustworthy completion record was sealed. It will not rerun the commands automatically. Route the work to repair/inspection, cancel, or add exact recovery direction.", "Yes — inspect and repair", "No — cancel run", "Other — direct recovery", "Tell the implementation session what evidence to inspect before any rerun"],
     planning_round_cap_reached: ["Planning round cap reached", "The planning loop used its configured rounds without agreement. Extend it, stop, or redirect the next revision.", "Yes — extend one round", "No — cancel run", "Other — extend with direction", "Tell the planning sessions what must change"],
     implementation_round_cap_reached: ["Implementation round cap reached", "The implementation loop used its configured repair rounds. Extend it, stop, or direct one more repair.", "Yes — extend one round", "No — cancel run", "Other — extend with direction", "Tell the implementation sessions what must change"],
     validation_failed_at_repair_cap: ["Validation still fails", "Required validation failed after the configured repair rounds. Extend repair, stop, or give a specific recovery direction.", "Yes — extend repair", "No — cancel run", "Other — direct repair", "Describe the evidence or repair you require"],
@@ -375,14 +480,14 @@ function configureGate(fragment, state) {
     description.textContent = `The run paused at ${stageTitle(state.current_stage) || "the current stage"}. Review the stored evidence, then continue, cancel, or add direction.`;
   }
   label.textContent = textarea.placeholder || "Optional direction";
+  gate.dataset.draftKey = `${currentRunId}:${reason}`;
+  textarea.value = gateDrafts.get(gate.dataset.draftKey) || "";
   if (reason === "validation_execution_approval") {
     const commands = (state.pending_validation?.commands || []).map((item) => `${item.id}: ${item.command}`);
     if (commands.length) description.textContent += `\n\nPending host commands:\n${commands.join("\n")}`;
   }
   gate.dataset.reason = reason;
   if (reason === "operator_step") {
-    textarea.hidden = true;
-    label.hidden = true;
     no.hidden = true;
     other.hidden = true;
   }
@@ -397,19 +502,61 @@ function humanizeReason(reason) {
 function populateNewRun() {
   $("#new-project").innerHTML = Object.entries(bootstrap.projects).map(([id, project]) => `<option value="${escapeHtml(id)}">${escapeHtml(id)} · ${escapeHtml(project.root)}</option>`).join("");
   $("#new-workflow").innerHTML = Object.entries(bootstrap.workflows).map(([id, workflow]) => `<option value="${escapeHtml(id)}">${escapeHtml(workflow.label)}</option>`).join("");
+  renderNewRunPreflight();
+}
+
+function renderNewRunPreflight() {
+  const workflow = bootstrap?.workflows?.[$("#new-workflow").value];
+  const root = $("#new-run-preflight");
+  if (!workflow) {
+    root.innerHTML = '<p class="route-preflight-empty">No route definition is available.</p>';
+    $("#route-preflight-summary").textContent = "";
+    return;
+  }
+  const stages = orderedWorkflowStages(workflow);
+  $("#route-preflight-summary").textContent = `${stages.length} stages · ${workflow.label}`;
+  root.innerHTML = stages.map((stage, index) => {
+    const profile = workflow.profiles?.[stage.profile] || {};
+    const label = stage.prompt_label || promptShort(stage.prompt_kind);
+    return `<article class="route-preflight-card"><span class="route-index">${String(index + 1).padStart(2, "0")}</span><p>${escapeHtml(label)}</p><h4>${escapeHtml(stage.title)}</h4><dl><div><dt>Actor</dt><dd>${escapeHtml(stage.session_slot)}</dd></div><div><dt>Profile</dt><dd>${escapeHtml(profile.model || stage.profile)} · ${escapeHtml(profile.effort || "default")}</dd></div><div><dt>Access</dt><dd>${escapeHtml(profile.permission || "unspecified")}</dd></div><div><dt>Session</dt><dd>${escapeHtml(stage.session_policy)}</dd></div></dl></article>`;
+  }).join("");
+}
+
+function orderedWorkflowStages(workflow) {
+  const stages = workflow.stages || {};
+  const ordered = [];
+  const visited = new Set();
+  const visit = (stageId) => {
+    if (!stageId || visited.has(stageId) || !stages[stageId]) return;
+    visited.add(stageId);
+    const stage = stages[stageId];
+    ordered.push(stage);
+    for (const target of Object.values(stage.transitions || {})) {
+      const value = String(target);
+      const next = value.startsWith("@seal:") || value.startsWith("@complete:") ? value.split(":").at(-1) : value.startsWith("@") ? null : value;
+      visit(next);
+    }
+  };
+  visit(workflow.start_stage);
+  for (const stageId of Object.keys(stages)) visit(stageId);
+  return ordered;
 }
 
 function renderSettings() {
   const workflows = bootstrap.workflows;
-  const workflow = workflows["continuous-development"] || Object.values(workflows)[0];
+  settingsWorkflowId = workflows[settingsWorkflowId] ? settingsWorkflowId : Object.keys(workflows)[0];
+  const selector = $("#settings-workflow");
+  selector.innerHTML = Object.entries(workflows).map(([id, workflow]) => `<option value="${escapeHtml(id)}">${escapeHtml(workflow.label)}</option>`).join("");
+  selector.value = settingsWorkflowId;
+  const workflow = workflows[settingsWorkflowId];
   const root = $("#profile-settings");
   root.innerHTML = "";
-  for (const profile of Object.values(workflow.profiles)) {
+  for (const [profileId, profile] of Object.entries(workflow?.profiles || {})) {
     const card = document.createElement("article");
     card.className = "profile-editor";
-    card.innerHTML = `<header><strong>${escapeHtml(profile.label)}</strong><span>${escapeHtml(profile.id)} · ${escapeHtml(profile.provider)}</span></header><div class="profile-grid"><input data-field="model" value="${escapeHtml(profile.model)}" aria-label="${escapeHtml(profile.label)} model"><input data-field="effort" value="${escapeHtml(profile.effort)}" aria-label="${escapeHtml(profile.label)} reasoning effort"><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} profile">Save</button></div>`;
+    card.innerHTML = `<header><strong>${escapeHtml(profile.label)}</strong><span>${escapeHtml(profile.id || profileId)} · ${escapeHtml(profile.provider)}</span></header><div class="profile-grid"><input data-field="model" value="${escapeHtml(profile.model)}" aria-label="${escapeHtml(profile.label)} model"><input data-field="effort" value="${escapeHtml(profile.effort)}" aria-label="${escapeHtml(profile.label)} reasoning effort"><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} profile">Save</button></div>`;
     $("button", card).addEventListener("click", async () => {
-      const payload = {workflow:workflow.id, profile:profile.id, model:$('[data-field="model"]',card).value, effort:$('[data-field="effort"]',card).value};
+      const payload = {workflow:workflow.id, profile:profile.id || profileId, model:$('[data-field="model"]',card).value, effort:$('[data-field="effort"]',card).value};
       try { await api("/api/profile", {method:"POST",body:JSON.stringify(payload)}); await loadBootstrap(); }
       catch(error){ alert(error.message); }
     });
@@ -446,13 +593,30 @@ function openNextTurnControl() {
   const profiles = Object.values(workflow.profiles).filter((profile) => profile.provider === defaultProfile.provider && (writeAllowed || profile.permission !== "workspace-write"));
   const dialog = document.createElement("dialog");
   dialog.className = "modal";
-  dialog.innerHTML = `<form method="dialog"><div class="modal-head"><div><p class="eyebrow">ONE-TURN OVERRIDE</p><h2>${escapeHtml(stage.title)}</h2></div><button value="cancel" aria-label="Close override">×</button></div><label>Profile<select id="override-profile">${profiles.map((profile)=>`<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.label)}</option>`).join("")}</select></label><label>Session action<select id="override-session"><option value="">Workflow default</option><option value="continue">Continue current session</option><option value="new">Start a new session</option></select></label><p class="override-note">The override is recorded in the run and applies only to the displayed next provider turn.</p><div class="modal-actions"><button value="cancel" class="ghost-button">Cancel</button><button type="button" class="primary-button" id="save-override">Apply override</button></div></form>`;
+  dialog.innerHTML = `<form method="dialog"><div class="modal-head"><div><p class="eyebrow">ONE-TURN OVERRIDE</p><h2>${escapeHtml(stage.title)}</h2></div><button value="cancel" aria-label="Close override">×</button></div><label>Profile<select id="override-profile">${profiles.map((profile)=>`<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.label)}</option>`).join("")}</select></label><div class="override-fields"><label>Model<input id="override-model" autocomplete="off"></label><label>Reasoning effort<input id="override-effort" autocomplete="off"></label></div><label>Session action<select id="override-session"><option value="">Workflow default</option><option value="continue">Continue current session</option><option value="new">Start a new session</option></select></label><div class="override-preview" id="override-preview" aria-live="polite"></div><p class="override-note">The override is recorded in the run and applies only to the displayed next provider turn.</p><div class="modal-actions"><button value="cancel" class="ghost-button">Cancel</button><button type="button" class="primary-button" id="save-override">Apply override</button></div></form>`;
   document.body.append(dialog);
   $("#override-profile",dialog).value = currentState.next_turn_override?.profile || stage.profile;
   $("#override-session",dialog).value = currentState.next_turn_override?.session_action || "";
+  const selectedProfile = () => workflow.profiles[$("#override-profile", dialog).value];
+  const refreshOverridePreview = ({resetValues = false} = {}) => {
+    const profile = selectedProfile();
+    if (resetValues) {
+      $("#override-model", dialog).value = profile.model || "";
+      $("#override-effort", dialog).value = profile.effort || "";
+    }
+    const session = $("#override-session", dialog).value || stage.session_policy;
+    $("#override-preview", dialog).innerHTML = `<span>${escapeHtml(profile.provider)}</span><strong>${escapeHtml($("#override-model", dialog).value || "provider default")}</strong><span>${escapeHtml($("#override-effort", dialog).value || "default effort")}</span><span>${escapeHtml(profile.permission)}</span><span>${escapeHtml(session)}</span>`;
+  };
+  $("#override-model",dialog).value = currentState.next_turn_override?.profile_value?.model || selectedProfile().model || "";
+  $("#override-effort",dialog).value = currentState.next_turn_override?.profile_value?.effort || selectedProfile().effort || "";
+  $("#override-profile",dialog).addEventListener("change", () => refreshOverridePreview({resetValues:true}));
+  $("#override-model",dialog).addEventListener("input", () => refreshOverridePreview());
+  $("#override-effort",dialog).addEventListener("input", () => refreshOverridePreview());
+  $("#override-session",dialog).addEventListener("change", () => refreshOverridePreview());
+  refreshOverridePreview();
   $("#save-override",dialog).addEventListener("click", async () => {
     try {
-      await api(`/api/runs/${encodeURIComponent(currentRunId)}/override`, {method:"POST",body:JSON.stringify({profile:$("#override-profile",dialog).value,session_action:$("#override-session",dialog).value || null})});
+      await api(`/api/runs/${encodeURIComponent(currentRunId)}/override`, {method:"POST",body:JSON.stringify({profile:$("#override-profile",dialog).value,model:$("#override-model",dialog).value.trim() || null,effort:$("#override-effort",dialog).value.trim() || null,session_action:$("#override-session",dialog).value || null})});
       dialog.close();dialog.remove();await refreshCurrent();
     } catch(error){alert(error.message);}
   });
@@ -521,6 +685,14 @@ function syncRunRail() {
   }
 }
 
+function applyTimelineDensity(value) {
+  const numeric = Number(value);
+  const density = numeric <= 84 ? "overview" : numeric >= 105 ? "detail" : "balanced";
+  document.documentElement.style.setProperty("--zoom", numeric / 100);
+  $("#timeline").dataset.density = density;
+  $("#zoom-slider").setAttribute("aria-valuetext", `${humanizeReason(density)} density`);
+}
+
 function bindStaticEvents() {
   const openNew = () => $("#new-run-dialog").showModal();
   $("#new-run-button").addEventListener("click", openNew);
@@ -532,10 +704,12 @@ function bindStaticEvents() {
   window.addEventListener("resize", syncRunRail);
   syncRunRail();
   $("#add-project-button").addEventListener("click", showProjectForm);
+  $("#new-workflow").addEventListener("change", renderNewRunPreflight);
+  $("#settings-workflow").addEventListener("change", (event) => { settingsWorkflowId = event.target.value; renderSettings(); });
   $("#refresh-button").addEventListener("click", async () => { await loadBootstrap(); if(currentRunId) await refreshCurrent(); });
   $("#close-inspector").addEventListener("click", closeInspector);
   $$(".inspector-tabs button").forEach((button) => button.addEventListener("click", () => selectInspectorTab(button.dataset.tab)));
-  $("#zoom-slider").addEventListener("input", (event) => document.documentElement.style.setProperty("--zoom", Number(event.target.value)/100));
+  $("#zoom-slider").addEventListener("input", (event) => applyTimelineDensity(event.target.value));
   $("#phase-filter").addEventListener("change", () => currentState && renderTimeline(currentState));
   $("#session-filter").addEventListener("change", () => currentState && renderTimeline(currentState));
   $("#jump-active").addEventListener("click", () => ($("#active-node") || $("#active-gate"))?.scrollIntoView({behavior:"smooth",block:"center"}));
@@ -544,6 +718,7 @@ function bindStaticEvents() {
     if ($("#inspector").getAttribute("aria-hidden") === "false") closeInspector();
     else if (document.body.classList.contains("mobile-rail-open")) closeRunRail();
   });
+  applyTimelineDensity($("#zoom-slider").value);
 }
 
 bindStaticEvents();

@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from toledo_orchestrator.core import ClaudeAdapter, CodexAdapter, ProviderAdapter, ProviderResult, sha256
+from toledo_orchestrator.configuration import load_configured_workflows
 from toledo_orchestrator.cycle import CycleOrchestrator
 from toledo_orchestrator.project import ProjectDefinition, ValidationDefinition
 from toledo_orchestrator.workflow import WorkflowDefinition, load_workflows
@@ -338,6 +339,337 @@ def test_step_mode_pauses_before_d_and_accepts_d_override(tmp_path: Path, writab
     assert state["turns"][-1]["session_label"] == "D"
 
 
+def test_step_mode_transports_exact_optional_owner_direction(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan")),
+        ("planning-revise", sentinel("human", "Revision")),
+    ])
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("continue", "Concrete finding")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Task", "test", run_mode="step")
+    paused = app.run_to_stop(run_id)
+    assert paused["pending_human_decision"] == "operator_step"
+
+    direction = b"Use your judgment; fix real issues and push back on empty fear.\r\n"
+    state = app.continue_step(run_id, direction)
+    assert state["pending_human_decision"] == "operator_step"
+    next_prompt = claude.invocations[-1]["prompt"]
+    assert next_prompt.count(direction) == 1
+    assert next_prompt.count(b"# Immediate human direction") == 1
+    record = state["decisions"][-1]
+    assert record["choice"] == "direction" and record["title"] == "Owner direction"
+    assert (app._run_dir(run_id) / record["file"]).read_bytes() == direction
+    final = app.continue_step(run_id)
+    assert final["pending_human_decision"] == "provider_requested_human"
+    assert direction not in codex.invocations[-1]["prompt"]
+
+
+def test_planner_close_variant_resumes_a_after_b_accepts_c(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan")),
+        ("implementation", sentinel("continue", "Build")),
+        ("next-task", sentinel("human", "Strategic next task")),
+        ("next-task-revise", sentinel("human", "Revised strategic next task")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Plan approved")),
+        ("implementation-review", sentinel("ready", "Build approved")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(
+        b"Task", "test", workflow="continuous-development-planner-close"
+    )
+    state = app.run_to_stop(run_id)
+    assert state["pending_human_decision"] == "next_task_approval"
+    assert [item["route"] for item in claude.invocations] == [
+        "planning-review", "implementation-review"
+    ]
+    assert codex.invocations[0]["session_id"] == "codex-session-1"
+    assert codex.invocations[1]["session_id"] == "codex-session-2"
+    assert codex.invocations[2]["session_id"] == "codex-session-1"
+    assert codex.invocations[2]["model"] == "gpt-5.6-sol"
+    assert state["turns"][-1]["prompt_label"] == "Next"
+
+    revised = app.decide(run_id, "other", b"Make it operationally narrower.\n")
+    assert revised["pending_human_decision"] == "next_task_approval"
+    assert codex.invocations[-1]["route"] == "next-task-revise"
+    assert codex.invocations[-1]["session_id"] == "codex-session-1"
+    assert b"Make it operationally narrower.\n" in codex.invocations[-1]["prompt"]
+
+
+def test_custom_prompt_and_renamed_round_stages_are_declarative(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    workflow_value = {
+        "id": "custom-debate",
+        "label": "Custom debate",
+        "start_stage": "draft-anything",
+        "next_task_stage": "draft-anything",
+        "next_task_revision_stage": "revise-anything",
+        "profiles": {
+            "draft": {"provider": "codex", "permission": "read-only"},
+            "critic": {"provider": "claude", "permission": "read-only"},
+        },
+        "stages": {
+            "draft-anything": {
+                "phase": "planning", "role": "planner", "prompt_kind": "draft",
+                "prompt_label": "Draft", "prompt_file": "custom-draft.md", "profile": "draft",
+                "session_slot": "architect", "session_policy": "new-if-missing", "artifact_type": "plan",
+                "context": ["request"],
+                "transitions": {"continue": "critic-anything", "ready": "critic-anything", "human": "@pause:provider_requested_human"},
+            },
+            "critic-anything": {
+                "phase": "review", "role": "reviewer", "prompt_kind": "critic",
+                "prompt_label": "Critic", "prompt_file": "custom-critic.md", "profile": "critic",
+                "session_slot": "skeptic", "session_policy": "new-if-missing", "artifact_type": "review",
+                "context": ["latest:plan"],
+                "round": {"counter": "debate", "cap": 1, "directive": "continue", "pause_reason": "custom_round_cap"},
+                "transitions": {"continue": "revise-anything", "ready": "@pause:done", "human": "@pause:provider_requested_human"},
+            },
+            "revise-anything": {
+                "phase": "planning", "role": "planner", "prompt_kind": "revise",
+                "prompt_label": "Revise", "prompt_file": "custom-revise.md", "profile": "draft",
+                "session_slot": "architect", "session_policy": "continue", "artifact_type": "plan",
+                "context": ["latest:review"],
+                "transitions": {"continue": "critic-anything", "ready": "critic-anything", "human": "@pause:provider_requested_human"},
+            },
+        },
+    }
+    workflow = WorkflowDefinition.from_value(workflow_value)
+    runtime = tmp_path / "runtime"
+    custom_prompts = runtime / "config" / "prompts" / "custom-debate"
+    custom_prompts.mkdir(parents=True)
+    (custom_prompts / "custom-draft.md").write_text("# Begin from purpose\n", encoding="utf-8")
+    (custom_prompts / "custom-critic.md").write_text("# Find the real weakness\n", encoding="utf-8")
+    (custom_prompts / "custom-revise.md").write_text("# Judge the critique\n", encoding="utf-8")
+    codex = SessionAdapter("codex", [
+        ("draft-anything", sentinel("continue", "Draft")),
+        ("revise-anything", sentinel("continue", "Revision")),
+    ])
+    claude = SessionAdapter("claude", [
+        ("critic-anything", sentinel("continue", "Finding one")),
+        ("critic-anything", sentinel("continue", "Finding two")),
+    ])
+    app = CycleOrchestrator(
+        runtime,
+        {"codex": codex, "claude": claude},
+        {"test": writable_project},
+        {"custom-debate": workflow},
+    )
+    state = app.run_to_stop(app.create_run(b"Task", "test", workflow="custom-debate"))
+    assert state["pending_human_decision"] == "custom_round_cap"
+    assert state["cycles"][0]["rounds"]["debate"]["count"] == 1
+    assert state["cycles"][0]["sessions"]["architect"]["label"] == "A"
+    assert state["cycles"][0]["sessions"]["skeptic"]["label"] == "B"
+    assert b"# Begin from purpose" in codex.invocations[0]["prompt"]
+    first_turn = state["turns"][0]
+    assert first_turn["interstitial_file"] == "prompt-library/custom-draft.md"
+    assert app.artifact(state["run_id"], first_turn["interstitial_file"]).decode("utf-8").splitlines() == [
+        "# Begin from purpose"
+    ]
+
+
+def test_legacy_v2_workflow_snapshot_recovers_caps_repairs_and_seal_source():
+    old_snapshot = load_workflows()["continuous-development"].snapshot()
+    old_snapshot.pop("schema_version", None)
+    old_snapshot.pop("session_slots", None)
+    for stage in old_snapshot["stages"].values():
+        stage.pop("round", None)
+        stage.pop("repair_stage", None)
+        stage.pop("seal_source", None)
+        stage.pop("prompt_label", None)
+    restored = WorkflowDefinition.from_value(old_snapshot)
+    planning_review = restored.stages["planning-review"]
+    implementation_review = restored.stages["implementation-review"]
+    assert planning_review.round_counter == "planning"
+    assert planning_review.round_cap == 3
+    assert planning_review.seal_source == "plan"
+    assert implementation_review.round_counter == "implementation"
+    assert implementation_review.round_cap == 2
+    assert implementation_review.repair_stage == "implementation-repair"
+    assert restored.stages["implementation"].repair_stage == "implementation-repair"
+    assert restored.session_slots == ("planner", "reviewer", "implementer")
+
+
+def test_current_schema_does_not_infer_legacy_semantics_from_stage_names():
+    value = {
+        "schema_version": "toledo_orchestrator.workflow.v2",
+        "id": "custom-named-stage",
+        "label": "Custom named stage",
+        "start_stage": "planning-review",
+        "next_task_stage": "planning-review",
+        "next_task_revision_stage": "planning-review",
+        "profiles": {"critic": {"provider": "claude", "permission": "read-only"}},
+        "stages": {
+            "planning-review": {
+                "phase": "custom", "role": "critic", "prompt_kind": "critic",
+                "prompt_file": "reviewer.md", "profile": "critic", "session_slot": "critic",
+                "session_policy": "new-if-missing", "artifact_type": "critique",
+                "transitions": {"ready": "@pause:done", "human": "@pause:human"},
+            }
+        },
+    }
+    parsed = WorkflowDefinition.from_value(value)
+    assert parsed.stages["planning-review"].round_counter is None
+    restored = WorkflowDefinition.from_value(parsed.snapshot())
+    assert restored.stages["planning-review"].round_counter is None
+
+
+def test_inherited_workflow_resolves_base_prompt_namespace(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    runtime = tmp_path / "runtime"
+    workflow_dir = runtime / "config" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    base_value = {
+        "schema_version": "toledo_orchestrator.workflow.v2",
+        "id": "custom-base",
+        "label": "Custom base",
+        "start_stage": "draft",
+        "next_task_stage": "draft",
+        "next_task_revision_stage": "draft",
+        "profiles": {"draft": {"provider": "codex", "permission": "read-only"}},
+        "stages": {
+            "draft": {
+                "phase": "planning", "role": "planner", "prompt_kind": "draft",
+                "prompt_file": "base-only.md", "profile": "draft", "session_slot": "planner",
+                "session_policy": "new-if-missing", "artifact_type": "plan",
+                "transitions": {"human": "@pause:provider_requested_human"},
+            }
+        },
+    }
+    child_value = {
+        "id": "custom-child",
+        "extends": "custom-base",
+        "label": "Custom child",
+    }
+    (workflow_dir / "custom-base.json").write_text(
+        json.dumps(base_value), encoding="utf-8"
+    )
+    (workflow_dir / "custom-child.json").write_text(
+        json.dumps(child_value), encoding="utf-8"
+    )
+    base_prompts = runtime / "config" / "prompts" / "custom-base"
+    base_prompts.mkdir(parents=True)
+    (base_prompts / "base-only.md").write_text("# Base-only direction\n", encoding="utf-8")
+
+    workflows = load_configured_workflows(runtime)
+    child = workflows["custom-child"]
+    assert child.prompt_namespaces == ("custom-child", "custom-base")
+    codex = SessionAdapter("codex", [("draft", sentinel("human", "Drafted"))])
+    app = CycleOrchestrator(
+        runtime,
+        {"codex": codex, "claude": SessionAdapter("claude", [])},
+        {"test": writable_project},
+        workflows,
+    )
+    state = app.run_to_stop(app.create_run(b"Task", "test", workflow="custom-child"))
+    assert state["pending_human_decision"] == "provider_requested_human"
+    assert b"# Base-only direction" in codex.invocations[0]["prompt"]
+
+
+def test_renamed_stage_seals_its_declared_non_plan_artifact(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    workflow = WorkflowDefinition.from_value({
+        "schema_version": "toledo_orchestrator.workflow.v2",
+        "id": "custom-seal",
+        "label": "Custom seal",
+        "start_stage": "shape-spec",
+        "next_task_stage": "after-seal",
+        "next_task_revision_stage": "after-seal",
+        "profiles": {
+            "author": {"provider": "codex", "permission": "read-only"},
+            "checker": {"provider": "claude", "permission": "read-only"},
+        },
+        "stages": {
+            "shape-spec": {
+                "phase": "design", "role": "author", "prompt_kind": "shape",
+                "prompt_file": "proposer.md", "profile": "author", "session_slot": "author",
+                "session_policy": "new-if-missing", "artifact_type": "spec",
+                "transitions": {"continue": "approve-spec", "ready": "approve-spec", "human": "@pause:human"},
+            },
+            "approve-spec": {
+                "phase": "review", "role": "checker", "prompt_kind": "check",
+                "prompt_file": "reviewer.md", "profile": "checker", "session_slot": "checker",
+                "session_policy": "new-if-missing", "artifact_type": "spec-review", "seal_source": "spec",
+                "transitions": {"continue": "shape-spec", "ready": "@seal:approved-handoff:after-seal", "human": "@pause:human"},
+            },
+            "after-seal": {
+                "phase": "closure", "role": "author", "prompt_kind": "close",
+                "prompt_file": "reviser.md", "profile": "author", "session_slot": "author",
+                "session_policy": "continue", "artifact_type": "closure", "context": ["approved-handoff"],
+                "transitions": {"human": "@pause:done"},
+            },
+        },
+    })
+    codex = SessionAdapter("codex", [
+        ("shape-spec", sentinel("continue", "Exact spec bytes")),
+        ("after-seal", sentinel("human", "Closure")),
+    ])
+    claude = SessionAdapter("claude", [("approve-spec", sentinel("ready", "Approved"))])
+    app = CycleOrchestrator(
+        tmp_path / "runtime",
+        {"codex": codex, "claude": claude},
+        {"test": writable_project},
+        {"custom-seal": workflow},
+    )
+    state = app.run_to_stop(app.create_run(b"Task", "test", workflow="custom-seal"))
+    handoff = state["cycles"][0]["approved_handoff"]
+    assert app.artifact(state["run_id"], handoff) == b"Exact spec bytes"
+    assert b"Exact spec bytes" in codex.invocations[-1]["prompt"]
+
+
+def test_failed_validation_uses_declared_renamed_repair_stage(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    value = load_workflows()["continuous-development"].snapshot()
+    value["id"] = "renamed-repair"
+    stages = value["stages"]
+    stages["fix-code"] = stages.pop("implementation-repair")
+    for stage in stages.values():
+        if stage.get("repair_stage") == "implementation-repair":
+            stage["repair_stage"] = "fix-code"
+        stage["transitions"] = {
+            directive: ("fix-code" if target == "implementation-repair" else target)
+            for directive, target in stage["transitions"].items()
+        }
+    workflow = WorkflowDefinition.from_value(value)
+    failing_project = replace(
+        writable_project,
+        validations=(ValidationDefinition(
+            "always-fails", 'python -c "raise SystemExit(1)"', "local", required=True
+        ),),
+        allow_no_validations=False,
+        validation_requires_approval=False,
+    )
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan")),
+        ("implementation", sentinel("continue", "Build")),
+        ("fix-code", sentinel("human", "Need repair direction")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Plan ready")),
+        ("implementation-review", sentinel("ready", "Build looks ready")),
+    ])
+    app = CycleOrchestrator(
+        tmp_path / "runtime",
+        {"codex": codex, "claude": claude},
+        {"test": failing_project},
+        {"renamed-repair": workflow},
+    )
+    state = app.run_to_stop(app.create_run(b"Task", "test", workflow="renamed-repair"))
+    assert state["pending_human_decision"] == "provider_requested_human"
+    assert codex.invocations[-1]["route"] == "fix-code"
+    assert state["cycles"][0]["rounds"]["implementation"]["count"] == 1
+
+
 def test_new_cycle_rejects_reuse_of_a_prior_physical_session(
     tmp_path: Path, writable_project: ProjectDefinition
 ):
@@ -405,8 +737,9 @@ def test_provider_requested_human_direction_reaches_the_resumed_session(
     state = app.decide(run_id, "other", b"Use the narrow scope.\r\n")
     assert state["pending_human_decision"] == "provider_requested_human"
     assert codex.invocations[-1]["session_action"] == "continue"
-    assert b"# Immediate human direction" in codex.invocations[-1]["prompt"]
-    assert b"Use the narrow scope.\r\n" in codex.invocations[-1]["prompt"]
+    resumed_prompt = codex.invocations[-1]["prompt"]
+    assert resumed_prompt.count(b"# Immediate human direction") == 1
+    assert resumed_prompt.count(b"Use the narrow scope.\r\n") == 1
 
 
 def test_provider_command_builders_select_profile_and_resume(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -437,6 +770,13 @@ def test_provider_command_builders_select_profile_and_resume(monkeypatch: pytest
     assert "--resume" in claude_command and "claude-session-fixture" in claude_command
     assert "claude-test-model" in claude_command and "max" in claude_command
 
+    unusual_effort = 'xhigh"\nmodel="unexpected'
+    codex.invoke_configured(
+        "planning-propose", b"prompt", tmp_path, model="gpt-test", reasoning=unusual_effort,
+        permission="read-only", session_action="new",
+    )
+    assert f"model_reasoning_effort={json.dumps(unusual_effort)}" in captured[-1]
+
 
 def test_run_profiles_are_snapshotted_and_explicit_override_is_recorded(tmp_path: Path, writable_project: ProjectDefinition):
     codex = SessionAdapter("codex", [("planning-propose", response("human", "Need owner"))])
@@ -454,10 +794,18 @@ def test_run_profiles_are_snapshotted_and_explicit_override_is_recorded(tmp_path
     workflow_override.profiles["codex-planning"] = replace(
         workflow_override.profiles["codex-planning"], effort="low", label="Changed default"
     )
-    state = app_override.set_next_turn_override(run_override, profile="codex-planning", session_action="new")
-    assert state["next_turn_override"]["profile_value"]["effort"] == "low"
+    state = app_override.set_next_turn_override(
+        run_override,
+        profile="codex-planning",
+        model="gpt-one-turn",
+        effort="medium",
+        session_action="new",
+    )
+    assert state["next_turn_override"]["profile_value"]["model"] == "gpt-one-turn"
+    assert state["next_turn_override"]["profile_value"]["effort"] == "medium"
     app_override.run_to_stop(run_override)
-    assert codex_override.invocations[0]["reasoning"] == "low"
+    assert codex_override.invocations[0]["model"] == "gpt-one-turn"
+    assert codex_override.invocations[0]["reasoning"] == "medium"
 
 
 def test_round_caps_allow_the_configured_number_of_corrections(tmp_path: Path, writable_project: ProjectDefinition):
@@ -517,7 +865,8 @@ def test_validation_and_post_review_mutations_cannot_escape_sealed_evidence(tmp_
     app = make_cycle(tmp_path, validation_project, codex, claude)
     state = app.run_to_stop(app.create_run(b"Task", "test"))
     assert state["status"] == "paused"
-    assert state["pending_human_decision"] == "implementation_boundary_failed"
+    assert state["pending_human_decision"] == "unknown_validation_execution"
+    assert state["validation_inflight"]["commands"][0]["id"] == "mutating-validation"
     assert "generated.txt" in state["errors"][-1]
 
     codex_review = SessionAdapter("codex", [
@@ -618,6 +967,124 @@ def test_unknown_inflight_can_be_abandoned_restarted_or_cancelled(tmp_path: Path
     cancelled = cancel_app.decide(cancel_id, "no")
     assert cancelled["status"] == "cancelled" and cancelled["inflight"] is None
     assert cancel_app.cleanup_worktree(cancel_id)["execution_worktree_removed"] is True
+
+
+def test_public_recovery_reenters_running_run_and_surfaces_stale_inflight(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [("planning-propose", sentinel("human", "Recovered"))])
+    app = make_cycle(tmp_path / "clean", writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    interrupted = app.state(run_id)
+    interrupted["status"] = "running"
+    app._save(run_id, interrupted)
+    recovered = app.recover_run(run_id)
+    assert recovered["pending_human_decision"] == "provider_requested_human"
+    assert codex.invocations[0]["route"] == "planning-propose"
+    assert any(event["kind"] == "run.recovery.started" for event in recovered["events"])
+
+    stale_app = make_cycle(
+        tmp_path / "stale",
+        writable_project,
+        SessionAdapter("codex", []),
+        SessionAdapter("claude", []),
+    )
+    stale_id = stale_app.create_run(b"Task", "test")
+    stale = stale_app.state(stale_id)
+    stale["status"] = "running"
+    stale["inflight"] = {
+        "stage": "planning-propose",
+        "session_slot": "planner",
+        "session_action": "new",
+        "session_id": None,
+        "started_at": "2026-07-12T12:00:00Z",
+    }
+    stale_app._save(stale_id, stale)
+    surfaced = stale_app.recover_run(stale_id)
+    assert surfaced["status"] == "paused"
+    assert surfaced["pending_human_decision"] == "unknown_provider_invocation"
+    assert surfaced["inflight"]["stage"] == "planning-propose"
+
+
+def test_validation_crash_journal_requires_explicit_inspection_before_any_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    writable_project: ProjectDefinition,
+):
+    import toledo_orchestrator.cycle as cycle_module
+
+    validation_project = replace(
+        writable_project,
+        validations=(ValidationDefinition(
+            "host-check", 'python -c "print(\'safe\')"', "local", required=True
+        ),),
+        allow_no_validations=False,
+        validation_requires_approval=False,
+    )
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan")),
+        ("implementation", sentinel("continue", "Build")),
+        ("implementation-repair", sentinel("human", "Inspect before rerun")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [("planning-review", sentinel("ready", "Plan ready"))])
+    app = make_cycle(tmp_path, validation_project, codex, claude)
+    original_runner = cycle_module.run_project_validations
+
+    def crash_after_start(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("simulated process loss during host validation")
+
+    monkeypatch.setattr(cycle_module, "run_project_validations", crash_after_start)
+    run_id = app.create_run(b"Task", "test")
+    with pytest.raises(RuntimeError, match="simulated process loss"):
+        app.run_to_stop(run_id)
+    on_disk = app.state(run_id)
+    assert on_disk["status"] == "running"
+    assert on_disk["inflight"] is None
+    assert on_disk["validation_inflight"]["commands"][0]["id"] == "host-check"
+
+    monkeypatch.setattr(cycle_module, "run_project_validations", original_runner)
+    surfaced = app.recover_run(run_id)
+    assert surfaced["pending_human_decision"] == "unknown_validation_execution"
+    invocation_count = len(codex.invocations)
+    repaired = app.decide(run_id, "yes")
+    assert repaired["pending_human_decision"] == "provider_requested_human"
+    assert len(codex.invocations) == invocation_count + 1
+    assert codex.invocations[-1]["route"] == "implementation-repair"
+    assert b"Validation recovery context" in codex.invocations[-1]["prompt"]
+    assert repaired["validation_inflight"] is None
+    assert repaired["abandoned_validations"][-1]["execution_id"] == on_disk["validation_inflight"]["execution_id"]
+
+
+def test_workflow_rejects_prompt_namespace_and_sealed_type_path_escape():
+    bad_namespace = load_workflows()["continuous-development"].snapshot()
+    bad_namespace["id"] = "bad-namespace"
+    bad_namespace["prompt_namespaces"] = ["../../outside"]
+    with pytest.raises(ValueError, match="prompt_namespaces"):
+        WorkflowDefinition.from_value(bad_namespace)
+
+    bad_seal = load_workflows()["continuous-development"].snapshot()
+    bad_seal["id"] = "bad-seal"
+    bad_seal["stages"]["planning-review"]["transitions"]["ready"] = "@seal:../escape:implementation"
+    with pytest.raises(ValueError, match="invalid seal transition"):
+        WorkflowDefinition.from_value(bad_seal)
+
+    bad_round = load_workflows()["continuous-development"].snapshot()
+    bad_round["id"] = "bad-round"
+    bad_round["stages"]["planning-review"]["round"]["directive"] = "ready"
+    with pytest.raises(ValueError, match="round directive must target a concrete stage"):
+        WorkflowDefinition.from_value(bad_round)
+
+    bad_slot = load_workflows()["continuous-development"].snapshot()
+    bad_slot["id"] = "bad-slot"
+    bad_slot["stages"]["next-task"]["profile"] = "codex-planning"
+    with pytest.raises(ValueError, match="changes provider"):
+        WorkflowDefinition.from_value(bad_slot)
+
+    bad_context = load_workflows()["continuous-development"].snapshot()
+    bad_context["id"] = "bad-context"
+    bad_context["stages"]["implementation"]["context"] = ["approved_handof"]
+    with pytest.raises(ValueError, match="unsupported context token"):
+        WorkflowDefinition.from_value(bad_context)
 
 
 def test_create_run_rejects_dirty_source_before_creating_run(tmp_path: Path, writable_project: ProjectDefinition):

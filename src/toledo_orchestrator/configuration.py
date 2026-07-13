@@ -6,7 +6,7 @@ from typing import Any
 
 from .core import atomic_write
 from .project import ProjectDefinition, load_projects
-from .workflow import WorkflowDefinition, load_workflows
+from .workflow import WorkflowDefinition, load_workflow_layers
 
 
 def configuration_dir(runtime_dir: Path) -> Path:
@@ -14,13 +14,10 @@ def configuration_dir(runtime_dir: Path) -> Path:
 
 
 def load_configured_workflows(runtime_dir: Path) -> dict[str, WorkflowDefinition]:
-    workflows = load_workflows()
+    packaged = sorted(Path(__file__).with_name("workflows").glob("*.json"))
     override_dir = configuration_dir(runtime_dir) / "workflows"
-    if override_dir.is_dir():
-        for path in sorted(override_dir.glob("*.json")):
-            value = WorkflowDefinition.from_file(path)
-            workflows[value.id] = value
-    return workflows
+    overrides = sorted(override_dir.glob("*.json")) if override_dir.is_dir() else []
+    return load_workflow_layers(packaged, overrides)
 
 
 def load_configured_projects(runtime_dir: Path) -> dict[str, ProjectDefinition]:
@@ -44,7 +41,10 @@ def workflow_source(workflow_id: str, runtime_dir: Path) -> Path:
 
 
 def workflow_value(workflow_id: str, runtime_dir: Path) -> dict[str, Any]:
-    return json.loads(workflow_source(workflow_id, runtime_dir).read_text(encoding="utf-8"))
+    workflows = load_configured_workflows(runtime_dir)
+    if workflow_id not in workflows:
+        raise ValueError(f"unknown workflow: {workflow_id}")
+    return workflows[workflow_id].snapshot()
 
 
 def save_workflow_value(runtime_dir: Path, value: dict[str, Any]) -> WorkflowDefinition:
@@ -96,4 +96,3 @@ def save_project_value(runtime_dir: Path, value: dict[str, Any]) -> ProjectDefin
         candidate.unlink(missing_ok=True)
     atomic_write(target, (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     return parsed
-

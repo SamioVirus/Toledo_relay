@@ -70,6 +70,17 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument("--text-file", type=Path)
     advance = commands.add_parser("advance")
     advance.add_argument("run_id")
+    advance_group = advance.add_mutually_exclusive_group()
+    advance_group.add_argument("--text")
+    advance_group.add_argument("--text-file", type=Path)
+    override = commands.add_parser("override")
+    override.add_argument("run_id")
+    override.add_argument("--profile")
+    override.add_argument("--model")
+    override.add_argument("--effort")
+    override.add_argument("--session-action", choices=("new", "continue"))
+    recover = commands.add_parser("recover")
+    recover.add_argument("run_id")
     validate = commands.add_parser("validate")
     validate.add_argument("run_id")
     validate.add_argument("--receipt-file", type=Path, required=True)
@@ -130,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         _emit(engine.run_to_stop(run_id))
         return 0
-    if args.command in {"status", "show", "resume", "decide", "advance", "validate", "artifact", "cleanup"}:
+    if args.command in {"status", "show", "resume", "decide", "advance", "override", "recover", "validate", "artifact", "cleanup"}:
         engine, state = _state_engine(args.runtime_dir, args.run_id)
         if args.command == "status":
             _emit(state)
@@ -165,7 +176,24 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "advance":
             if not isinstance(engine, CycleOrchestrator):
                 raise ValueError("step-by-step advance requires a v2 run")
-            _emit(engine.continue_step(args.run_id))
+            direction = args.text_file.read_bytes() if args.text_file else (args.text or "").encode("utf-8")
+            _emit(engine.continue_step(args.run_id, direction))
+            return 0
+        if args.command == "override":
+            if not isinstance(engine, CycleOrchestrator):
+                raise ValueError("next-turn overrides require a v2 run")
+            _emit(engine.set_next_turn_override(
+                args.run_id,
+                profile=args.profile,
+                model=args.model,
+                effort=args.effort,
+                session_action=args.session_action,
+            ))
+            return 0
+        if args.command == "recover":
+            if not isinstance(engine, CycleOrchestrator):
+                raise ValueError("run recovery requires a v2 run")
+            _emit(engine.recover_run(args.run_id))
             return 0
         if args.command == "validate":
             if isinstance(engine, CycleOrchestrator):

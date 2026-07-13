@@ -269,9 +269,19 @@ def make_handler(engine: CycleOrchestrator, workers: RunWorkers, nonce: str) -> 
                     return
                 if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "continue":
                     run_id = parts[2]
+                    direction = str(value.get("direction", "")).encode("utf-8")
                     workers.start(
                         run_id,
-                        lambda: engine.continue_step(run_id),
+                        lambda: engine.continue_step(run_id, direction),
+                        lambda error: engine.record_background_failure(run_id, error),
+                    )
+                    self._send({"run_id": run_id, "worker": workers.status(run_id)}, HTTPStatus.ACCEPTED)
+                    return
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
+                    run_id = parts[2]
+                    workers.start(
+                        run_id,
+                        lambda: engine.recover_run(run_id),
                         lambda error: engine.record_background_failure(run_id, error),
                     )
                     self._send({"run_id": run_id, "worker": workers.status(run_id)}, HTTPStatus.ACCEPTED)
@@ -280,6 +290,8 @@ def make_handler(engine: CycleOrchestrator, workers: RunWorkers, nonce: str) -> 
                     state = engine.set_next_turn_override(
                         parts[2],
                         profile=str(value["profile"]) if value.get("profile") else None,
+                        model=str(value["model"]) if value.get("model") else None,
+                        effort=str(value["effort"]) if value.get("effort") else None,
                         session_action=str(value["session_action"]) if value.get("session_action") else None,
                     )
                     self._send(state)

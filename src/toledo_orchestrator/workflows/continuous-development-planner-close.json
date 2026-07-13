@@ -1,0 +1,29 @@
+{
+  "id": "continuous-development-planner-close",
+  "extends": "continuous-development",
+  "label": "A/B/C Continuous Development · Planner closes",
+  "stages": {
+    "next-task": {
+      "title": "Strategic closure and next build",
+      "role": "planner",
+      "prompt_kind": "strategic-closure",
+      "prompt_label": "Next",
+      "prompt_file": "next-task-planner.md",
+      "profile": "codex-planning",
+      "session_slot": "planner",
+      "session_policy": "continue",
+      "context": ["approved-handoff", "completion-receipt", "latest:implementation-review", "implementation-evidence", "human-decisions"]
+    },
+    "next-task-revise": {
+      "title": "Revise strategic next step",
+      "role": "planner",
+      "prompt_kind": "human-other",
+      "prompt_label": "Redirect",
+      "prompt_file": "next-task-planner-revise.md",
+      "profile": "codex-planning",
+      "session_slot": "planner",
+      "session_policy": "continue",
+      "context": ["approved-handoff", "completion-receipt", "latest:next-task-proposal", "implementation-evidence", "human-decisions"]
+    }
+  }
+}

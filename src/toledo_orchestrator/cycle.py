@@ -34,7 +34,7 @@ from .configuration import load_configured_projects, load_configured_workflows
 from .locking import run_lock
 from .project import ProjectDefinition, load_projects
 from .validation import pending_required_validations, required_local_validations_passed, run_project_validations
-from .workflow import ProfileDefinition, StageDefinition, WorkflowDefinition, load_workflows
+from .workflow import IDENTIFIER, ProfileDefinition, StageDefinition, WorkflowDefinition, load_workflows
 from .worktree import (
     assert_allowed_changes,
     current_branch,
@@ -61,9 +61,11 @@ def _locked(method: Callable[..., T]) -> Callable[..., T]:
     return wrapper
 
 
-def _session_label(cycle_number: int, slot: str) -> str:
-    offset = {"planner": 0, "reviewer": 1, "implementer": 2}.get(slot, 0)
-    number = (cycle_number - 1) * 3 + offset + 1
+def _session_label(workflow: WorkflowDefinition, cycle_number: int, slot: str) -> str:
+    if slot not in workflow.session_slots:
+        raise ValueError(f"workflow does not register session slot: {slot}")
+    offset = workflow.session_slots.index(slot)
+    number = (cycle_number - 1) * len(workflow.session_slots) + offset + 1
     label = ""
     while number:
         number, remainder = divmod(number - 1, 26)
@@ -153,6 +155,48 @@ class CycleOrchestrator:
         return state["cycles"][state["cycle"] - 1]
 
     @staticmethod
+    def _round_record(cycle: dict[str, Any], counter: str) -> dict[str, int]:
+        rounds = cycle.setdefault("rounds", {})
+        record = rounds.get(counter)
+        if not isinstance(record, dict):
+            record = {
+                "count": int(cycle.get(f"{counter}_round", 0)),
+                "extension": int(cycle.get(f"{counter}_round_extension", 0)),
+            }
+            rounds[counter] = record
+        return record
+
+    @staticmethod
+    def _sync_round_alias(cycle: dict[str, Any], counter: str, record: dict[str, int]) -> None:
+        # Preserve the early v2 fields for already-created runs and external readers.
+        cycle[f"{counter}_round"] = int(record["count"])
+        cycle[f"{counter}_round_extension"] = int(record["extension"])
+
+    def _prompt_source(self, workflow: WorkflowDefinition, name: str) -> Path:
+        configured_root = (self.runtime_dir / "config" / "prompts").resolve()
+        configured_candidates: list[Path] = []
+        for namespace in workflow.prompt_namespaces:
+            candidate = (configured_root / namespace / name).resolve()
+            if configured_root not in candidate.parents:
+                raise ValueError(f"prompt namespace escapes the configured prompt root: {namespace}")
+            configured_candidates.append(candidate)
+        shared_candidate = (configured_root / name).resolve()
+        if configured_root not in shared_candidate.parents:
+            raise ValueError(f"prompt file escapes the configured prompt root: {name}")
+        candidates = tuple(configured_candidates) + (
+            shared_candidate,
+            Path(__file__).with_name("prompts") / name,
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        raise ValueError(
+            f"prompt file {name} for workflow {workflow.id} was not found in namespaces "
+            f"{','.join(workflow.prompt_namespaces)}; place custom prompts under "
+            f"{self.runtime_dir / 'config' / 'prompts' / workflow.id}"
+        )
+
+    @staticmethod
     def _provider_session_ids(state: dict[str, Any], provider: str) -> set[str]:
         values: set[str] = set()
         for cycle in state.get("cycles", []):
@@ -207,10 +251,14 @@ class CycleOrchestrator:
         }
         prompt_library: dict[str, dict[str, str]] = {}
         for prompt_name in sorted(prompt_names):
-            source = Path(__file__).with_name("prompts") / prompt_name
+            source = self._prompt_source(workflow_definition, prompt_name)
             relative = Path("prompt-library") / prompt_name
             digest = atomic_write(run_dir / relative, source.read_bytes())
-            prompt_library[prompt_name] = {"path": str(relative).replace("\\", "/"), "sha256": digest}
+            prompt_library[prompt_name] = {
+                "path": str(relative).replace("\\", "/"),
+                "sha256": digest,
+                "source": str(source.resolve()),
+            }
         state: dict[str, Any] = {
             "schema_version": "toledo_orchestrator.run.v2",
             "run_id": run_id,
@@ -242,13 +290,17 @@ class CycleOrchestrator:
             "validations": {},
             "current_implementation_evidence": None,
             "pending_validation": None,
+            "validation_inflight": None,
             "pending_completion": None,
             "pending_commit": None,
             "completion_receipt": None,
             "pending_human_decision": None,
+            "pending_round_extension": None,
+            "pending_repair_stage": None,
             "next_turn_override": None,
             "inflight": None,
             "abandoned_invocations": [],
+            "abandoned_validations": [],
             "errors": [],
             "degraded": False,
         }
@@ -282,6 +334,7 @@ class CycleOrchestrator:
             "planning_round_extension": 0,
             "implementation_round": 0,
             "implementation_round_extension": 0,
+            "rounds": {},
             "start_turn": None,
             "end_turn": None,
             "sessions": {},
@@ -323,10 +376,27 @@ class CycleOrchestrator:
     def check(self) -> dict[str, Any]:
         providers = {name: adapter.check() for name, adapter in self.adapters.items()}
         projects = {name: project.check() for name, project in self.projects.items()}
-        workflows = {name: workflow.public_summary() for name, workflow in self.workflows.items()}
+        workflows: dict[str, dict[str, Any]] = {}
+        for name, workflow in self.workflows.items():
+            prompt_names = {
+                "orchestrator-law.md",
+                "strict-contract.md",
+                *(stage.prompt_file for stage in workflow.stages.values()),
+            }
+            prompt_files: dict[str, dict[str, Any]] = {}
+            for prompt_name in sorted(prompt_names):
+                try:
+                    source = self._prompt_source(workflow, prompt_name)
+                    prompt_files[prompt_name] = {"ready": True, "source": str(source.resolve())}
+                except ValueError as error:
+                    prompt_files[prompt_name] = {"ready": False, "error": str(error)}
+            summary = workflow.public_summary()
+            summary["prompt_files"] = prompt_files
+            summary["ready"] = all(value["ready"] for value in prompt_files.values())
+            workflows[name] = summary
         ready = all(value["ready"] for value in providers.values()) and all(
             value.get("implementation_ready", value["ready"]) for value in projects.values()
-        )
+        ) and all(value["ready"] for value in workflows.values())
         return {
             "status": "ready_for_generation" if ready else "blocked",
             "ready": ready,
@@ -421,7 +491,13 @@ class CycleOrchestrator:
             raise ValueError(f"artifact exceeds the prompt transport limit: {relative}:{len(data)}")
         return decode_text_artifact(data, relative)
 
-    def _context_section(self, state: dict[str, Any], token: str) -> tuple[str, str] | None:
+    def _context_section(
+        self,
+        state: dict[str, Any],
+        token: str,
+        *,
+        exclude_decision_file: str | None = None,
+    ) -> tuple[str, str] | None:
         cycle = self._cycle(state)
         run_dir = self._run_dir(state["run_id"])
         if token == "request":
@@ -430,6 +506,12 @@ class CycleOrchestrator:
             values = []
             for decision in state["decisions"]:
                 if decision.get("cycle") != state["cycle"]:
+                    continue
+                if decision.get("choice") == "direction":
+                    # Step directions are intentionally one-shot and are injected by
+                    # _prompt only on the immediately following provider turn.
+                    continue
+                if exclude_decision_file and decision.get("file") == exclude_decision_file:
                     continue
                 values.append(self._artifact_text(state, decision["file"]))
             return "Human decisions", "\n\n".join(values) if values else "None."
@@ -492,20 +574,35 @@ class CycleOrchestrator:
                 "Continue this existing logical and provider session. Apply the orchestration law already established in the session. "
                 "The compact material below is the new delta; inspect repository evidence directly when needed."
             )
+        abandoned_validations = state.get("abandoned_validations") or []
+        if abandoned_validations:
+            sections.append(
+                "# Validation recovery context\n"
+                "A prior host validation process ended without a trustworthy completion record. "
+                "Do not assume it passed, failed, or was safe to rerun. Inspect repository and host evidence, "
+                "then repair or request the exact authority needed.\n"
+                + json.dumps(abandoned_validations[-1], ensure_ascii=False, indent=2, sort_keys=True)
+            )
         sections.append(self._prompt_file(state, stage.prompt_file).strip())
+        immediate_decision_file: str | None = None
         if state.get("decisions"):
             latest_decision = state["decisions"][-1]
             if (
                 latest_decision.get("cycle") == state["cycle"]
                 and latest_decision.get("after_turn") == state["current_turn"]
             ):
+                immediate_decision_file = str(latest_decision["file"])
                 sections.append(
                     "# Immediate human direction\n"
-                    + self._artifact_text(state, str(latest_decision["file"]))
+                    + self._artifact_text(state, immediate_decision_file)
                 )
         context_tokens = list(stage.context)
         for token in context_tokens:
-            context = self._context_section(state, token)
+            context = self._context_section(
+                state,
+                token,
+                exclude_decision_file=immediate_decision_file,
+            )
             if context:
                 title, text = context
                 sections.append(f"# {title}\n{text}")
@@ -525,7 +622,7 @@ class CycleOrchestrator:
         if slot is None:
             slot = {
                 "slot": stage.session_slot,
-                "label": _session_label(state["cycle"], stage.session_slot),
+                "label": _session_label(self._workflow(state), state["cycle"], stage.session_slot),
                 "provider": profile.provider,
                 "active_generation": 0,
                 "active_session_id": None,
@@ -576,6 +673,9 @@ class CycleOrchestrator:
         work = work_product_text(output)
         output_hash = write_text(turns / text_name, work)
         substantive = result.exit_code == 0 and bool(work) and not correction
+        interstitial = state.get("prompt_library", {}).get(stage.prompt_file, {})
+        interstitial_file = str(interstitial.get("path", "")) or None
+        interstitial_sha256 = str(interstitial.get("sha256", "")) or None
         previous_session_id = slot.get("active_session_id")
         previously_seen = bool(
             result.session_id
@@ -595,6 +695,7 @@ class CycleOrchestrator:
             "route": stage.id,
             "title": stage.title,
             "prompt_kind": stage.prompt_kind,
+            "prompt_label": stage.prompt_label,
             "role": stage.role,
             "provider": profile.provider,
             "profile": profile.id,
@@ -614,6 +715,8 @@ class CycleOrchestrator:
             "session_id": result.session_id,
             "session_promoted": session_promotable,
             "prompt_file": prompt_name,
+            "interstitial_file": interstitial_file,
+            "interstitial_sha256": interstitial_sha256,
             "output_file": text_name,
             "raw_file": raw_name,
             "stderr_file": stderr_name,
@@ -673,6 +776,7 @@ class CycleOrchestrator:
             "outcome": directive.next if directive else None,
             "artifacts": {
                 "prompt": {"path": f"turns/{prompt_name}", "sha256": prompt_hash},
+                "interstitial": {"path": interstitial_file, "sha256": interstitial_sha256},
                 "output": {"path": f"turns/{text_name}", "sha256": output_hash},
                 "metadata": {"path": f"turns/{turn_id}.json", "sha256": metadata_hash},
             },
@@ -700,6 +804,7 @@ class CycleOrchestrator:
         )
         state["pending_validation"] = {
             "stage": stage.id,
+            "repair_stage": self._repair_stage(stage),
             "directive_next": directive.next,
             "turn": state["current_turn"],
             "pre_validation_evidence": sealed,
@@ -732,6 +837,27 @@ class CycleOrchestrator:
         expected = pending["pre_validation_evidence"]
         if sha256(current.patch) != expected["patch"]["sha256"] or list(current.changed_paths) != list(expected["changed_paths"]):
             raise ValueError("implementation changed while validation approval was pending")
+        if state.get("validation_inflight"):
+            raise ValueError("a validation execution is already marked in flight")
+        validation_execution = {
+            "execution_id": f"validation_{uuid.uuid4().hex}",
+            "cycle": state["cycle"],
+            "turn": int(pending["turn"]),
+            "stage": stage.id,
+            "repair_stage": pending.get("repair_stage"),
+            "commands": list(pending.get("commands", [])),
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        state["validation_inflight"] = validation_execution
+        state["inflight"] = None
+        state["status"] = "running"
+        self._event(
+            state,
+            "validation.execution.started",
+            title="Host validation started",
+            details=validation_execution,
+        )
+        self._save(state["run_id"], state)
         validations = run_project_validations(
             project,
             worktree,
@@ -761,7 +887,18 @@ class CycleOrchestrator:
         state["current_implementation_evidence"] = sealed
         state["validations"] = validations
         state["pending_validation"] = None
+        state["validation_inflight"] = None
         self._event(state, "implementation.evidence.sealed", title="Implementation evidence", details=sealed)
+        self._event(
+            state,
+            "validation.execution.completed",
+            title="Host validation completed",
+            details={
+                **validation_execution,
+                "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "states": {key: value.get("state") for key, value in validations.items()},
+            },
+        )
         self._transition(state, stage, directive)
 
     def _finalize_acceptance(
@@ -773,10 +910,21 @@ class CycleOrchestrator:
         evidence: dict[str, Any],
     ) -> None:
         cycle = self._cycle(state)
+        pending_commit = state.get("pending_commit") or {}
+        review_stage = str(pending_commit.get("review_stage") or state.get("current_stage") or "")
         state["working_revision"] = accepted_revision
         state["pending_completion"] = None
         state["pending_commit"] = None
-        review = self._latest_turn(state, "implementation-review")
+        review = next(
+            (
+                turn
+                for turn in reversed(state["turns"])
+                if turn.get("stage") == review_stage
+                and turn.get("substantive")
+                and not turn.get("correction")
+            ),
+            None,
+        )
         receipt = {
             "schema_version": "toledo_orchestrator.completion.v1",
             "cycle": state["cycle"],
@@ -853,6 +1001,19 @@ class CycleOrchestrator:
                 state["status"] = "paused"
                 state["pending_human_decision"] = "acceptance_commit_recovery_failed"
                 state["errors"].append(str(error))
+            self._save(run_id, state)
+            return state
+        if state.get("validation_inflight"):
+            state["status"] = "paused"
+            state["pending_human_decision"] = "unknown_validation_execution"
+            if not state["errors"] or state["errors"][-1] != "unknown_validation_execution_requires_human":
+                state["errors"].append("unknown_validation_execution_requires_human")
+            self._event(
+                state,
+                "human.gate.opened",
+                title="Unknown validation execution",
+                details={"reason": "unknown_validation_execution", **state["validation_inflight"]},
+            )
             self._save(run_id, state)
             return state
         if state["status"] in {"complete", "cancelled", "paused", "failed"}:
@@ -1068,7 +1229,11 @@ class CycleOrchestrator:
                 self._execute_pending_validation(state)
             except ValueError as error:
                 state["status"] = "paused"
-                state["pending_human_decision"] = "implementation_boundary_failed"
+                if state.get("validation_inflight"):
+                    state["pending_human_decision"] = "unknown_validation_execution"
+                else:
+                    state["pending_human_decision"] = "implementation_boundary_failed"
+                    state["pending_repair_stage"] = self._repair_stage(stage)
                 state["errors"].append(str(error))
                 self._save(run_id, state)
                 return state
@@ -1084,6 +1249,8 @@ class CycleOrchestrator:
         return state
 
     def _seal_latest(self, state: dict[str, Any], artifact_type: str, sealed_type: str) -> str:
+        if not IDENTIFIER.fullmatch(sealed_type):
+            raise ValueError(f"invalid sealed artifact type: {sealed_type}")
         turn = self._latest_turn(state, artifact_type)
         if not turn:
             raise ValueError(f"cannot seal missing {artifact_type} artifact")
@@ -1104,6 +1271,40 @@ class CycleOrchestrator:
         })
         return str(relative).replace("\\", "/")
 
+    @staticmethod
+    def _repair_stage(stage: StageDefinition) -> str | None:
+        target = stage.repair_stage
+        return target if target and not target.startswith("@") else None
+
+    def _consume_round(
+        self,
+        state: dict[str, Any],
+        stage: StageDefinition,
+        *,
+        target: str,
+        pause_reason: str | None = None,
+    ) -> bool:
+        if not stage.round_counter or stage.round_cap is None:
+            return True
+        cycle = self._cycle(state)
+        record = self._round_record(cycle, stage.round_counter)
+        cap = int(stage.round_cap) + int(record["extension"])
+        if int(record["count"]) >= cap:
+            reason = pause_reason or stage.round_pause_reason or "round_cap_reached"
+            state["status"] = "paused"
+            state["pending_human_decision"] = reason
+            state["pending_round_extension"] = {
+                "counter": stage.round_counter,
+                "stage": stage.id,
+                "target": target,
+                "reason": reason,
+            }
+            state["degraded"] = True
+            return False
+        record["count"] = int(record["count"]) + 1
+        self._sync_round_alias(cycle, stage.round_counter, record)
+        return True
+
     def _transition(self, state: dict[str, Any], stage: StageDefinition, directive: Directive) -> None:
         workflow = self._workflow(state)
         cycle = self._cycle(state)
@@ -1113,22 +1314,11 @@ class CycleOrchestrator:
             state["pending_human_decision"] = "unsupported_stage_directive"
             state["errors"].append(f"{stage.id}:unsupported:{directive.next}")
             return
-        if stage.id == "planning-review" and directive.next == "continue":
-            planning_cap = workflow.planning_round_cap + int(cycle.get("planning_round_extension", 0))
-            if cycle["planning_round"] >= planning_cap:
-                state["status"] = "paused"
-                state["pending_human_decision"] = "planning_round_cap_reached"
-                state["degraded"] = True
+        if stage.round_counter and directive.next == stage.round_directive:
+            if target.startswith("@"):
+                raise ValueError(f"round-controlled stage {stage.id} requires a concrete transition target")
+            if not self._consume_round(state, stage, target=target):
                 return
-            cycle["planning_round"] += 1
-        if stage.id == "implementation-review" and directive.next == "continue":
-            implementation_cap = workflow.implementation_round_cap + int(cycle.get("implementation_round_extension", 0))
-            if cycle["implementation_round"] >= implementation_cap:
-                state["status"] = "paused"
-                state["pending_human_decision"] = "implementation_round_cap_reached"
-                state["degraded"] = True
-                return
-            cycle["implementation_round"] += 1
         if target.startswith("@pause:"):
             reason = target.split(":", 1)[1]
             if stage.artifact_type == "next-task-proposal":
@@ -1140,7 +1330,9 @@ class CycleOrchestrator:
             return
         if target.startswith("@seal:"):
             _, sealed_type, next_stage = target.split(":", 2)
-            relative = self._seal_latest(state, "plan", sealed_type)
+            if not stage.seal_source:
+                raise ValueError(f"stage {stage.id} has no configured seal source")
+            relative = self._seal_latest(state, stage.seal_source, sealed_type)
             cycle["approved_handoff"] = relative
             state["current_stage"] = next_stage
             state["status"] = "running"
@@ -1162,15 +1354,18 @@ class CycleOrchestrator:
                 })
                 return
             if not required_local_validations_passed(validations):
-                implementation_cap = workflow.implementation_round_cap + int(cycle.get("implementation_round_extension", 0))
-                if cycle["implementation_round"] >= implementation_cap:
-                    state["status"] = "paused"
-                    state["pending_human_decision"] = "validation_failed_at_repair_cap"
-                    state["degraded"] = True
+                repair_stage = self._repair_stage(stage)
+                if not repair_stage:
+                    raise ValueError(f"stage {stage.id} has no repair stage for failed validation")
+                if not self._consume_round(
+                    state,
+                    stage,
+                    target=repair_stage,
+                    pause_reason="validation_failed_at_repair_cap",
+                ):
                     return
-                cycle["implementation_round"] += 1
                 state["errors"].append("reviewer_ready_but_validation_failed")
-                state["current_stage"] = "implementation-repair"
+                state["current_stage"] = repair_stage
                 state["status"] = "running"
                 return
             project = self._project(state)
@@ -1181,6 +1376,7 @@ class CycleOrchestrator:
             except ValueError as error:
                 state["status"] = "paused"
                 state["pending_human_decision"] = "implementation_boundary_failed_before_commit"
+                state["pending_repair_stage"] = self._repair_stage(stage)
                 state["errors"].append(str(error))
                 return
             expected_patch = evidence.get("patch", {}).get("sha256")
@@ -1190,6 +1386,7 @@ class CycleOrchestrator:
             ):
                 state["status"] = "paused"
                 state["pending_human_decision"] = "implementation_changed_after_review"
+                state["pending_repair_stage"] = self._repair_stage(stage)
                 state["errors"].append("implementation evidence no longer matches the worktree")
                 return
             if project.commit_on_accept:
@@ -1197,6 +1394,7 @@ class CycleOrchestrator:
                     "base_revision": state["working_revision"],
                     "patch_sha256": expected_patch,
                     "next_stage": next_stage,
+                    "review_stage": stage.id,
                     "message": f"orchestrator: accept cycle {state['cycle']:04d}",
                     "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 }
@@ -1238,6 +1436,26 @@ class CycleOrchestrator:
             self.advance(run_id)
         return self.state(run_id)
 
+    @_locked
+    def recover_run(self, run_id: str) -> dict[str, Any]:
+        """Re-enter a v2 run after its owning CLI/UI process stopped."""
+
+        state = self.state(run_id)
+        if state.get("status") not in {"created", "running"}:
+            raise ValueError("only an inactive created or running run can be recovered")
+        self._event(
+            state,
+            "run.recovery.started",
+            title="Run recovery started",
+            details={
+                "status": state.get("status"),
+                "inflight_present": bool(state.get("inflight")),
+                "stage": state.get("current_stage"),
+            },
+        )
+        self._save(run_id, state)
+        return self.run_to_stop(run_id)
+
     def _cancel(self, state: dict[str, Any], reason: str) -> None:
         cycle = self._cycle(state)
         cycle["status"] = "cancelled"
@@ -1246,14 +1464,47 @@ class CycleOrchestrator:
         state["current_stage"] = None
         state["pending_human_decision"] = None
         state["pending_validation"] = None
+        state["validation_inflight"] = None
         state["pending_completion"] = None
         state["pending_commit"] = None
+        state["pending_round_extension"] = None
+        state["pending_repair_stage"] = None
         state["inflight"] = None
         self._event(state, "run.cancelled", title="Run cancelled", details={"reason": reason})
 
     def _force_new_session(self, state: dict[str, Any]) -> None:
         state["next_turn_override"] = {"profile": None, "profile_value": None, "session_action": "new"}
         state["status"] = "running"
+
+    def _record_decision(
+        self,
+        state: dict[str, Any],
+        *,
+        payload: bytes,
+        choice: str,
+        reason: str,
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        decision_number = len(state["decisions"]) + 1
+        relative = Path("decisions") / f"decision.{decision_number:04d}.md"
+        digest = atomic_write(self._run_dir(state["run_id"]) / relative, payload)
+        record = {
+            "file": str(relative).replace("\\", "/"),
+            "sha256": digest,
+            "choice": choice,
+            "reason": reason,
+            "cycle": state["cycle"],
+            "after_turn": state["current_turn"],
+            "title": title or f"Human: {choice}",
+        }
+        state["decisions"].append(record)
+        self._event(
+            state,
+            "human.direction" if choice == "direction" else "human.decision",
+            title=str(record["title"]),
+            details=record,
+        )
+        return record
 
     @_locked
     def decide(self, run_id: str, choice: str, text: bytes = b"") -> dict[str, Any]:
@@ -1282,19 +1533,7 @@ class CycleOrchestrator:
                 state, f"turns/{accepted_proposal['output_file']}"
             )
         payload = text if text else (choice + "\n").encode("utf-8")
-        decision_number = len(state["decisions"]) + 1
-        relative = Path("decisions") / f"decision.{decision_number:04d}.md"
-        digest = atomic_write(self._run_dir(run_id) / relative, payload)
-        record = {
-            "file": str(relative).replace("\\", "/"),
-            "sha256": digest,
-            "choice": choice,
-            "reason": reason,
-            "cycle": state["cycle"],
-            "after_turn": state["current_turn"],
-        }
-        state["decisions"].append(record)
-        self._event(state, "human.decision", title=f"Human: {choice}", details=record)
+        self._record_decision(state, payload=payload, choice=choice, reason=reason)
         state["pending_human_decision"] = None
         if reason == "next_task_approval":
             if choice == "no":
@@ -1348,8 +1587,11 @@ class CycleOrchestrator:
                 self._save(run_id, state)
                 return state
             if choice == "other":
+                repair_stage = str((state.get("pending_validation") or {}).get("repair_stage") or "")
+                if not repair_stage or repair_stage not in self._workflow(state).stages:
+                    raise ValueError("pending validation has no configured repair stage")
                 state["pending_validation"] = None
-                state["current_stage"] = "implementation-repair"
+                state["current_stage"] = repair_stage
                 state["status"] = "running"
                 self._save(run_id, state)
                 return self.run_to_stop(run_id)
@@ -1359,7 +1601,13 @@ class CycleOrchestrator:
                 self._pause_for_step(state)
             except ValueError as error:
                 state["status"] = "paused"
-                state["pending_human_decision"] = "implementation_boundary_failed"
+                if state.get("validation_inflight"):
+                    state["pending_human_decision"] = "unknown_validation_execution"
+                else:
+                    state["pending_human_decision"] = "implementation_boundary_failed"
+                    state["pending_repair_stage"] = str(
+                        (state.get("pending_validation") or {}).get("repair_stage") or ""
+                    ) or None
                 state["errors"].append(str(error))
             self._save(run_id, state)
             return self.run_to_stop(run_id) if state["status"] == "running" else state
@@ -1409,22 +1657,88 @@ class CycleOrchestrator:
             self._save(run_id, state)
             return self.run_to_stop(run_id)
 
+        if reason == "unknown_validation_execution":
+            uncertain = dict(state.get("validation_inflight") or {})
+            if not uncertain:
+                raise ValueError("the uncertain validation journal is missing")
+            uncertain.update({
+                "abandoned_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "decision": choice,
+            })
+            state.setdefault("abandoned_validations", []).append(uncertain)
+            self._event(
+                state,
+                "validation.execution.abandoned",
+                title="Uncertain validation execution abandoned",
+                details=uncertain,
+            )
+            state["validation_inflight"] = None
+            state["pending_validation"] = None
+            if choice == "no":
+                self._cancel(state, reason)
+                self._save(run_id, state)
+                return state
+            repair_stage = str(uncertain.get("repair_stage") or "")
+            if repair_stage not in self._workflow(state).stages:
+                state["status"] = "paused"
+                state["pending_human_decision"] = "implementation_boundary_failed"
+                state["errors"].append("uncertain validation has no configured repair stage")
+                self._save(run_id, state)
+                return state
+            try:
+                identity_error = self._worktree_identity_error(state)
+                if identity_error:
+                    raise ValueError(identity_error)
+                assert_allowed_changes(
+                    self._project(state),
+                    collect_worktree_evidence(Path(state["execution_worktree"])).changed_paths,
+                )
+            except ValueError as error:
+                state["status"] = "paused"
+                state["pending_human_decision"] = "implementation_boundary_failed"
+                state["pending_repair_stage"] = repair_stage
+                state["errors"].append(str(error))
+                self._save(run_id, state)
+                return state
+            state["current_stage"] = repair_stage
+            state["status"] = "running"
+            self._save(run_id, state)
+            return self.run_to_stop(run_id)
+
         if choice == "no":
             self._cancel(state, reason)
             self._save(run_id, state)
             return state
 
-        if reason in {"planning_round_cap_reached"}:
-            self._cycle(state)["planning_round_extension"] = int(
-                self._cycle(state).get("planning_round_extension", 0)
-            ) + 1
-            state["current_stage"] = "planning-revise"
-            state["status"] = "running"
-        elif reason in {"implementation_round_cap_reached", "validation_failed_at_repair_cap"}:
-            self._cycle(state)["implementation_round_extension"] = int(
-                self._cycle(state).get("implementation_round_extension", 0)
-            ) + 1
-            state["current_stage"] = "implementation-repair"
+        pending_round = state.get("pending_round_extension")
+        if not isinstance(pending_round, dict):
+            current_stage = self._workflow(state).stages.get(str(state.get("current_stage")))
+            if current_stage and current_stage.round_counter and reason in {
+                current_stage.round_pause_reason,
+                "validation_failed_at_repair_cap",
+            }:
+                inferred_target = current_stage.transitions.get(current_stage.round_directive)
+                if inferred_target and inferred_target.startswith("@"):
+                    inferred_target = None
+                if inferred_target:
+                    pending_round = {
+                        "counter": current_stage.round_counter,
+                        "stage": current_stage.id,
+                        "target": inferred_target,
+                        "reason": reason,
+                    }
+                    state["pending_round_extension"] = pending_round
+        if isinstance(pending_round, dict) and pending_round.get("reason") == reason:
+            counter = str(pending_round["counter"])
+            cycle = self._cycle(state)
+            record = self._round_record(cycle, counter)
+            record["extension"] = int(record["extension"]) + 1
+            self._sync_round_alias(cycle, counter, record)
+            target = str(pending_round["target"])
+            if target not in self._workflow(state).stages:
+                raise ValueError(f"round extension target is not a configured stage: {target}")
+            state["pending_round_extension"] = None
+            state["current_stage"] = target
             state["status"] = "running"
         elif reason in {
             "provider_invocation_failed",
@@ -1457,8 +1771,19 @@ class CycleOrchestrator:
                 state["errors"].append(str(error))
                 self._save(run_id, state)
                 return state
+            repair_stage = str(state.get("pending_repair_stage") or "")
+            if not repair_stage:
+                current_stage = self._workflow(state).stages.get(str(state.get("current_stage")))
+                repair_stage = self._repair_stage(current_stage) if current_stage else None
+            if not repair_stage or repair_stage not in self._workflow(state).stages:
+                state["status"] = "paused"
+                state["pending_human_decision"] = reason
+                state["errors"].append("no configured repair stage for this failure")
+                self._save(run_id, state)
+                return state
             state["pending_validation"] = None
-            state["current_stage"] = "implementation-repair"
+            state["pending_repair_stage"] = None
+            state["current_stage"] = repair_stage
             state["status"] = "running"
         elif reason in {
             "execution_worktree_missing",
@@ -1485,17 +1810,26 @@ class CycleOrchestrator:
         return self.run_to_stop(run_id)
 
     @_locked
-    def continue_step(self, run_id: str) -> dict[str, Any]:
+    def continue_step(self, run_id: str, direction: bytes = b"") -> dict[str, Any]:
         state = self.state(run_id)
         if state.get("status") != "paused" or state.get("pending_human_decision") != "operator_step":
             raise ValueError("the run is not waiting at an operator step")
+        decode_text_artifact(direction, "operator direction")
+        if direction.strip():
+            self._record_decision(
+                state,
+                payload=direction,
+                choice="direction",
+                reason="operator_step",
+                title="Owner direction",
+            )
         state["pending_human_decision"] = None
         state["status"] = "running"
         self._event(
             state,
             "operator.step.continued",
             title="Next turn started",
-            details={"stage": state.get("current_stage")},
+            details={"stage": state.get("current_stage"), "direction_supplied": bool(direction.strip())},
         )
         self._save(run_id, state)
         return self.run_to_stop(run_id)
@@ -1507,7 +1841,9 @@ class CycleOrchestrator:
         state["errors"].append(f"background_operation_failed:{detail}")
         if state.get("status") not in {"complete", "cancelled", "failed"}:
             state["status"] = "paused"
-            if state.get("inflight"):
+            if state.get("validation_inflight"):
+                state["pending_human_decision"] = "unknown_validation_execution"
+            elif state.get("inflight"):
                 state["pending_human_decision"] = "unknown_provider_invocation"
             elif not state.get("pending_human_decision"):
                 state["pending_human_decision"] = "background_operation_failed"
@@ -1620,6 +1956,8 @@ class CycleOrchestrator:
         run_id: str,
         *,
         profile: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
         session_action: str | None = None,
     ) -> dict[str, Any]:
         state = self.state(run_id)
@@ -1646,9 +1984,18 @@ class CycleOrchestrator:
             raise ValueError("workspace-write profiles are allowed only for implementation stages")
         if session_action is not None and session_action not in {"new", "continue"}:
             raise ValueError("session action must be new or continue")
+        if model is not None and not model.strip():
+            raise ValueError("model override cannot be empty")
+        if effort is not None and not effort.strip():
+            raise ValueError("reasoning effort override cannot be empty")
+        profile_value = vars(target_profile).copy()
+        if model is not None:
+            profile_value["model"] = model.strip()
+        if effort is not None:
+            profile_value["effort"] = effort.strip()
         state["next_turn_override"] = {
             "profile": selected_profile,
-            "profile_value": vars(target_profile),
+            "profile_value": profile_value,
             "session_action": session_action,
             "target_stage": stage.id,
         }

@@ -27,11 +27,17 @@ def request_json(url: str, *, method: str = "GET", value: dict[str, object] | No
 
 
 def test_profile_overrides_are_runtime_local_and_validated(tmp_path: Path):
-    before = load_configured_workflows(tmp_path)["continuous-development"].profiles["codex-planning"]
+    workflows = load_configured_workflows(tmp_path)
+    before = workflows["continuous-development"].profiles["codex-planning"]
     assert before.effort == "xhigh"
+    planner_close = workflows["continuous-development-planner-close"]
+    assert planner_close.stages["next-task"].session_slot == "planner"
+    assert planner_close.stages["next-task"].profile == "codex-planning"
     update_profile(tmp_path, "continuous-development", "codex-planning", model="gpt-test", effort="high")
     after = load_configured_workflows(tmp_path)["continuous-development"].profiles["codex-planning"]
     assert after.model == "gpt-test" and after.effort == "high"
+    inherited = load_configured_workflows(tmp_path)["continuous-development-planner-close"].profiles["codex-planning"]
+    assert inherited.model == "gpt-test" and inherited.effort == "high"
     assert (tmp_path / "config" / "workflows" / "continuous-development.json").is_file()
 
 
@@ -142,3 +148,68 @@ def test_background_worker_failure_is_persisted_in_run_state(tmp_path: Path):
     assert state["pending_human_decision"] == "background_operation_failed"
     assert "fixture worker crash" in state["errors"][-1]
     assert state["events"][-1]["kind"] == "background.operation.failed"
+
+
+def test_local_web_continue_forwards_optional_owner_direction(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    received: list[tuple[str, bytes]] = []
+
+    def continue_step(run_id: str, direction: bytes = b"") -> dict[str, object]:
+        received.append((run_id, direction))
+        return {"run_id": run_id}
+
+    engine.continue_step = continue_step  # type: ignore[method-assign]
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status, _ = request_json(
+            base + "/api/runs/run_20260712T120000Z_1234abcd/continue",
+            method="POST",
+            nonce="test-nonce",
+            value={"direction": "How about now?\r\n"},
+        )
+        assert status == 202
+        deadline = time.monotonic() + 5
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert received == [("run_20260712T120000Z_1234abcd", b"How about now?\r\n")]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_local_web_exposes_inactive_run_recovery(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    received: list[str] = []
+
+    def recover_run(run_id: str) -> dict[str, object]:
+        received.append(run_id)
+        return {"run_id": run_id}
+
+    engine.recover_run = recover_run  # type: ignore[method-assign]
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    run_id = "run_20260712T120000Z_1234abcd"
+    try:
+        status, _ = request_json(
+            base + f"/api/runs/{run_id}/recover",
+            method="POST",
+            nonce="test-nonce",
+            value={},
+        )
+        assert status == 202
+        deadline = time.monotonic() + 5
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert received == [run_id]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
