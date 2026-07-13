@@ -19,12 +19,21 @@ let settingsWorkflowId = null;
 const promptPreviewCache = new Map();
 const gateDrafts = new Map();
 
-async function api(path, options = {}) {
+async function api(path, options = {}, retriedNonce = false) {
   const headers = {"Content-Type": "application/json", ...(options.headers || {})};
   if (options.method && options.method !== "GET") headers["X-Orchestrator-Nonce"] = bootstrap?.nonce || "";
   const response = await fetch(path, {...options, headers});
   const type = response.headers.get("content-type") || "";
   const value = type.includes("application/json") ? await response.json() : await response.text();
+  if (!response.ok && response.status === 403 && !retriedNonce && options.method && options.method !== "GET" && String(value?.error || "").includes("launch nonce")) {
+    const refreshed = await fetch("/api/bootstrap", {headers:{"Content-Type":"application/json"}});
+    const refreshedType = refreshed.headers.get("content-type") || "";
+    const refreshedValue = refreshedType.includes("application/json") ? await refreshed.json() : await refreshed.text();
+    if (refreshed.ok) {
+      bootstrap = refreshedValue;
+      return api(path, options, true);
+    }
+  }
   if (!response.ok) throw new Error(value.error || value || `${response.status}`);
   return value;
 }
@@ -575,8 +584,13 @@ function renderSettings() {
     card.innerHTML = `<header><strong>${escapeHtml(profile.label)}</strong><span>${escapeHtml(profile.id || profileId)} · ${escapeHtml(profile.provider)}</span></header><div class="profile-grid"><input data-field="model" value="${escapeHtml(profile.model)}" aria-label="${escapeHtml(profile.label)} model"><input data-field="effort" value="${escapeHtml(profile.effort)}" aria-label="${escapeHtml(profile.label)} reasoning effort"><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} profile">Save</button></div>`;
     $("button", card).addEventListener("click", async () => {
       const payload = {workflow:workflow.id, profile:profile.id || profileId, model:$('[data-field="model"]',card).value, effort:$('[data-field="effort"]',card).value};
-      try { await api("/api/profile", {method:"POST",body:JSON.stringify(payload)}); await loadBootstrap(); }
-      catch(error){ alert(error.message); }
+      try {
+        const saved = await api("/api/profile", {method:"POST",body:JSON.stringify(payload)});
+        $('[data-field="model"]',card).value = saved.model;
+        $('[data-field="effort"]',card).value = saved.effort;
+        $("strong", card).textContent = saved.label;
+        await loadBootstrap();
+      } catch(error) { alert(`Not saved: ${error.message}. Reload to discard this draft.`); }
     });
     root.append(card);
   }

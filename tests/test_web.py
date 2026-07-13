@@ -56,6 +56,8 @@ def test_local_web_api_serves_ui_requires_nonce_and_blocks_artifact_traversal(tm
 
         status, bootstrap = request_json(base + "/api/bootstrap")
         assert status == 200 and bootstrap["nonce"] == "test-nonce"
+        assert bootstrap["server"]["started_at"]
+        assert bootstrap["server"]["revision"] == "unknown"
         assert "continuous-development" in bootstrap["workflows"]
 
         try:
@@ -118,6 +120,89 @@ def test_local_web_api_serves_ui_requires_nonce_and_blocks_artifact_traversal(tm
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_profile_save_with_browser_nonce_from_before_server_restart_is_rejected(tmp_path: Path):
+    """Capture the stale page nonce incident before adding retry behavior.
+
+    A page bootstrapped by the first UI process retains its launch nonce.  If
+    the process is restarted on the same URL before the page reloads, its
+    profile-save request must currently receive the explicit nonce rejection.
+    """
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    first_server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(engine, workers, "nonce-before-restart")
+    )
+    port = first_server.server_port
+    first_thread = threading.Thread(target=first_server.serve_forever, daemon=True)
+    first_thread.start()
+    try:
+        _, bootstrap = request_json(f"http://127.0.0.1:{port}/api/bootstrap")
+    finally:
+        first_server.shutdown()
+        first_server.server_close()
+        first_thread.join(timeout=5)
+
+    second_server = ThreadingHTTPServer(
+        ("127.0.0.1", port), make_handler(engine, workers, "nonce-after-restart")
+    )
+    second_thread = threading.Thread(target=second_server.serve_forever, daemon=True)
+    second_thread.start()
+    try:
+        stale_profile_save = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/profile",
+            data=json.dumps({
+                "workflow": "continuous-development",
+                "profile": "codex-planning",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+            }).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Orchestrator-Nonce": bootstrap["nonce"],
+                "Origin": f"http://127.0.0.1:{port}",
+            },
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            urllib.request.urlopen(stale_profile_save, timeout=5)
+        assert rejected.value.code == 403
+        assert json.loads(rejected.value.read().decode("utf-8")) == {
+            "error": "PermissionError: missing or invalid launch nonce"
+        }
+        saved = load_configured_workflows(engine.runtime_dir)["continuous-development"]
+        assert saved.profiles["codex-planning"].effort == "xhigh"
+    finally:
+        second_server.shutdown()
+        second_server.server_close()
+        second_thread.join(timeout=5)
+
+
+def test_profile_value_persists_across_ui_server_restart(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    first = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "first-nonce"))
+    port = first.server_port
+    first_thread = threading.Thread(target=first.serve_forever, daemon=True)
+    first_thread.start()
+    try:
+        status, saved = request_json(
+            f"http://127.0.0.1:{port}/api/profile", method="POST", nonce="first-nonce",
+            value={"workflow": "continuous-development", "profile": "codex-planning", "effort": "high"},
+        )
+        assert status == 200 and saved["effort"] == "high"
+    finally:
+        first.shutdown(); first.server_close(); first_thread.join(timeout=5)
+    restarted = ThreadingHTTPServer(("127.0.0.1", port), make_handler(engine, workers, "second-nonce"))
+    restarted_thread = threading.Thread(target=restarted.serve_forever, daemon=True)
+    restarted_thread.start()
+    try:
+        _, bootstrap = request_json(f"http://127.0.0.1:{port}/api/bootstrap")
+        assert bootstrap["nonce"] == "second-nonce"
+        assert bootstrap["workflows"]["continuous-development"]["profiles"]["codex-planning"]["effort"] == "high"
+    finally:
+        restarted.shutdown(); restarted.server_close(); restarted_thread.join(timeout=5)
 
 
 def test_head_endpoint_returns_only_change_detection_fields(tmp_path: Path):

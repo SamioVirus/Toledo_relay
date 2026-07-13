@@ -3,8 +3,10 @@ from __future__ import annotations
 import ipaddress
 import json
 import secrets
+import subprocess
 import threading
 import urllib.parse
+from datetime import datetime, timezone
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +19,7 @@ from .configuration import (
     save_project_value,
     update_profile,
 )
+from .catalog import load_catalog, refresh_catalog, validate_selection
 from .core import read_json
 from .cycle import CycleOrchestrator
 
@@ -126,8 +129,16 @@ def _timeline_compatible(state: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
-def make_handler(engine: CycleOrchestrator, workers: RunWorkers, nonce: str) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    engine: CycleOrchestrator,
+    workers: RunWorkers,
+    nonce: str,
+    server_started_at: str | None = None,
+    server_revision: str | None = None,
+) -> type[BaseHTTPRequestHandler]:
     ui_root = Path(__file__).with_name("ui").resolve()
+    server_started_at = server_started_at or datetime.now(timezone.utc).isoformat()
+    server_revision = server_revision or "unknown"
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "ToledoOrchestrator/0.2"
@@ -182,7 +193,9 @@ def make_handler(engine: CycleOrchestrator, workers: RunWorkers, nonce: str) -> 
                     workflows = load_configured_workflows(engine.runtime_dir)
                     self._send({
                         "nonce": nonce,
+                        "server": {"started_at": server_started_at, "revision": server_revision},
                         "runtime_dir": str(engine.runtime_dir),
+                        "catalog": load_catalog(engine.runtime_dir),
                         "projects": {key: value.check() for key, value in projects.items()},
                         "workflows": {key: value.public_summary() for key, value in workflows.items()},
                         "runs": _run_summaries(engine, workers),
@@ -318,17 +331,38 @@ def make_handler(engine: CycleOrchestrator, workers: RunWorkers, nonce: str) -> 
                     self._send(state)
                     return
                 if parsed.path == "/api/profile":
+                    workflow_id = str(value.get("workflow", "continuous-development"))
+                    profile_id = str(value["profile"])
+                    workflow = load_configured_workflows(engine.runtime_dir)[workflow_id]
+                    current = workflow.profiles[profile_id]
+                    model = str(value["model"]) if "model" in value else current.model
+                    effort = str(value["effort"]) if "effort" in value else current.effort
+                    catalog = load_catalog(engine.runtime_dir)
+                    # Discovery can be unavailable (for example a locked-down
+                    # field host).  A stale/empty catalog warns the UI but is
+                    # never a persistence or run blocker; when it has entries,
+                    # the combination is validated deterministically.
+                    if catalog.get("models"):
+                        validate_selection(
+                            catalog, provider=current.provider, model=model,
+                            effort=effort, custom=bool(value.get("custom")),
+                        )
                     workflow = update_profile(
                         engine.runtime_dir,
-                        str(value.get("workflow", "continuous-development")),
-                        str(value["profile"]),
+                        workflow_id,
+                        profile_id,
                         model=str(value["model"]) if "model" in value else None,
                         effort=str(value["effort"]) if "effort" in value else None,
                         permission=str(value["permission"]) if "permission" in value else None,
                         label=str(value["label"]) if "label" in value else None,
                     )
                     engine.workflows = load_configured_workflows(engine.runtime_dir)
-                    self._send(workflow.public_summary()["profiles"][str(value["profile"])])
+                    saved = workflow.public_summary()["profiles"][profile_id]
+                    saved["custom"] = bool(value.get("custom"))
+                    self._send(saved)
+                    return
+                if parsed.path == "/api/catalog/refresh":
+                    self._send(refresh_catalog(engine.runtime_dir))
                     return
                 if parsed.path == "/api/project":
                     project = save_project_value(engine.runtime_dir, value)
@@ -360,9 +394,17 @@ def serve(runtime_dir: Path, host: str = "127.0.0.1", port: int = 8765, open_bro
     engine = CycleOrchestrator(runtime_dir=runtime_dir)
     workers = RunWorkers()
     nonce = secrets.token_urlsafe(24)
-    server = ThreadingHTTPServer((host, port), make_handler(engine, workers, nonce))
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=Path.cwd(), capture_output=True, text=True, timeout=3, check=False
+        ).stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        revision = "unknown"
+    started_at = datetime.now(timezone.utc).isoformat()
+    server = ThreadingHTTPServer((host, port), make_handler(engine, workers, nonce, started_at, revision))
     url = f"http://{host}:{server.server_port}/"
     print(f"Toledo Orchestrator UI: {url}")
+    print(f"Server start: {started_at} revision: {revision}")
     print("Press Ctrl+C to stop.")
     if open_browser:
         webbrowser.open(url)

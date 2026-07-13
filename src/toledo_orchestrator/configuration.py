@@ -80,6 +80,11 @@ def update_profile(
     for key, selected in changes.items():
         if selected is not None:
             profiles[profile_id][key] = selected
+    # A label is presentation only.  When an operator changes selection fields
+    # without deliberately setting a custom label, keep the visible label
+    # truthful by deriving it from the persisted values.
+    if label is None and (model is not None or effort is not None):
+        profiles[profile_id]["label"] = f"{profiles[profile_id]['model']} · {profiles[profile_id]['effort']}"
     return save_workflow_value(runtime_dir, value)
 
 
