@@ -185,6 +185,13 @@ function renderRun() {
       : stageTitle(state.current_stage);
   const retryReasons = new Set(["operator_step", "provider_requested_human", "provider_invocation_failed", "provider_session_id_missing", "provider_session_missing", "provider_session_not_new", "provider_session_changed_unexpectedly", "missing_substantive_output", "malformed_directive", "unsupported_stage_directive", "invalid_next_turn_profile", "profile_permission_exceeds_stage", "background_operation_failed"]);
   const canOverride = state.schema_version === "toledo_orchestrator.run.v2" && state.current_stage && !state.inflight && (state.status === "created" || state.status === "running" || retryReasons.has(state.pending_human_decision));
+  const workflow = bootstrap.workflows[state.workflow];
+  const stage = workflow?.stages?.[state.current_stage] || {};
+  const profile = workflow?.profiles?.[state.next_turn_override?.profile || stage.profile] || {};
+  const cost = (state.turns || []).reduce((sum, turn) => sum + Number(turn.usage?.total_cost_usd || 0), 0);
+  const strip = $("#run-status-strip");
+  strip.hidden = false;
+  strip.innerHTML = `<span>${escapeHtml(state.status)}</span><span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
   $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(state.run_id)} · ${escapeHtml(state.status.toUpperCase())}</p><h2>${escapeHtml(heading || "Run complete")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">cycle ${state.cycle || 1}</span><span class="fact">${state.current_turn || 0} turns</span><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span>${state.execution_branch ? `<span class="fact">${escapeHtml(state.execution_branch)}</span>` : ''}${canOverride ? '<button class="quiet-button" id="next-turn-control">Override next turn ↗</button>' : ''}${canRecover ? '<button class="accept-button" id="recover-run">Recover run</button>' : ''}</div>`;
   $("#next-turn-control")?.addEventListener("click", openNextTurnControl);
   $("#recover-run")?.addEventListener("click", recoverCurrentRun);
@@ -512,6 +519,9 @@ function configureGate(fragment, state) {
   if (reason === "validation_execution_approval") {
     const commands = (state.pending_validation?.commands || []).map((item) => `${item.id}: ${item.command}`);
     if (commands.length) description.textContent += `\n\nPending host commands:\n${commands.join("\n")}`;
+    description.textContent = `You are approving these host commands once in the isolated worktree, not a provider turn.\n\n${description.textContent}\n\nWhere: ${state.execution_worktree || "isolated worktree"} at ${(state.working_revision || state.source_revision || "").slice(0, 12)}`;
+    textarea.hidden = true;
+    label.hidden = true;
   }
   gate.dataset.reason = reason;
   if (reason === "operator_step") {

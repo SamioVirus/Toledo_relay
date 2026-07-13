@@ -1921,6 +1921,45 @@ class CycleOrchestrator:
     def artifact(self, run_id: str, relative: str) -> bytes:
         return self._artifact_bytes(self.state(run_id), relative)
 
+    def export_run(self, run_id: str, *, plain_text: bool = False) -> bytes:
+        """Create a local, chronological evidence export without raw envelopes."""
+        state = self.state(run_id)
+        run_dir = self._run_dir(run_id)
+        lines = [
+            f"# Toledo run {state['run_id']}", "",
+            f"- Project: {state.get('project', '')}",
+            f"- Workflow: {state.get('workflow', '')}",
+            f"- Revision: {state.get('working_revision') or state.get('source_revision') or ''}",
+            f"- Status: {state.get('status', '')}", "",
+            "This is local evidence. Raw provider stdout/stderr envelopes are excluded.", "",
+        ]
+        for turn in state.get("turns", []):
+            lines.extend([
+                f"## {turn.get('id', 'turn')} — {turn.get('title') or turn.get('stage') or turn.get('route', '')}",
+                f"Provider: {turn.get('provider', '')} | model: {turn.get('observed_model') or turn.get('configured_model') or ''} | effort: {turn.get('observed_reasoning') or turn.get('configured_reasoning') or ''}",
+            ])
+            usage = turn.get("usage") or {}
+            if isinstance(usage, dict) and usage.get("total_cost_usd") is not None:
+                lines.append(f"Observed cost: ${usage['total_cost_usd']}")
+            for label, key in (("Direction", "direction_file"), ("Output", "output_file")):
+                name = turn.get(key)
+                if not name:
+                    continue
+                try:
+                    text = (run_dir / "turns" / str(name)).read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                lines.extend([f"### {label}", work_product_text(text).strip(), ""])
+        for decision in state.get("decisions", []):
+            lines.append(f"## Decision: {decision.get('choice', '')}")
+            if decision.get("reason"):
+                lines.append(f"Reason: {decision['reason']}")
+        lines.extend(["## Validation summary", json.dumps(state.get("validations", {}), ensure_ascii=False, indent=2, sort_keys=True), ""])
+        text = "\n".join(lines)
+        if plain_text:
+            text = text.replace("# ", "").replace("## ", "").replace("### ", "")
+        return text.encode("utf-8")
+
     @_locked
     def attach_receipt(self, run_id: str, receipt_path: Path) -> dict[str, Any]:
         state = self.state(run_id)

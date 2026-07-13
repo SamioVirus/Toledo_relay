@@ -240,6 +240,12 @@ def make_handler(
                     self._headers("text/plain; charset=utf-8", len(data))
                     self.wfile.write(data)
                     return
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "export":
+                    plain_text = urllib.parse.parse_qs(parsed.query).get("format", ["markdown"])[0] == "text"
+                    data = engine.export_run(parts[2], plain_text=plain_text)
+                    self._headers("text/plain; charset=utf-8", len(data))
+                    self.wfile.write(data)
+                    return
                 self._static(path)
             except ValueError as error:
                 self._error(error, 404)

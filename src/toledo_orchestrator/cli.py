@@ -106,6 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
     artifact = commands.add_parser("artifact")
     artifact.add_argument("run_id")
     artifact.add_argument("path")
+    export = commands.add_parser("export")
+    export.add_argument("run_id")
+    export.add_argument("--format", choices=("markdown", "text"), default="markdown")
     cleanup = commands.add_parser("cleanup")
     cleanup.add_argument("run_id")
     cleanup.add_argument("--force", action="store_true")
@@ -141,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         _emit(engine.run_to_stop(run_id))
         return 0
-    if args.command in {"status", "show", "resume", "decide", "advance", "override", "recover", "validate", "artifact", "cleanup"}:
+    if args.command in {"status", "show", "resume", "decide", "advance", "override", "recover", "validate", "artifact", "export", "cleanup"}:
         engine, state = _state_engine(args.runtime_dir, args.run_id)
         if args.command == "status":
             _emit(state)
@@ -153,6 +156,11 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(engine, CycleOrchestrator):
                 raise ValueError("artifact command currently requires a v2 run")
             sys.stdout.buffer.write(engine.artifact(args.run_id, args.path))
+            return 0
+        if args.command == "export":
+            if not isinstance(engine, CycleOrchestrator):
+                raise ValueError("export currently requires a v2 run")
+            sys.stdout.buffer.write(engine.export_run(args.run_id, plain_text=args.format == "text"))
             return 0
         if args.command == "cleanup":
             if not isinstance(engine, CycleOrchestrator):

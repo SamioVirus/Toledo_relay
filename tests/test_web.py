@@ -242,6 +242,22 @@ def test_head_endpoint_returns_only_change_detection_fields(tmp_path: Path):
         thread.join(timeout=5)
 
 
+def test_export_is_chronological_and_excludes_raw_envelopes(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    run_id = "run_20260712T120000Z_deadbeef"
+    run_dir = engine.runs_dir / run_id
+    (run_dir / "turns").mkdir(parents=True)
+    (run_dir / "turns" / "turn.0001.output.md").write_text("Useful work\n```orchestrator\n{\"next\":\"ready\"}\n```", encoding="utf-8")
+    write_json(run_dir / "run.json", {
+        "run_id": run_id, "schema_version": "toledo_orchestrator.run.v2", "project": "toledo", "workflow": "continuous-development",
+        "status": "paused", "turns": [{"id": "turn.0001", "stage": "planning-propose", "provider": "codex", "output_file": "turn.0001.output.md", "usage": {"total_cost_usd": 0.12}}],
+        "decisions": [], "validations": {}, "artifacts": {},
+    })
+    exported = engine.export_run(run_id).decode("utf-8")
+    assert "Useful work" in exported and "Observed cost: $0.12" in exported
+    assert "orchestrator" not in exported and "stderr" in exported
+
+
 def test_background_worker_failure_is_persisted_in_run_state(tmp_path: Path):
     engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
     workers = RunWorkers()
