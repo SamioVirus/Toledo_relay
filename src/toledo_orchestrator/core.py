@@ -500,8 +500,14 @@ def parse_claude_result(route: str, stdout: bytes, stderr: bytes = b"", exit_cod
         for key in ("total_cost_usd", "duration_ms", "duration_api_ms", "num_turns"):
             if key in envelope:
                 usage[key] = envelope[key]
-        if envelope.get("is_error") is True or str(envelope.get("subtype") or "").startswith("error"):
-            provider_error = str(envelope.get("subtype") or "claude_result_error")
+        subtype = str(envelope.get("subtype") or "")
+        if envelope.get("is_error") is True or subtype.startswith("error"):
+            if subtype and subtype != "success":
+                provider_error = subtype
+            elif envelope.get("api_error_status") is not None:
+                provider_error = f"claude_api_error_{envelope['api_error_status']}"
+            else:
+                provider_error = "claude_result_error"
     except (UnicodeDecodeError, json.JSONDecodeError):
         pass
     effective_exit = exit_code or (1 if provider_error else 0)

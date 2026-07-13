@@ -212,6 +212,15 @@ def test_provider_error_envelopes_never_become_work_product():
     assert codex.session_id == "codex-limited-session-fixture"
     assert claude.exit_code == 1 and claude.error == "error_during_execution"
 
+    rate_limited = parse_claude_result(
+        "claude-review",
+        (FIXTURES / "claude_rate_limit.json").read_bytes(),
+        exit_code=1,
+    )
+    assert rate_limited.error == "claude_api_error_429"
+    assert rate_limited.exit_code == 1
+    assert result_text(rate_limited) == "You've hit your limit"
+
 
 def test_missing_provider_executable_becomes_captured_failure(tmp_path: Path):
     result = CodexAdapter(executable=str(tmp_path / "missing-codex.exe"), timeout=1).invoke("codex-propose", b"prompt", tmp_path)

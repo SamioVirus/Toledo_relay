@@ -155,6 +155,23 @@ class FailedThenReusedAdapter(ProviderAdapter):
         return {"provider": self.provider, "ready": True, "generation": "fixture"}
 
 
+class FailedOnceThenSessionAdapter(SessionAdapter):
+    def invoke_configured(self, route: str, prompt: bytes, working_directory: Path, **kwargs: Any) -> ProviderResult:
+        if not self.invocations:
+            self.invocations.append({**kwargs, "route": route, "prompt": prompt, "cwd": working_directory})
+            return ProviderResult(
+                self.provider,
+                route,
+                b'{"type":"result","subtype":"success","is_error":true,"api_error_status":429}',
+                exit_code=1,
+                error="claude_api_error_429",
+                configured_model=kwargs["model"],
+                configured_reasoning=kwargs["reasoning"],
+                session_action=kwargs["session_action"],
+            )
+        return super().invoke_configured(route, prompt, working_directory, **kwargs)
+
+
 @pytest.fixture
 def writable_project(tmp_path: Path) -> ProjectDefinition:
     root = tmp_path / "project"
@@ -806,6 +823,38 @@ def test_run_profiles_are_snapshotted_and_explicit_override_is_recorded(tmp_path
     app_override.run_to_stop(run_override)
     assert codex_override.invocations[0]["model"] == "gpt-one-turn"
     assert codex_override.invocations[0]["reasoning"] == "medium"
+
+
+def test_provider_failure_retry_preserves_the_selected_profile_model_and_effort(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [("planning-propose", response("continue", "Initial plan"))])
+    claude = FailedOnceThenSessionAdapter(
+        "claude", [("planning-review", response("human", "Review completed"))]
+    )
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Task", "test")
+    failed = app.run_to_stop(run_id)
+    assert failed["pending_human_decision"] == "provider_invocation_failed"
+
+    saved = app.set_next_turn_override(
+        run_id,
+        profile="claude-implementation-review",
+        model="claude-opus-4-8",
+        effort="max",
+        session_action="new",
+    )
+    assert saved["next_turn_override"]["profile"] == "claude-implementation-review"
+
+    retried = app.decide(run_id, "yes")
+    invocation = claude.invocations[-1]
+    assert invocation["model"] == "claude-opus-4-8"
+    assert invocation["reasoning"] == "max"
+    assert invocation["session_action"] == "new"
+    assert retried["turns"][-1]["profile"] == "claude-implementation-review"
+    assert retried["turns"][-1]["configured_model"] == "claude-opus-4-8"
+    assert retried["turns"][-1]["configured_reasoning"] == "max"
+    assert retried["next_turn_override"] is None
 
 
 def test_round_caps_allow_the_configured_number_of_corrections(tmp_path: Path, writable_project: ProjectDefinition):

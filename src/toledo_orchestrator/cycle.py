@@ -1473,7 +1473,13 @@ class CycleOrchestrator:
         self._event(state, "run.cancelled", title="Run cancelled", details={"reason": reason})
 
     def _force_new_session(self, state: dict[str, Any]) -> None:
-        state["next_turn_override"] = {"profile": None, "profile_value": None, "session_action": "new"}
+        override = state.get("next_turn_override")
+        preserved = dict(override) if isinstance(override, dict) else {}
+        preserved.setdefault("profile", None)
+        preserved.setdefault("profile_value", None)
+        preserved.setdefault("target_stage", state.get("current_stage"))
+        preserved["session_action"] = "new"
+        state["next_turn_override"] = preserved
         state["status"] = "running"
 
     def _record_decision(
