@@ -96,8 +96,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .prompt-node { position:relative; grid-column:2; justify-self:center; width:72px; min-height:34px; margin-top:11px; z-index:4; border:1px solid #36536c; border-radius:999px; background:#132434; color:#a6bdd1; font:700 9px/1.15 ui-monospace,monospace; text-transform:uppercase; letter-spacing:.06em; padding:8px 6px; box-shadow:0 0 0 5px var(--canvas); }
 .prompt-tooltip { position:absolute; visibility:hidden; opacity:0; width:max-content; max-width:min(520px,calc(100vw - 32px)); max-height:min(70vh,560px); overflow:auto; left:50%; top:calc(100% + 10px); transform:translate(-50%,-4px); white-space:pre-wrap; text-align:left; text-transform:none; letter-spacing:0; font:11px/1.5 ui-monospace,Consolas,monospace; padding:13px; border-radius:9px; color:#d7e2ee; background:#111f2d; border:1px solid #35516b; box-shadow:0 20px 50px #000a; pointer-events:auto; z-index:30; transition:opacity .12s ease,transform .12s ease,visibility .12s; }
 .prompt-node:hover .prompt-tooltip,.prompt-node:focus-visible .prompt-tooltip { visibility:visible; opacity:1; transform:translate(-50%,0); }
-.turn-card { width:var(--card-width); border:1px solid #26384b; border-left:3px solid var(--session-color); border-radius:12px; background:linear-gradient(150deg,rgba(20,34,48,.98),rgba(11,21,31,.98)); box-shadow:0 12px 30px rgba(0,0,0,.18); overflow:hidden; transition:transform .16s ease,border-color .16s ease; }
-.turn-card:hover { transform:translateY(-2px); border-color:#405975; }
+.turn-card { --accent:var(--session-color); width:var(--card-width); border:1px solid #26384b; border-radius:12px; background:linear-gradient(150deg,rgba(20,34,48,.98),rgba(11,21,31,.98)); box-shadow:inset 3px 0 0 0 var(--accent),0 12px 30px rgba(0,0,0,.18); overflow:hidden; transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease; }
+.turn-card:hover { transform:translateY(-2px); border-color:#405975; box-shadow:inset 3px 0 0 0 var(--accent),0 16px 38px rgba(0,0,0,.28); }
 .session-color-0 { --session-color:#56c8ff; }
 .session-color-1 { --session-color:#ffb15a; }
 .session-color-2 { --session-color:#61e6a8; }
@@ -122,8 +122,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .session-color-21 { --session-color:#d9bc6f; }
 .session-color-22 { --session-color:#8ab9cf; }
 .session-color-23 { --session-color:#c9a0dd; }
-.turn-card.codex { grid-column:1; justify-self:end; }
-.turn-card.claude { grid-column:3; justify-self:start; border-left-width:1px; border-right:3px solid var(--session-color); }
+.turn-card.codex { grid-column:1; justify-self:end; box-shadow:inset -3px 0 0 0 var(--accent),0 12px 30px rgba(0,0,0,.18); }
+.turn-card.codex:hover { box-shadow:inset -3px 0 0 0 var(--accent),0 16px 38px rgba(0,0,0,.28); }
+.turn-card.claude { grid-column:3; justify-self:start; box-shadow:inset 3px 0 0 0 var(--accent),0 12px 30px rgba(0,0,0,.18); }
+.turn-card.claude:hover { box-shadow:inset 3px 0 0 0 var(--accent),0 16px 38px rgba(0,0,0,.28); }
 .turn-card-head { padding:13px 14px 10px; display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
 .actor { display:flex; gap:9px; align-items:center; }
 .session-token { min-width:38px; height:30px; padding:0 6px; flex:0 0 auto; border-radius:9px; display:grid; place-items:center; color:var(--session-color); border:1px solid color-mix(in srgb,var(--session-color),#152131 55%); background:color-mix(in srgb,var(--session-color),#101a27 84%); font:800 11px ui-monospace,monospace; }
@@ -192,7 +194,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .mobile-only,.mobile-label{display:inline}.desktop-label{display:none}
   .run-rail{display:flex;position:fixed;z-index:50;inset:0 auto 0 0;width:min(320px,88vw);background:#081019;box-shadow:20px 0 60px #000a;transform:translateX(-105%);transition:transform .2s ease;pointer-events:none}
   body.mobile-rail-open .run-rail{transform:translateX(0);pointer-events:auto}
-  .workspace{overflow:visible}.timeline-row{display:block;padding-left:70px;min-height:0;margin-bottom:18px}.cycle-block::before{left:29px}.prompt-node{position:absolute;left:0;top:0;width:58px;font-size:8px}.prompt-tooltip{display:none!important}.turn-card,.turn-card.codex,.turn-card.claude{width:100%;margin:0;justify-self:auto;border-left:3px solid var(--session-color);border-right:1px solid #26384b}.milestone-row{display:block;padding:10px 0}.decision-row{display:block;padding:10px 0}.decision-node{width:92%}.inspector{position:fixed;inset:68px 0 0 4%;z-index:40}.inspector-tabs{overflow-x:auto}.timeline-toolbar{padding:9px 14px;flex-wrap:wrap}.timeline-toolbar select{min-width:0;flex:1}.zoom-control{display:none}.run-header{padding:20px}.run-facts{display:none}.route-preflight-card{flex-basis:184px}.route-preflight-head{align-items:flex-start;flex-direction:column;gap:6px}.override-fields{grid-template-columns:1fr}
+  .workspace{overflow:visible}.timeline-row{display:block;padding-left:70px;min-height:0;margin-bottom:18px}.cycle-block::before{left:29px}.prompt-node{position:absolute;left:0;top:0;width:58px;font-size:8px}.prompt-tooltip{display:none!important}.turn-card,.turn-card.codex,.turn-card.claude{width:100%;margin:0;justify-self:auto;border:1px solid #26384b;box-shadow:inset 3px 0 0 0 var(--accent),0 12px 30px rgba(0,0,0,.18)}.milestone-row{display:block;padding:10px 0}.decision-row{display:block;padding:10px 0}.decision-node{width:92%}.inspector{position:fixed;inset:68px 0 0 4%;z-index:40}.inspector-tabs{overflow-x:auto}.timeline-toolbar{padding:9px 14px;flex-wrap:wrap}.timeline-toolbar select{min-width:0;flex:1}.zoom-control{display:none}.run-header{padding:20px}.run-facts{display:none}.route-preflight-card{flex-basis:184px}.route-preflight-head{align-items:flex-start;flex-direction:column;gap:6px}.override-fields{grid-template-columns:1fr}
 }
 @media (prefers-reduced-motion: reduce) {
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
