@@ -212,3 +212,33 @@ No paid provider call is needed for Phases 0-2 beyond a bounded local capability
 - Anthropic effort and Claude Code CLI behavior are documented at <https://platform.claude.com/docs/en/build-with-claude/effort> and <https://code.claude.com/docs/en/cli-usage>.
 
 Recheck these sources and the locally installed CLI versions immediately before implementing catalog logic; provider capability information is expected to change.
+
+## Implementation prompt
+
+Hand this to the implementing agent (Codex Field Operator, a Claude Code session, or the orchestrator itself). It is written to stand alone.
+
+You are implementing the approved plan in the sections above.
+
+Repo: `C:\Users\sammo\src\toledo-orchestrator` - stdlib-only Python plus a vanilla-JS UI. Byte contract: UTF-8 without BOM, atomic temp-file plus `os.replace` writes, never shell-redirect bytes. Commit to `main`, then `git push origin main` (the OneDrive bare mirror is the backup).
+
+### Non-negotiable constraints
+
+- Additive only. Do not break existing run snapshots, sealed artifacts, host-command approval, provider-session continuity, or declarative workflow ownership. Existing runs must stay reproducible from their pinned `workflow_snapshot`.
+- Evidence before behavior change. For the profile-save incident, first capture the actual failing browser request/response plus nonce and server-start state and add a regression test, then fix. The leading hypothesis is a stale browser nonce after a server restart: `app.js` sends the nonce captured at page load, and each `serve()` mints a new one.
+- Do not "fix" the content-type check. `app.js` already correctly tests `application/json`; there is no typo, and no task should be created for it.
+- Reuse working plumbing. The next-turn override backend already exists: `POST /api/runs/<id>/override` calls `set_next_turn_override(profile, model, effort, session_action)`, with the `openNextTurnControl` modal. The preview dock is a projection over it, not a new controller path.
+- Provider is locked while continuing a session; `workflow.py` enforces per-slot provider consistency. Cross-provider switching is Phase 4 only, behind a `provider_switchable` stage flag plus a new physical session.
+- Captions never enter transport. The deterministic state caption is free (`director.py`, no model call). The semantic self-caption is optional, parsed via the existing directive-fence mechanism, absence-is-harmless, sidecar-only, and labeled as the producing model's self-report.
+- Every state-changing gate states exactly what it authorizes. Keep the host-command validation card separate from next-turn direction; the command boundary stays human-approved.
+
+### Verify current facts at implementation time (they drift - re-check, do not trust memory)
+
+- Codex catalog source: `codex debug models` returns JSON `{models:[...]}` with `slug`, `default_reasoning_level`, `supported_reasoning_levels`, `additional_speed_tiers`, `service_tiers`, `supported_in_api`, and `visibility`. Reasoning levels and speed/multi-agent tiers are separate fields; render them as separate controls.
+- Claude has no account-aware model list. Use `claude --help` capabilities plus a curated manifest plus models observed in successful runs. The Anthropic Models API is API entitlement, not Claude Code subscription entitlement; label it as such if used.
+- Capability-gate every control. Hide Ultracode until the installed `claude` binary reports it (2.1.185 does not). A control is never shown solely because documentation mentions it.
+
+### Sequence
+
+Implement Phase 0 through Phase 4 in order. Do not start a phase until the previous one meets its exit criterion above. Each phase lands with: unit, API, and cycle tests; `python -m compileall -q src`; `node --check` on changed JS; `?v=` cache-bust bumps on any changed static asset; desktop and 390px browser QA for UI phases; and a `docs/agent-control/08-evidence-log.md` entry. No paid provider call for Phases 0 through 2 beyond one bounded local capability query; run one scoped live continuity proof per affected provider before closing Phase 3, only after deterministic tests pass.
+
+Start with Phase 0, task 1: reproduce the profile-save failure, capture the exact request/response plus nonce and server-start state, and add the regression test. Report that captured evidence before changing any behavior.
