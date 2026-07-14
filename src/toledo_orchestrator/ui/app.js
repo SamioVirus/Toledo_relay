@@ -557,6 +557,23 @@ function renderNewRunPreflight() {
     const label = stage.prompt_label || promptShort(stage.prompt_kind);
     return `<article class="route-preflight-card"><span class="route-index">${String(index + 1).padStart(2, "0")}</span><p>${escapeHtml(label)}</p><h4>${escapeHtml(stage.title)}</h4><dl><div><dt>Actor</dt><dd>${escapeHtml(stage.session_slot)}</dd></div><div><dt>Profile</dt><dd>${escapeHtml(profile.model || stage.profile)} · ${escapeHtml(profile.effort || "default")}</dd></div><div><dt>Access</dt><dd>${escapeHtml(profile.permission || "unspecified")}</dd></div><div><dt>Session</dt><dd>${escapeHtml(stage.session_policy)}</dd></div></dl></article>`;
   }).join("");
+  // Preflight is display-only: it exposes the same locally verified catalog
+  // facts without creating a second launch controller.
+  $$(".route-preflight-card", root).forEach((card, index) => {
+    const stage = stages[index];
+    const profile = workflow.profiles?.[stage.profile] || {};
+    const entry = catalogModels(profile.provider).find((candidate) => candidate.selection_token === profile.model);
+    const detail = document.createElement("p");
+    detail.className = "catalog-detail";
+    detail.textContent = catalogDetail(profile.provider, profile.model, !entry);
+    card.append(detail);
+    if (entry?.special_modes?.length) {
+      const modes = document.createElement("p");
+      modes.className = "catalog-special-mode";
+      modes.textContent = `Verified special mode: ${entry.special_modes.join(", ")}`;
+      card.append(modes);
+    }
+  });
 }
 
 function orderedWorkflowStages(workflow) {
@@ -579,6 +596,59 @@ function orderedWorkflowStages(workflow) {
   return ordered;
 }
 
+function catalogModels(provider) {
+  return (bootstrap?.catalog?.models || []).filter((model) => model.provider === provider);
+}
+
+function catalogDetail(provider, model, custom) {
+  const entry = catalogModels(provider).find((candidate) => candidate.selection_token === model);
+  if (custom || !entry) return "Custom selection — unverified; recorded as evidence.";
+  const checked = bootstrap?.catalog?.verified_at ? `verified ${new Date(bootstrap.catalog.verified_at).toLocaleDateString()}` : "verification date unavailable";
+  return `${entry.source || "local catalog"} · ${entry.availability || "availability unknown"} · ${checked}${bootstrap?.catalog?.stale ? " · stale" : ""}`;
+}
+
+function installCatalogPicker(root, provider, model, effort) {
+  const modelSelect = $('[data-field="model"]', root);
+  const effortSelect = $('[data-field="effort"]', root);
+  const customBox = $('[data-catalog-custom]', root);
+  const customModel = $('[data-field="custom-model"]', root);
+  const customEffort = $('[data-field="custom-effort"]', root);
+  const detail = $('[data-catalog-detail]', root);
+  const entries = catalogModels(provider);
+  const entry = entries.find((candidate) => candidate.selection_token === model);
+  modelSelect.innerHTML = `${entries.map((candidate) => `<option value="${escapeHtml(candidate.selection_token)}">${escapeHtml(candidate.display_name || candidate.selection_token)}</option>`).join("")}<option value="__custom__">Custom…</option>`;
+  modelSelect.value = entry ? entry.selection_token : "__custom__";
+  customModel.value = entry ? "" : (model || "");
+  customEffort.value = entry ? "" : (effort || "");
+  const sync = () => {
+    const selected = entries.find((candidate) => candidate.selection_token === modelSelect.value);
+    const custom = !selected;
+    customBox.hidden = !custom;
+    effortSelect.closest("label").hidden = custom;
+    if (custom) {
+      detail.textContent = catalogDetail(provider, customModel.value, true);
+      return;
+    }
+    const efforts = selected.supported_efforts || [];
+    effortSelect.innerHTML = efforts.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
+    effortSelect.value = efforts.includes(effortSelect.value) ? effortSelect.value : (efforts.includes(effort) ? effort : (efforts[0] || ""));
+    detail.textContent = catalogDetail(provider, selected.selection_token, false);
+  };
+  effortSelect.value = effort || "";
+  modelSelect.addEventListener("change", sync);
+  customModel.addEventListener("input", sync);
+  sync();
+}
+
+function catalogSelection(root) {
+  const custom = $('[data-field="model"]', root).value === "__custom__";
+  return {
+    custom,
+    model: custom ? $('[data-field="custom-model"]', root).value.trim() : $('[data-field="model"]', root).value,
+    effort: custom ? $('[data-field="custom-effort"]', root).value.trim() : $('[data-field="effort"]', root).value,
+  };
+}
+
 function renderSettings() {
   const workflows = bootstrap.workflows;
   settingsWorkflowId = workflows[settingsWorkflowId] ? settingsWorkflowId : Object.keys(workflows)[0];
@@ -591,9 +661,14 @@ function renderSettings() {
   for (const [profileId, profile] of Object.entries(workflow?.profiles || {})) {
     const card = document.createElement("article");
     card.className = "profile-editor";
-    card.innerHTML = `<header><strong>${escapeHtml(profile.label)}</strong><span>${escapeHtml(profile.id || profileId)} · ${escapeHtml(profile.provider)}</span></header><div class="profile-grid"><input data-field="model" value="${escapeHtml(profile.model)}" aria-label="${escapeHtml(profile.label)} model"><input data-field="effort" value="${escapeHtml(profile.effort)}" aria-label="${escapeHtml(profile.label)} reasoning effort"><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} profile">Save</button></div>`;
+    // Replace the legacy free-text controls with catalog-backed selects. The
+    // only text entry lives inside the explicit Custom… branch.
+    card.innerHTML = `<header><strong>${escapeHtml(profile.label)}</strong><span>${escapeHtml(profile.id || profileId)} / ${escapeHtml(profile.provider)}</span></header><div class="profile-grid"><label>Model<select data-field="model" aria-label="${escapeHtml(profile.label)} model"></select></label><label>Reasoning effort<select data-field="effort" aria-label="${escapeHtml(profile.label)} reasoning effort"></select></label><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} profile">Save</button></div><div data-catalog-custom hidden><label>Custom model<input data-field="custom-model" autocomplete="off"></label><label>Custom reasoning effort<input data-field="custom-effort" autocomplete="off"></label></div><p class="catalog-detail" data-catalog-detail></p>`;
+    installCatalogPicker(card, profile.provider, profile.model, profile.effort);
     $("button", card).addEventListener("click", async () => {
-      const payload = {workflow:workflow.id, profile:profile.id || profileId, model:$('[data-field="model"]',card).value, effort:$('[data-field="effort"]',card).value};
+      const selection = catalogSelection(card);
+      if (!selection.model || !selection.effort) { alert("Custom model and reasoning effort are required."); return; }
+      const payload = {workflow:workflow.id, profile:profile.id || profileId, ...selection};
       try {
         const saved = await api("/api/profile", {method:"POST",body:JSON.stringify(payload)});
         $('[data-field="model"]',card).value = saved.model;
@@ -639,7 +714,7 @@ function openNextTurnControl() {
     : "The override is recorded in the run and applies only to the displayed next provider turn.";
   const dialog = document.createElement("dialog");
   dialog.className = "modal";
-  dialog.innerHTML = `<form method="dialog"><div class="modal-head"><div><p class="eyebrow">ONE-TURN OVERRIDE</p><h2>${escapeHtml(stage.title)}</h2></div><button value="cancel" aria-label="Close override">×</button></div><label>Profile<select id="override-profile">${profiles.map((profile)=>`<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.label)}</option>`).join("")}</select></label><div class="override-fields"><label>Model<input id="override-model" autocomplete="off"></label><label>Reasoning effort<input id="override-effort" autocomplete="off"></label></div><label>Session action<select id="override-session"><option value="">Workflow default</option><option value="continue">Continue current session</option><option value="new">Start a new session</option></select></label><div class="override-preview" id="override-preview" aria-live="polite"></div><p class="override-note">${escapeHtml(overrideNote)}</p><div class="modal-actions"><button value="cancel" class="ghost-button">Cancel</button><button type="button" class="primary-button" id="save-override">Apply override</button></div></form>`;
+  dialog.innerHTML = `<form method="dialog"><div class="modal-head"><div><p class="eyebrow">NEXT TURN</p><h2>${escapeHtml(stage.title)}</h2></div><button value="cancel" aria-label="Close override">×</button></div><label>Profile<select id="override-profile">${profiles.map((profile)=>`<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.label)}</option>`).join("")}</select></label><div class="override-fields"><label>Model<select data-field="model"></select></label><label>Reasoning effort<select data-field="effort"></select></label></div><div data-catalog-custom hidden><label>Custom model<input data-field="custom-model" autocomplete="off"></label><label>Custom reasoning effort<input data-field="custom-effort" autocomplete="off"></label></div><p class="catalog-detail" data-catalog-detail></p><input id="override-model" type="hidden"><input id="override-effort" type="hidden"><label>Session action<select id="override-session"><option value="">Workflow default</option><option value="continue">Continue current session</option><option value="new">Start a new session</option></select></label><div class="override-preview" id="override-preview" aria-live="polite"></div><p class="override-note">${escapeHtml(overrideNote)}</p><div class="modal-actions"><button value="cancel" class="ghost-button">Cancel</button><button type="button" class="primary-button" id="save-override">Apply override</button></div></form>`;
   document.body.append(dialog);
   $("#override-profile",dialog).value = currentState.next_turn_override?.profile || stage.profile;
   $("#override-session",dialog).value = currentState.next_turn_override?.session_action || "";
@@ -655,14 +730,29 @@ function openNextTurnControl() {
   };
   $("#override-model",dialog).value = currentState.next_turn_override?.profile_value?.model || selectedProfile().model || "";
   $("#override-effort",dialog).value = currentState.next_turn_override?.profile_value?.effort || selectedProfile().effort || "";
+  const syncCatalogOverride = () => {
+    const selection = catalogSelection(dialog);
+    $("#override-model", dialog).value = selection.model;
+    $("#override-effort", dialog).value = selection.effort;
+  };
+  const installOverridePicker = () => {
+    installCatalogPicker(dialog, selectedProfile().provider, $("#override-model", dialog).value, $("#override-effort", dialog).value);
+    $$("[data-field]", dialog).forEach((input) => input.addEventListener("input", () => { syncCatalogOverride(); refreshOverridePreview(); }));
+    $$("select[data-field]", dialog).forEach((input) => input.addEventListener("change", () => { syncCatalogOverride(); refreshOverridePreview(); }));
+  };
+  installOverridePicker();
   $("#override-profile",dialog).addEventListener("change", () => refreshOverridePreview({resetValues:true}));
   $("#override-model",dialog).addEventListener("input", () => refreshOverridePreview());
   $("#override-effort",dialog).addEventListener("input", () => refreshOverridePreview());
   $("#override-session",dialog).addEventListener("change", () => refreshOverridePreview());
+  $("#override-profile",dialog).addEventListener("change", () => { installOverridePicker(); syncCatalogOverride(); refreshOverridePreview(); });
   refreshOverridePreview();
   $("#save-override",dialog).addEventListener("click", async () => {
     try {
-      await api(`/api/runs/${encodeURIComponent(currentRunId)}/override`, {method:"POST",body:JSON.stringify({profile:$("#override-profile",dialog).value,model:$("#override-model",dialog).value.trim() || null,effort:$("#override-effort",dialog).value.trim() || null,session_action:$("#override-session",dialog).value || null})});
+      syncCatalogOverride();
+      const selection = catalogSelection(dialog);
+      if (!selection.model || !selection.effort) throw new Error("Custom model and reasoning effort are required.");
+      await api(`/api/runs/${encodeURIComponent(currentRunId)}/override`, {method:"POST",body:JSON.stringify({profile:$("#override-profile",dialog).value,...selection,session_action:$("#override-session",dialog).value || null})});
       dialog.close();dialog.remove();await refreshCurrent();
     } catch(error){alert(error.message);}
   });

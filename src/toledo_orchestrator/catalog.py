@@ -91,7 +91,9 @@ def _claude_models() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     version, _ = _run_text(["claude", "--version"])
     supports_model = "--model" in help_text
     supports_effort = "--effort" in help_text
-    supports_ultracode = "ulտրacode" in help_text.lower() or "ultracode" in help_text.lower()
+    # Do not infer this from documentation or similarly named commands. The
+    # installed binary must advertise the exact execution capability.
+    supports_ultracode = "ultracode" in help_text.lower()
     metadata: dict[str, Any] = {
         "cli": "claude", "cli_version": version.strip(), "error": error,
         "supports_model": supports_model, "supports_effort": supports_effort,

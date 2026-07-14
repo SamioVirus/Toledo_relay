@@ -11,6 +11,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
 
+from .catalog import load_catalog, validate_selection
 from .core import (
     ClaudeAdapter,
     CodexAdapter,
@@ -2055,6 +2056,7 @@ class CycleOrchestrator:
         model: str | None = None,
         effort: str | None = None,
         session_action: str | None = None,
+        custom: bool = False,
     ) -> dict[str, Any]:
         state = self.state(run_id)
         if state["status"] not in {"created", "paused", "running"} or state.get("inflight"):
@@ -2089,11 +2091,24 @@ class CycleOrchestrator:
             profile_value["model"] = model.strip()
         if effort is not None:
             profile_value["effort"] = effort.strip()
+        # A populated catalog is authoritative for the ordinary picker path.
+        # Discovery failure/staleness remains a warning rather than a run
+        # blocker, and the deliberate custom escape hatch records its status.
+        catalog = load_catalog(self.runtime_dir)
+        if catalog.get("models") and (model is not None or effort is not None):
+            validate_selection(
+                catalog,
+                provider=target_profile.provider,
+                model=str(profile_value["model"]),
+                effort=str(profile_value["effort"]),
+                custom=custom,
+            )
         state["next_turn_override"] = {
             "profile": selected_profile,
             "profile_value": profile_value,
             "session_action": session_action,
             "target_stage": stage.id,
+            "custom": custom,
         }
         self._event(state, "turn.override.set", title="Next-turn override", details=state["next_turn_override"])
         self._save(run_id, state)

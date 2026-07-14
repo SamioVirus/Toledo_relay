@@ -33,6 +33,7 @@ class ProfileDefinition:
     permission: str
     color: str
     timeout_seconds: int = 900
+    custom: bool = False
 
     @classmethod
     def from_value(cls, profile_id: str, value: dict[str, Any]) -> "ProfileDefinition":
@@ -51,6 +52,7 @@ class ProfileDefinition:
             permission=permission,
             color=str(value.get("color", "#7c8aa5")),
             timeout_seconds=int(value.get("timeout_seconds", 900)),
+            custom=bool(value.get("custom", False)),
         )
 
 
@@ -340,6 +342,7 @@ class WorkflowDefinition:
                     "permission": profile.permission,
                     "color": profile.color,
                     "timeout_seconds": profile.timeout_seconds,
+                    "custom": profile.custom,
                 }
                 for key, profile in self.profiles.items()
             },

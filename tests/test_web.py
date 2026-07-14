@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from toledo_orchestrator.configuration import load_configured_workflows, update_profile
+from toledo_orchestrator.catalog import CATALOG_SCHEMA
 from toledo_orchestrator.core import sha256, write_json
 from toledo_orchestrator.cycle import CycleOrchestrator
 from toledo_orchestrator.web import RunWorkers, make_handler
@@ -39,6 +40,38 @@ def test_profile_overrides_are_runtime_local_and_validated(tmp_path: Path):
     inherited = load_configured_workflows(tmp_path)["continuous-development-planner-close"].profiles["codex-planning"]
     assert inherited.model == "gpt-test" and inherited.effort == "high"
     assert (tmp_path / "config" / "workflows" / "continuous-development.json").is_file()
+
+
+def test_profile_api_rejects_unknown_catalog_selection_but_records_custom(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    write_json(engine.runtime_dir / "catalog" / "capabilities.v1.json", {
+        "schema_version": CATALOG_SCHEMA,
+        "verified_at": "2026-07-13T00:00:00+00:00",
+        "models": [{
+            "provider": "codex", "selection_token": "gpt-catalog",
+            "display_name": "Catalog model", "supported_efforts": ["low"],
+            "special_modes": [], "availability": "installed-account", "source": "fixture",
+        }], "observed_models": [], "sources": {},
+    })
+    workers = RunWorkers()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            request_json(base + "/api/profile", method="POST", nonce="test-nonce", value={
+                "workflow": "continuous-development", "profile": "codex-planning",
+                "model": "not-in-catalog", "effort": "high",
+            })
+        assert rejected.value.code == 400
+        status, saved = request_json(base + "/api/profile", method="POST", nonce="test-nonce", value={
+            "workflow": "continuous-development", "profile": "codex-planning",
+            "model": "operator-token", "effort": "special", "custom": True,
+        })
+        assert status == 200 and saved["custom"] is True and saved["model"] == "operator-token"
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=5)
 
 
 def test_local_web_api_serves_ui_requires_nonce_and_blocks_artifact_traversal(tmp_path: Path):

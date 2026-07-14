@@ -1,5 +1,12 @@
 # Evidence log
 
+## 2026-07-13 — Phase 2 catalog-backed controls
+
+- Re-checked locally immediately before implementation: `codex debug models` reported `gpt-5.6-sol`, distinct supported reasoning levels, and the separate `fast` speed tier; `claude --help` exposes model/effort controls but no Ultracode capability. The UI shows special modes only when the cached local catalog records one.
+- Profiles and the existing next-turn override modal now use catalog selects. The only text entry is the explicit `Custom…` branch; custom selections persist as `profile.custom` or in the one-turn override evidence. API proof rejects an unknown ordinary selection and accepts an explicitly custom one.
+- The local UI Python subprocess cannot discover CLI capabilities on this host (`WinError 5`), so browser QA correctly displayed the explicit Custom warning rather than inventing ordinary choices. Desktop and 390×844 snapshots confirmed the picker remains reachable and mobile controls stay compact.
+- Verification: `python -m pytest -q`, `python -m compileall -q src`, `node --check src/toledo_orchestrator/ui/app.js`, and `git diff --check` passed.
+
 ## 2026-07-13 — Phase 0 correctness and capability contracts
 
 - The stale profile-save reproduction retained the page's pre-restart nonce and received `403` with `PermissionError: missing or invalid launch nonce`; the regression is `test_profile_save_with_browser_nonce_from_before_server_restart_is_rejected`.

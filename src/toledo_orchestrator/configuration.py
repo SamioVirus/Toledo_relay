@@ -71,12 +71,13 @@ def update_profile(
     effort: str | None = None,
     permission: str | None = None,
     label: str | None = None,
+    custom: bool | None = None,
 ) -> WorkflowDefinition:
     value = workflow_value(workflow_id, runtime_dir)
     profiles = value.get("profiles", {})
     if profile_id not in profiles:
         raise ValueError(f"unknown profile: {profile_id}")
-    changes = {"model": model, "effort": effort, "permission": permission, "label": label}
+    changes = {"model": model, "effort": effort, "permission": permission, "label": label, "custom": custom}
     for key, selected in changes.items():
         if selected is not None:
             profiles[profile_id][key] = selected

@@ -333,6 +333,7 @@ def make_handler(
                         model=str(value["model"]) if value.get("model") else None,
                         effort=str(value["effort"]) if value.get("effort") else None,
                         session_action=str(value["session_action"]) if value.get("session_action") else None,
+                        custom=bool(value.get("custom")),
                     )
                     self._send(state)
                     return
@@ -361,10 +362,10 @@ def make_handler(
                         effort=str(value["effort"]) if "effort" in value else None,
                         permission=str(value["permission"]) if "permission" in value else None,
                         label=str(value["label"]) if "label" in value else None,
+                        custom=bool(value.get("custom")),
                     )
                     engine.workflows = load_configured_workflows(engine.runtime_dir)
                     saved = workflow.public_summary()["profiles"][profile_id]
-                    saved["custom"] = bool(value.get("custom"))
                     self._send(saved)
                     return
                 if parsed.path == "/api/catalog/refresh":
