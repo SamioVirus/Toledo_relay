@@ -97,6 +97,10 @@ def build_parser() -> argparse.ArgumentParser:
     profile_set.add_argument("--label")
     commands.add_parser("projects")
     commands.add_parser("catalog-research")
+    backfill = commands.add_parser("backfill-captions")
+    backfill.add_argument("run_id")
+    backfill.add_argument("--opt-in", action="store_true")
+    backfill.add_argument("--limit", type=int, default=1)
     project_add = commands.add_parser("project-add")
     project_add.add_argument("--id", required=True)
     project_add.add_argument("--root", type=Path, required=True)
@@ -216,6 +220,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "catalog-research":
         from .catalog import research_catalog
         _emit(research_catalog(cycle.runtime_dir))
+        return 0
+    if args.command == "backfill-captions":
+        _emit(cycle.backfill_semantic_captions(args.run_id, opt_in=args.opt_in, limit=args.limit))
         return 0
     if args.command == "runs":
         values = []

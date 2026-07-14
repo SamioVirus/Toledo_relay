@@ -11,7 +11,8 @@ from typing import Any
 
 import pytest
 
-from toledo_orchestrator.core import ClaudeAdapter, CodexAdapter, ProviderAdapter, ProviderResult, sha256
+from toledo_orchestrator.core import ClaudeAdapter, CodexAdapter, ProviderAdapter, ProviderResult, sha256, write_json
+from toledo_orchestrator.catalog import CATALOG_SCHEMA
 from toledo_orchestrator.configuration import load_configured_workflows
 from toledo_orchestrator.cycle import CycleOrchestrator
 from toledo_orchestrator.project import ProjectDefinition, ValidationDefinition
@@ -890,6 +891,30 @@ def test_curated_stance_override_is_opt_in_and_recorded_as_sidecar(tmp_path: Pat
     turn = result["turns"][-1]
     assert turn["stance_override"] == "ideas" and turn["stance_override_file"]
     assert b"Explicit one-turn stance override" in codex.invocations[-1]["prompt"]
+
+
+def test_caption_backfill_is_opt_in_bounded_and_sidecar_only(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("human", "Original artifact")),
+        ("caption-backfill", "A producing model self-report."),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    state = app.run_to_stop(run_id)
+    output = app._run_dir(run_id) / "turns" / state["turns"][-1]["output_file"]
+    before = output.read_bytes()
+    write_json(app.runtime_dir / "catalog" / "capabilities.v1.json", {
+        "schema_version": CATALOG_SCHEMA, "verified_at": "2026-07-13T00:00:00+00:00",
+        "models": [{"provider": "codex", "selection_token": "fixture-low", "supported_efforts": ["low"]}],
+        "observed_models": [], "sources": {},
+    })
+    with pytest.raises(ValueError, match="off by default"):
+        app.backfill_semantic_captions(run_id)
+    report = app.backfill_semantic_captions(run_id, opt_in=True, limit=1)
+    assert report["model"] == "fixture-low" and report["captions"][0]["caption"] == "A producing model self-report."
+    assert output.read_bytes() == before
+    assert (app._run_dir(run_id) / "captions").is_dir()
+    assert b"Original artifact" in codex.invocations[-1]["prompt"]
 
 
 def test_provider_failure_retry_preserves_the_selected_profile_model_and_effort(

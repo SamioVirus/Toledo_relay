@@ -1,5 +1,11 @@
 # Evidence log
 
+## 2026-07-13 — Phase 4 experiment 4: semantic-caption backfill
+
+- Hypothesis: bounded, opt-in semantic summaries can improve historical review without affecting any original artifact, transition, or future prompt transport.
+- Cost cap: explicit `--opt-in`, at most three turns, one new low-effort invocation per selected turn, and only a locally cataloged model. Rollback: do not invoke it; remove the additive `captions/caption-backfill.*.json` sidecar/report reference.
+- Acceptance proof: the experiment rejects its default path, selects a fixture low-effort catalog model, records the model self-report in a new sidecar report, and leaves the original output bytes unchanged.
+
 ## 2026-07-13 — Phase 4 experiment 3: catalog research automation
 
 - Hypothesis: a deterministic local audit can surface configured/observed model leads and catalog freshness without putting an AI researcher or an external entitlement lookup on the launch path.

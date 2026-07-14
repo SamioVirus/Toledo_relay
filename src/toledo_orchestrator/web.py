@@ -345,6 +345,9 @@ def make_handler(
                     workers.start(run_id, lambda: engine.steer(run_id, str(value.get("note", ""))), lambda error: engine.record_background_failure(run_id, error))
                     self._send({"run_id": run_id, "worker": workers.status(run_id)}, HTTPStatus.ACCEPTED)
                     return
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "backfill-captions":
+                    self._send(engine.backfill_semantic_captions(parts[2], opt_in=bool(value.get("opt_in")), limit=int(value.get("limit", 1))))
+                    return
                 if parsed.path == "/api/profile":
                     workflow_id = str(value.get("workflow", "continuous-development"))
                     profile_id = str(value["profile"])

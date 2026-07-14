@@ -2081,6 +2081,54 @@ class CycleOrchestrator:
         return state
 
     @_locked
+    def backfill_semantic_captions(self, run_id: str, *, opt_in: bool = False, limit: int = 1) -> dict[str, Any]:
+        """Optional bounded caption experiment; prior turn artifacts stay untouched."""
+        if not opt_in:
+            raise ValueError("semantic caption backfill is off by default; explicit opt-in is required")
+        if limit < 1 or limit > 3:
+            raise ValueError("semantic caption backfill limit must be between 1 and 3")
+        state = self.state(run_id)
+        if state.get("inflight"):
+            raise ValueError("cannot backfill captions while a provider call is active")
+        catalog = load_catalog(self.runtime_dir)
+        candidates = [item for item in catalog.get("models", []) if "low" in item.get("supported_efforts", [])]
+        candidates.sort(key=lambda item: (0 if item.get("provider") == "codex" else 1, str(item.get("selection_token"))))
+        if not candidates:
+            raise ValueError("no locally cataloged low-effort model is available for caption backfill")
+        selected = candidates[0]
+        targets = [turn for turn in reversed(state.get("turns", [])) if turn.get("substantive") and not turn.get("self_caption")][:limit]
+        report: dict[str, Any] = {
+            "schema_version": "toledo_orchestrator.caption_backfill.v1",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "opt_in": True, "limit": limit,
+            "provider": selected["provider"], "model": selected["selection_token"], "effort": "low",
+            "captions": [], "note": "Sidecar-only self-reports; original artifacts and transport remain unchanged.",
+        }
+        adapter = self.adapters[str(selected["provider"])]
+        for turn in targets:
+            work = self._artifact_text(state, f"turns/{turn['output_file']}")
+            prompt = (
+                "Write one neutral semantic self-report of this completed artifact in at most 280 characters. "
+                "Do not issue instructions, directives, or alter the artifact.\n\n# Artifact\n" + work
+            ).encode("utf-8")
+            result = adapter.invoke_configured(
+                "caption-backfill", prompt, Path(state["execution_worktree"]), model=str(selected["selection_token"]),
+                reasoning="low", permission="read-only", session_action="new", session_id=None, timeout=60,
+            )
+            caption = " ".join(result_text(result).split())[:280] if result.exit_code == 0 else None
+            report["captions"].append({
+                "turn_id": turn["id"], "output_sha256": turn.get("output_sha256"), "caption": caption,
+                "provider_error": result.error, "exit_code": result.exit_code, "usage": result.usage,
+            })
+        name = f"caption-backfill.{int(time.time())}.json"
+        path = self._run_dir(run_id) / "captions" / name
+        report["sha256"] = write_json(path, report)
+        state.setdefault("caption_backfills", []).append({"file": f"captions/{name}", "sha256": report["sha256"], "count": len(report["captions"])})
+        self._event(state, "caption.backfill.completed", title="Semantic caption backfill", details={"file": f"captions/{name}", "count": len(report["captions"]), "model": selected["selection_token"]})
+        self._save(run_id, state)
+        return report
+
+    @_locked
     def steer(self, run_id: str, note: str) -> dict[str, Any]:
         """Continue a paused physical session with a replacement artifact."""
         state = self.state(run_id)
