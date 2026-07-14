@@ -1,5 +1,11 @@
 # Evidence log
 
+## 2026-07-13 — Phase 4 experiment 5: fork/rewind
+
+- Hypothesis: an explicit copy-on-fork rewind can let an operator revisit an earlier turn without altering the original run, its sealed evidence, or provider-session history.
+- Cost cap: zero provider calls; this operation only copies local evidence and creates a new isolated worktree. Rollback: do not pass `--opt-in`; remove the entire newly created fork run/worktree while the original remains intact.
+- Acceptance proof: the default call is rejected; an opted-in rewind at turn 1 creates a new run ID/branch/worktree, forces its next turn to start a new session, preserves later copied artifacts for audit, and leaves the source `run.json` bytes unchanged.
+
 ## 2026-07-13 — Phase 4 experiment 4: semantic-caption backfill
 
 - Hypothesis: bounded, opt-in semantic summaries can improve historical review without affecting any original artifact, transition, or future prompt transport.

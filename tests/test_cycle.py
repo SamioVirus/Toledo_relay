@@ -917,6 +917,28 @@ def test_caption_backfill_is_opt_in_bounded_and_sidecar_only(tmp_path: Path, wri
     assert b"Original artifact" in codex.invocations[-1]["prompt"]
 
 
+def test_fork_rewind_requires_opt_in_and_preserves_source_evidence(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("human", "Original artifact")),
+        ("planning-propose", response("human", "Replacement artifact")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    app.run_to_stop(run_id)
+    app.steer(run_id, "Replace it.")
+    source_path = app._run_dir(run_id) / "run.json"
+    source_before = source_path.read_bytes()
+    with pytest.raises(ValueError, match="off by default"):
+        app.fork_rewind(run_id, rewind_to_turn=1)
+    result = app.fork_rewind(run_id, rewind_to_turn=1, opt_in=True)
+    fork = app.state(result["run_id"])
+    assert source_path.read_bytes() == source_before
+    assert fork["forked_from"]["run_id"] == run_id and fork["current_turn"] == 1
+    assert len(fork["turns"]) == 1 and fork["next_turn_override"]["session_action"] == "new"
+    assert (app._run_dir(result["run_id"]) / "turns" / "turn.0002.output.md").is_file()
+    assert (app._run_dir(result["run_id"]) / "fork.json").is_file()
+
+
 def test_provider_failure_retry_preserves_the_selected_profile_model_and_effort(
     tmp_path: Path, writable_project: ProjectDefinition
 ):

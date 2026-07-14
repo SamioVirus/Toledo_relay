@@ -348,6 +348,9 @@ def make_handler(
                 if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "backfill-captions":
                     self._send(engine.backfill_semantic_captions(parts[2], opt_in=bool(value.get("opt_in")), limit=int(value.get("limit", 1))))
                     return
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "fork":
+                    self._send(engine.fork_rewind(parts[2], rewind_to_turn=int(value.get("rewind_to_turn", 0)), opt_in=bool(value.get("opt_in"))))
+                    return
                 if parsed.path == "/api/profile":
                     workflow_id = str(value.get("workflow", "continuous-development"))
                     profile_id = str(value["profile"])

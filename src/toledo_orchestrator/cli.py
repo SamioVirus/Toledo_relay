@@ -101,6 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("run_id")
     backfill.add_argument("--opt-in", action="store_true")
     backfill.add_argument("--limit", type=int, default=1)
+    fork = commands.add_parser("fork-rewind")
+    fork.add_argument("run_id")
+    fork.add_argument("--rewind-to-turn", type=int, required=True)
+    fork.add_argument("--opt-in", action="store_true")
     project_add = commands.add_parser("project-add")
     project_add.add_argument("--id", required=True)
     project_add.add_argument("--root", type=Path, required=True)
@@ -223,6 +227,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "backfill-captions":
         _emit(cycle.backfill_semantic_captions(args.run_id, opt_in=args.opt_in, limit=args.limit))
+        return 0
+    if args.command == "fork-rewind":
+        _emit(cycle.fork_rewind(args.run_id, rewind_to_turn=args.rewind_to_turn, opt_in=args.opt_in))
         return 0
     if args.command == "runs":
         values = []

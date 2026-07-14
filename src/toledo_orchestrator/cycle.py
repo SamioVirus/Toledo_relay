@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 import uuid
 from contextlib import contextmanager
@@ -2079,6 +2080,53 @@ class CycleOrchestrator:
         if state["status"] == "running":
             return self.run_to_stop(run_id)
         return state
+
+    @_locked
+    def fork_rewind(self, run_id: str, *, rewind_to_turn: int, opt_in: bool = False) -> dict[str, Any]:
+        """Create an independent, paused evidence copy at an earlier turn.
+
+        This never edits the source run or removes its later artifacts. The
+        fork always starts its next provider call in a new physical session.
+        """
+        if not opt_in:
+            raise ValueError("fork/rewind is off by default; explicit opt-in is required")
+        source = self.state(run_id)
+        if source.get("inflight"):
+            raise ValueError("cannot fork/rewind while the source run has an active provider call")
+        if rewind_to_turn < 1 or rewind_to_turn >= int(source.get("current_turn", 0)):
+            raise ValueError("rewind turn must name an earlier completed turn")
+        retained = [turn for turn in source.get("turns", []) if int(str(turn["id"]).split(".")[-1]) <= rewind_to_turn]
+        if len(retained) != rewind_to_turn:
+            raise ValueError("rewind turn is not a contiguous completed turn")
+        new_id = f"run_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
+        source_dir = self._run_dir(run_id)
+        fork_dir = self._run_dir(new_id)
+        # The source lock is process-local, not evidence; copying it would also
+        # fail on Windows while this method holds the source run lock.
+        shutil.copytree(source_dir, fork_dir, ignore=shutil.ignore_patterns("run.lock"))
+        fork = read_json(fork_dir / "run.json")
+        project = self._project(source)
+        execution_worktree = self.runtime_dir / "worktrees" / new_id
+        execution_branch = f"codex/orchestrator/{new_id}"
+        fork.update({
+            "run_id": new_id, "turns": retained, "current_turn": rewind_to_turn,
+            "status": "paused", "pending_human_decision": "fork_rewind_ready", "inflight": None,
+            "execution_worktree": str(execution_worktree.resolve()), "execution_branch": execution_branch,
+            "next_turn_override": {"profile": source["current_stage"] and self._workflow(source).stages[source["current_stage"]].profile, "session_action": "new", "target_stage": source["current_stage"], "fork_rewind": True},
+            "forked_from": {"run_id": run_id, "rewind_to_turn": rewind_to_turn, "source_run_sha256": sha256((source_dir / "run.json").read_bytes())},
+        })
+        write_json(fork_dir / "fork.json", fork["forked_from"])
+        write_json(fork_dir / "run.json", fork)
+        try:
+            create_execution_worktree(project, execution_worktree, str(fork["working_revision"]), execution_branch)
+        except Exception as error:
+            fork["status"] = "failed"
+            fork["errors"].append(f"fork_execution_worktree_creation_failed:{type(error).__name__}:{error}")
+            write_json(fork_dir / "run.json", fork)
+            raise
+        self._event(fork, "run.forked", title="Fork/rewind created", details={"source_run": run_id, "rewind_to_turn": rewind_to_turn, "new_session_required": True})
+        self._save(new_id, fork)
+        return {"run_id": new_id, "source_run": run_id, "rewind_to_turn": rewind_to_turn, "status": fork["status"]}
 
     @_locked
     def backfill_semantic_captions(self, run_id: str, *, opt_in: bool = False, limit: int = 1) -> dict[str, Any]:
