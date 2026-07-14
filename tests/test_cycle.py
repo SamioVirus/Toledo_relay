@@ -837,6 +837,25 @@ def test_run_profiles_are_snapshotted_and_explicit_override_is_recorded(tmp_path
     assert codex_override.invocations[0]["reasoning"] == "medium"
 
 
+def test_steer_continues_same_session_and_preserves_round_accounting(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("human", "Initial artifact")),
+        ("planning-propose", response("human", "Replacement artifact")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    paused = app.run_to_stop(run_id)
+    before_rounds = json.loads(json.dumps(paused["cycles"][0].get("rounds", {})))
+    result = app.steer(run_id, "Address the missing acceptance criterion.")
+    replacement = result["turns"][-1]
+    assert codex.invocations[-1]["session_action"] == "continue"
+    assert codex.invocations[-1]["session_id"] == paused["turns"][-1]["session_id"]
+    assert replacement["steer_of"] == paused["turns"][-1]["id"]
+    assert replacement["steer_note_file"] and result["cycles"][0].get("rounds", {}) == before_rounds
+    prompt = codex.invocations[-1]["prompt"].decode("utf-8")
+    assert "Address the missing acceptance criterion." in prompt
+
+
 def test_provider_failure_retry_preserves_the_selected_profile_model_and_effort(
     tmp_path: Path, writable_project: ProjectDefinition
 ):

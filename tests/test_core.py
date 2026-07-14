@@ -14,6 +14,7 @@ from toledo_orchestrator.core import (
     ProviderResult,
     atomic_write,
     extract_directive,
+    extract_self_caption,
     has_substantive_work,
     parse_claude_result,
     parse_codex_result,
@@ -47,6 +48,13 @@ class ScriptedAdapter(ProviderAdapter):
 
 def block(next_value: str, work: str = "work", extra: str = "") -> str:
     return f"{work}\n```orchestrator\n{{\"next\":\"{next_value}\"{extra}}}\n```"
+
+
+def test_self_caption_is_bounded_sidecar_and_removed_from_work_product():
+    output = block("human", "replacement artifact", ',"self_caption":"two contradictions found"')
+    assert extract_self_caption(output) == "two contradictions found"
+    assert "self_caption" not in work_product_text(output)
+    assert extract_self_caption(block("human")) is None
 
 
 @pytest.fixture

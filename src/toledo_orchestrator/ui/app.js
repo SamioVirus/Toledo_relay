@@ -185,6 +185,7 @@ function renderRun() {
       : stageTitle(state.current_stage);
   const retryReasons = new Set(["operator_step", "provider_requested_human", "provider_invocation_failed", "provider_session_id_missing", "provider_session_missing", "provider_session_not_new", "provider_session_changed_unexpectedly", "missing_substantive_output", "malformed_directive", "unsupported_stage_directive", "invalid_next_turn_profile", "profile_permission_exceeds_stage", "background_operation_failed"]);
   const canOverride = state.schema_version === "toledo_orchestrator.run.v2" && state.current_stage && !state.inflight && (state.status === "created" || state.status === "running" || retryReasons.has(state.pending_human_decision));
+  const canSteer = state.schema_version === "toledo_orchestrator.run.v2" && state.status === "paused" && !state.inflight && Boolean(state.turns?.length);
   const workflow = bootstrap.workflows[state.workflow];
   const stage = workflow?.stages?.[state.current_stage] || {};
   const profile = workflow?.profiles?.[state.next_turn_override?.profile || stage.profile] || {};
@@ -194,10 +195,27 @@ function renderRun() {
   strip.innerHTML = `<span>${escapeHtml(state.status)}</span><span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
   $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(state.run_id)} · ${escapeHtml(state.status.toUpperCase())}</p><h2>${escapeHtml(heading || "Run complete")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">cycle ${state.cycle || 1}</span><span class="fact">${state.current_turn || 0} turns</span><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span>${state.execution_branch ? `<span class="fact">${escapeHtml(state.execution_branch)}</span>` : ''}${canOverride ? '<button class="quiet-button" id="next-turn-control">Override next turn ↗</button>' : ''}${canRecover ? '<button class="accept-button" id="recover-run">Recover run</button>' : ''}</div>`;
   $("#next-turn-control")?.addEventListener("click", openNextTurnControl);
+  if (canSteer) {
+    const button = document.createElement("button");
+    button.className = "quiet-button";
+    button.id = "steer-control";
+    button.textContent = "Steer latest artifact";
+    $("#run-facts").append(button);
+    button.addEventListener("click", openSteerControl);
+  }
   $("#recover-run")?.addEventListener("click", recoverCurrentRun);
   renderFilters(state);
   renderTimeline(state);
   if (state.worker?.error) showBanner(state.worker.error, "error");
+}
+
+async function openSteerControl() {
+  const note = window.prompt("Steer the active provider session. It will produce a complete replacement artifact.");
+  if (note == null || !note.trim()) return;
+  try {
+    await api(`/api/runs/${encodeURIComponent(currentRunId)}/steer`, {method:"POST", body:JSON.stringify({note:note.trim()})});
+    await refreshCurrent();
+  } catch (error) { alert(error.message); }
 }
 
 async function recoverCurrentRun() {

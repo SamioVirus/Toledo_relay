@@ -132,6 +132,23 @@ def extract_directive(text: str) -> Directive | None:
     )
 
 
+def extract_self_caption(text: str, limit: int = 280) -> str | None:
+    """Read optional model self-report from the final directive fence only."""
+    for match in reversed(list(FENCE.finditer(text))):
+        if text[match.end():].strip():
+            continue
+        try:
+            value = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return None
+        caption = value.get("self_caption") if isinstance(value, dict) else None
+        if not isinstance(caption, str):
+            return None
+        compact = " ".join(caption.split())
+        return compact[:limit] if compact else None
+    return None
+
+
 def has_substantive_work(text: str, directive: Directive | None) -> bool:
     if directive is not None and directive.source == "native":
         return False

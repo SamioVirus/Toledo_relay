@@ -1,5 +1,12 @@
 # Evidence log
 
+## 2026-07-13 — Phase 3 steer and caption sidecars
+
+- Deterministic proof: Steer is accepted only for a paused run with no in-flight call, continues the active provider session, records the exact note in a new sidecar artifact, links the replacement turn to the replaced turn, and does not call transition/round accounting. The latest turn remains the downstream artifact by existing chronological selection.
+- Captions: `director.state_caption` is deterministic and free; optional `self_caption` is bounded to 280 characters, read only from the final directive fence, persisted as turn metadata, and removed with that fence from work-product transport.
+- Live Codex continuity proof (low effort): session `019f5e67-b9bc-75b0-a265-8b542654abab` returned `CONTINUITY-ONE` then resumed to `CONTINUITY-TWO`. The manual CLI resume defaulted to Terra despite the initial Sol selection, so this is logged as a CLI invocation caution; the adapter explicitly passes `-m` on resume.
+- Live Claude continuity proof (low effort): `claude-fable-5` session `7be09f0f-9e4f-4356-aa34-7eadbf10735e` returned both scoped responses with the same session ID. Recorded provider costs were $0.359001 then $0.064427.
+
 ## 2026-07-13 — Phase 2 catalog-backed controls
 
 - Re-checked locally immediately before implementation: `codex debug models` reported `gpt-5.6-sol`, distinct supported reasoning levels, and the separate `fast` speed tier; `claude --help` exposes model/effort controls but no Ultracode capability. The UI shows special modes only when the cached local catalog records one.

@@ -23,6 +23,7 @@ from .core import (
     atomic_write,
     decode_text_artifact,
     extract_directive,
+    extract_self_caption,
     has_substantive_work,
     read_json,
     result_text,
@@ -701,6 +702,8 @@ class CycleOrchestrator:
         *,
         correction: bool = False,
         direction_text: str | None = None,
+        steer_of: str | None = None,
+        steer_note: str | None = None,
     ) -> dict[str, Any]:
         number = state["current_turn"] + 1
         turn_id = f"turn.{number:04d}"
@@ -724,6 +727,11 @@ class CycleOrchestrator:
         if direction_text and direction_text.strip() and not correction:
             direction_name = f"{turn_id}.direction.md"
             direction_hash = write_text(turns / direction_name, direction_text)
+        steer_note_name: str | None = None
+        steer_note_hash: str | None = None
+        if steer_note:
+            steer_note_name = f"{turn_id}.steer-note.md"
+            steer_note_hash = write_text(turns / steer_note_name, steer_note)
         previous_session_id = slot.get("active_session_id")
         previously_seen = bool(
             result.session_id
@@ -782,6 +790,10 @@ class CycleOrchestrator:
             "correction": correction,
             "substantive": substantive,
             "provider_error": result.error,
+            "steer_of": steer_of,
+            "steer_note_file": steer_note_name,
+            "steer_note_sha256": steer_note_hash,
+            "self_caption": extract_self_caption(output),
         }
         metadata_hash = write_json(turns / f"{turn_id}.json", record)
         record["metadata_sha256"] = metadata_hash
@@ -2045,6 +2057,54 @@ class CycleOrchestrator:
         self._save(run_id, state)
         if state["status"] == "running":
             return self.run_to_stop(run_id)
+        return state
+
+    @_locked
+    def steer(self, run_id: str, note: str) -> dict[str, Any]:
+        """Continue a paused physical session with a replacement artifact."""
+        state = self.state(run_id)
+        if state.get("status") != "paused" or state.get("inflight"):
+            raise ValueError("Steer is available only while the run is paused with no provider call active")
+        note = note.strip()
+        if not note:
+            raise ValueError("a Steer note is required")
+        if not state.get("current_stage"):
+            raise ValueError("the run has no active stage to steer")
+        stage = self._workflow(state).stages[str(state["current_stage"])]
+        profile = self._profile(state, stage.profile)
+        slot, _, session_id = self._session(state, stage, profile, "continue")
+        if not session_id:
+            raise ValueError("Steer requires an active provider session")
+        latest = next((turn for turn in reversed(state.get("turns", [])) if turn.get("session_slot") == stage.session_slot and not turn.get("correction")), None)
+        if latest is None:
+            raise ValueError("Steer requires a prior artifact in the active logical session")
+        latest_text = self._artifact_text(state, f"turns/{latest['output_file']}")
+        prompt = (
+            "Continue the existing physical provider session. Produce a complete replacement artifact, "
+            "not a patch or a summary. Preserve the workflow directive fence at the end.\n\n"
+            f"# Operator Steer\n{note}\n\n# Artifact to replace\n{latest_text}\n"
+        ).encode("utf-8")
+        state["status"] = "running"
+        state["inflight"] = {"stage": stage.id, "session_slot": stage.session_slot, "session_action": "continue", "session_id": session_id, "steer": True}
+        self._event(state, "provider.steer.started", title="STEER", details={"stage": stage.id, "session_id": session_id, "note": note})
+        self._save(run_id, state)
+        result = self.adapters[profile.provider].invoke_configured(
+            stage.id, prompt, Path(state["execution_worktree"]), model=profile.model, reasoning=profile.effort,
+            permission=profile.permission, session_action="continue", session_id=session_id, timeout=profile.timeout_seconds,
+        )
+        state = self.state(run_id)
+        state["inflight"] = None
+        directive = extract_directive(result_text(result)) if result.exit_code == 0 else None
+        replacement = self._store_turn(state, stage, profile, slot, "continue", result, prompt, directive, steer_of=str(latest["id"]), steer_note=note)
+        if result.exit_code != 0 or result.session_id != session_id or not work_product_text(result_text(result)):
+            state["status"] = "paused"
+            state["pending_human_decision"] = "provider_invocation_failed"
+            state["errors"].append("steer replacement was not trustworthy")
+        else:
+            state["status"] = "paused"
+            state["pending_human_decision"] = "operator_step"
+            self._event(state, "provider.steer.completed", title="STEER", details={"replacement_turn": replacement["id"], "replaces": latest["id"], "note_file": replacement["steer_note_file"]})
+        self._save(run_id, state)
         return state
 
     @_locked

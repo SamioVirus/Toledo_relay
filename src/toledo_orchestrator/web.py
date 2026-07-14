@@ -22,6 +22,7 @@ from .configuration import (
 from .catalog import load_catalog, refresh_catalog, validate_selection
 from .core import read_json
 from .cycle import CycleOrchestrator
+from .director import state_caption
 
 
 class RunWorkers:
@@ -223,6 +224,7 @@ def make_handler(
                 if len(parts) == 3 and parts[:2] == ["api", "runs"]:
                     run_id = parts[2]
                     state = _timeline_compatible(engine.state(run_id))
+                    state["state_caption"] = state_caption(state)
                     run_dir = engine._run_dir(run_id)
                     for turn in state.get("turns", []):
                         try:
@@ -336,6 +338,11 @@ def make_handler(
                         custom=bool(value.get("custom")),
                     )
                     self._send(state)
+                    return
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "steer":
+                    run_id = parts[2]
+                    workers.start(run_id, lambda: engine.steer(run_id, str(value.get("note", ""))), lambda error: engine.record_background_failure(run_id, error))
+                    self._send({"run_id": run_id, "worker": workers.status(run_id)}, HTTPStatus.ACCEPTED)
                     return
                 if parsed.path == "/api/profile":
                     workflow_id = str(value.get("workflow", "continuous-development"))

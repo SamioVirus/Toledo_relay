@@ -46,3 +46,12 @@ def select_conditions(context: DirectionContext) -> tuple[str, ...]:
     if context.cycle > 1:
         conditions.append("later_cycle")
     return tuple(conditions)
+
+
+def state_caption(state: dict[str, object]) -> str:
+    """Free, deterministic compact state summary for the operator surface."""
+    stage = str(state.get("current_stage") or "complete")
+    cycle = int(state.get("cycle") or 1)
+    turns = int(state.get("current_turn") or 0)
+    status = str(state.get("status") or "unknown")
+    return f"{status} · {stage} · cycle {cycle} · {turns} turns"
