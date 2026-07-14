@@ -1,5 +1,11 @@
 # Evidence log
 
+## 2026-07-13 — Phase 4 experiment 2: curated stance overrides
+
+- Hypothesis: a workflow can explicitly allow one curated prompt-contract stance for its next turn without conflating it with the provider/model profile or mutating the pinned workflow.
+- Cost cap: no provider invocation was made; deterministic fixture only. Rollback: omit `stance_overrides` (the default is empty) or clear the pending next-turn override.
+- Acceptance proof: an undeclared stance is rejected; an opt-in `ideas` stance is appended only to the next transport prompt and recorded in a new turn sidecar artifact. Existing run snapshots and static prompt artifacts remain unchanged.
+
 ## 2026-07-13 — Phase 4 experiment 1: provider-switchable stages
 
 - Hypothesis: an explicitly declared stage can safely change providers only by beginning a new physical session, while prior session artifacts remain immutable.

@@ -36,6 +36,7 @@ from .configuration import load_configured_projects, load_configured_workflows
 from .director import DirectionContext, select_conditions
 from .locking import run_lock
 from .project import ProjectDefinition, load_projects
+from .stance import CURATED_STANCES
 from .validation import pending_required_validations, required_local_validations_passed, run_project_validations
 from .workflow import IDENTIFIER, ProfileDefinition, StageDefinition, WorkflowDefinition, load_workflows
 from .worktree import (
@@ -586,6 +587,7 @@ class CycleOrchestrator:
         session_action: str,
         session_label: str,
         direction_text: str | None = None,
+        stance_text: str | None = None,
     ) -> bytes:
         project = self._project(state)
         sections = [
@@ -627,6 +629,8 @@ class CycleOrchestrator:
         sections.append(self._prompt_file(state, stage.prompt_file).strip())
         if direction_text and direction_text.strip():
             sections.append("# Orchestrator direction\n" + direction_text.strip())
+        if stance_text and stance_text.strip():
+            sections.append("# Explicit one-turn stance override\n" + stance_text.strip())
         immediate_decision_file: str | None = None
         if state.get("decisions"):
             latest_decision = state["decisions"][-1]
@@ -710,6 +714,7 @@ class CycleOrchestrator:
         direction_text: str | None = None,
         steer_of: str | None = None,
         steer_note: str | None = None,
+        stance_override: str | None = None,
     ) -> dict[str, Any]:
         number = state["current_turn"] + 1
         turn_id = f"turn.{number:04d}"
@@ -738,6 +743,11 @@ class CycleOrchestrator:
         if steer_note:
             steer_note_name = f"{turn_id}.steer-note.md"
             steer_note_hash = write_text(turns / steer_note_name, steer_note)
+        stance_name: str | None = None
+        stance_hash: str | None = None
+        if stance_override:
+            stance_name = f"{turn_id}.stance-override.md"
+            stance_hash = write_text(turns / stance_name, CURATED_STANCES[stance_override])
         previous_session_id = slot.get("active_session_id")
         previously_seen = bool(
             result.session_id
@@ -800,6 +810,9 @@ class CycleOrchestrator:
             "steer_note_file": steer_note_name,
             "steer_note_sha256": steer_note_hash,
             "self_caption": extract_self_caption(output),
+            "stance_override": stance_override,
+            "stance_override_file": stance_name,
+            "stance_override_sha256": stance_hash,
         }
         metadata_hash = write_json(turns / f"{turn_id}.json", record)
         record["metadata_sha256"] = metadata_hash
@@ -1151,7 +1164,9 @@ class CycleOrchestrator:
             return state
         direction_text = self._compose_direction_text(state, stage)
         try:
-            prompt = self._prompt(state, stage, profile, action, slot["label"], direction_text)
+            stance_override = override.get("stance")
+            stance_text = CURATED_STANCES.get(str(stance_override)) if stance_override else None
+            prompt = self._prompt(state, stage, profile, action, slot["label"], direction_text, stance_text)
         except (OSError, ValueError) as error:
             state["status"] = "paused"
             state["pending_human_decision"] = "artifact_integrity_failed"
@@ -1196,7 +1211,7 @@ class CycleOrchestrator:
         session_mismatch = action == "continue" and result.session_id != session_id
         session_not_new = action == "new" and result.session_id in known_session_ids
         self._store_turn(state, stage, profile, slot=self._cycle(state)["sessions"][stage.session_slot], action=action,
-                         result=result, prompt=prompt, directive=directive, direction_text=direction_text)
+                         result=result, prompt=prompt, directive=directive, direction_text=direction_text, stance_override=stance_override)
         if post_provider_identity_error:
             state["status"] = "paused"
             state["pending_human_decision"] = "provider_changed_worktree_identity"
@@ -2123,6 +2138,7 @@ class CycleOrchestrator:
         effort: str | None = None,
         session_action: str | None = None,
         custom: bool = False,
+        stance: str | None = None,
     ) -> dict[str, Any]:
         state = self.state(run_id)
         if state["status"] not in {"created", "paused", "running"} or state.get("inflight"):
@@ -2132,6 +2148,8 @@ class CycleOrchestrator:
         if not state.get("current_stage"):
             raise ValueError("the run has no next stage")
         stage = workflow.stages[state["current_stage"]]
+        if stance is not None and stance not in stage.stance_overrides:
+            raise ValueError("stance override is not enabled for this workflow stage")
         selected_profile = profile or stage.profile
         if selected_profile not in configured_workflow.profiles:
             raise ValueError(f"unknown profile: {selected_profile}")
@@ -2177,6 +2195,7 @@ class CycleOrchestrator:
             "target_stage": stage.id,
             "custom": custom,
             "provider_switch": provider_switch,
+            "stance": stance,
         }
         self._event(state, "turn.override.set", title="Next-turn override", details=state["next_turn_override"])
         self._save(run_id, state)

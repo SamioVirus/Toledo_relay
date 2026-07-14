@@ -336,6 +336,7 @@ def make_handler(
                         effort=str(value["effort"]) if value.get("effort") else None,
                         session_action=str(value["session_action"]) if value.get("session_action") else None,
                         custom=bool(value.get("custom")),
+                        stance=str(value["stance"]) if value.get("stance") else None,
                     )
                     self._send(state)
                     return

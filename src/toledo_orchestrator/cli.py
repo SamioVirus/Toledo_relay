@@ -79,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     override.add_argument("--model")
     override.add_argument("--effort")
     override.add_argument("--session-action", choices=("new", "continue"))
+    override.add_argument("--stance", choices=("ideas", "skeptic", "judge", "audit"))
     recover = commands.add_parser("recover")
     recover.add_argument("run_id")
     validate = commands.add_parser("validate")
@@ -196,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
                 effort=args.effort,
                 session_action=args.session_action,
+                stance=args.stance,
             ))
             return 0
         if args.command == "recover":

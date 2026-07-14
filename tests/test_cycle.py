@@ -875,6 +875,23 @@ def test_provider_switch_requires_opt_in_and_forces_new_session(tmp_path: Path, 
     assert claude.invocations[-1]["session_action"] == "new"
 
 
+def test_curated_stance_override_is_opt_in_and_recorded_as_sidecar(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [("planning-propose", response("human", "Ideas artifact"))])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    with pytest.raises(ValueError, match="not enabled"):
+        app.set_next_turn_override(run_id, stance="ideas")
+    state = app.state(run_id)
+    state["workflow_snapshot"]["stages"]["planning-propose"]["stance_overrides"] = ["ideas"]
+    app._save(run_id, state)
+    saved = app.set_next_turn_override(run_id, stance="ideas")
+    assert saved["next_turn_override"]["stance"] == "ideas"
+    result = app.run_to_stop(run_id)
+    turn = result["turns"][-1]
+    assert turn["stance_override"] == "ideas" and turn["stance_override_file"]
+    assert b"Explicit one-turn stance override" in codex.invocations[-1]["prompt"]
+
+
 def test_provider_failure_retry_preserves_the_selected_profile_model_and_effort(
     tmp_path: Path, writable_project: ProjectDefinition
 ):

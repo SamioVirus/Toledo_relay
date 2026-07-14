@@ -79,6 +79,7 @@ class StageDefinition:
     seal_source: str | None = None
     direction: dict[str, str] = field(default_factory=dict)
     provider_switchable: bool = False
+    stance_overrides: tuple[str, ...] = ()
 
     @classmethod
     def from_value(cls, stage_id: str, value: dict[str, Any]) -> "StageDefinition":
@@ -124,6 +125,7 @@ class StageDefinition:
                 )
             if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*\.md", fragment):
                 raise ValueError(f"invalid direction fragment for stage {stage_id}: {fragment}")
+        stance_overrides = tuple(str(item) for item in value.get("stance_overrides", []))
         return cls(
             id=stage_id,
             title=str(value.get("title", stage_id)),
@@ -146,6 +148,7 @@ class StageDefinition:
             seal_source=str(value["seal_source"]) if value.get("seal_source") else None,
             direction=direction,
             provider_switchable=bool(value.get("provider_switchable", False)),
+            stance_overrides=stance_overrides,
         )
 
 
@@ -376,6 +379,7 @@ class WorkflowDefinition:
                     "seal_source": stage.seal_source,
                     "direction": dict(stage.direction),
                     "provider_switchable": stage.provider_switchable,
+                    "stance_overrides": list(stage.stance_overrides),
                 }
                 for key, stage in self.stages.items()
             },
@@ -421,6 +425,7 @@ class WorkflowDefinition:
                     "seal_source": stage.seal_source,
                     "direction": dict(stage.direction),
                     "provider_switchable": stage.provider_switchable,
+                    "stance_overrides": list(stage.stance_overrides),
                 }
                 for key, stage in self.stages.items()
             },
