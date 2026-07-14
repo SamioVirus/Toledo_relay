@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import time
 import uuid
 from contextlib import contextmanager
@@ -38,7 +39,12 @@ from .director import DirectionContext, select_conditions
 from .locking import run_lock
 from .project import ProjectDefinition, load_projects
 from .stance import CURATED_STANCES
-from .validation import pending_required_validations, required_local_validations_passed, run_project_validations
+from .validation import (
+    failure_signature,
+    pending_required_validations,
+    required_local_validations_passed,
+    run_project_validations,
+)
 from .workflow import IDENTIFIER, ProfileDefinition, StageDefinition, WorkflowDefinition, load_workflows
 from .worktree import (
     assert_allowed_changes,
@@ -223,6 +229,7 @@ class CycleOrchestrator:
         workflow: str = "continuous-development",
         *,
         run_mode: str = "auto",
+        profile_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> str:
         decode_text_artifact(request, "request")
         if run_mode not in {"auto", "step"}:
@@ -249,6 +256,26 @@ class CycleOrchestrator:
         execution_worktree = self.runtime_dir / "worktrees" / run_id
         execution_branch = f"codex/orchestrator/{run_id}"
         workflow_definition = self.workflows[workflow]
+        if profile_overrides:
+            # Route overrides bind to this run's snapshot only; saved workflow
+            # defaults change exclusively through the explicit profile API.
+            value = workflow_definition.snapshot()
+            catalog = load_catalog(self.runtime_dir, refresh=False)
+            for profile_id, changes in profile_overrides.items():
+                if profile_id not in value["profiles"]:
+                    raise ValueError(f"unknown profile override: {profile_id}")
+                if not isinstance(changes, dict):
+                    raise ValueError(f"profile override for {profile_id} must be an object")
+                target = value["profiles"][profile_id]
+                model = str(changes.get("model") or target["model"]).strip()
+                effort = str(changes.get("effort") or target["effort"]).strip()
+                custom = bool(changes.get("custom"))
+                if not model or not effort:
+                    raise ValueError(f"profile override for {profile_id} requires model and effort")
+                if catalog.get("models"):
+                    validate_selection(catalog, provider=str(target["provider"]), model=model, effort=effort, custom=custom)
+                target.update({"model": model, "effort": effort, "custom": custom, "label": f"{model} · {effort}"})
+            workflow_definition = WorkflowDefinition.from_value(value)
         prompt_names = {
             "orchestrator-law.md",
             "strict-contract.md",
@@ -307,6 +334,8 @@ class CycleOrchestrator:
             "pending_human_decision": None,
             "pending_round_extension": None,
             "pending_repair_stage": None,
+            "pending_baseline_acceptance": None,
+            "baseline_validations": None,
             "next_turn_override": None,
             "inflight": None,
             "abandoned_invocations": [],
@@ -328,6 +357,7 @@ class CycleOrchestrator:
             "source_revision": source_revision,
             "execution_worktree": str(execution_worktree),
             "execution_branch": execution_branch,
+            "profile_overrides": profile_overrides or None,
         })
         self._save(run_id, state)
         return run_id
@@ -1391,6 +1421,310 @@ class CycleOrchestrator:
         self._sync_round_alias(cycle, stage.round_counter, record)
         return True
 
+    @staticmethod
+    def _describe_transition(workflow: WorkflowDefinition, target: str) -> str:
+        if target.startswith("@pause:"):
+            reason = target.split(":", 1)[1]
+            named = {
+                "next_task_approval": "pause for your approval of the proposed next task",
+                "provider_requested_human": "pause for your input",
+            }
+            return named.get(reason, f"pause: {reason.replace('_', ' ')}")
+        if target.startswith("@seal:"):
+            _, sealed_type, next_stage = target.split(":", 2)
+            title = workflow.stages[next_stage].title if next_stage in workflow.stages else next_stage
+            return f"seal the {sealed_type.replace('-', ' ')} and move to {title}"
+        if target.startswith("@complete:"):
+            next_stage = target.split(":", 1)[1]
+            title = workflow.stages[next_stage].title if next_stage in workflow.stages else next_stage
+            return f"run validation, commit the accepted change, then {title}"
+        title = workflow.stages[target].title if target in workflow.stages else target
+        return f"move to {title}"
+
+    def stage_prompt_template(self, workflow_id: str, stage_id: str) -> dict[str, Any]:
+        """Exact static instruction bytes for a stage, before any run exists."""
+        if workflow_id not in self.workflows:
+            raise ValueError(f"unknown workflow: {workflow_id}")
+        workflow = self.workflows[workflow_id]
+        stage = workflow.stages.get(stage_id)
+        if stage is None:
+            raise ValueError(f"unknown stage: {stage_id}")
+        source = self._prompt_source(workflow, stage.prompt_file)
+        return {
+            "workflow": workflow_id,
+            "stage": stage_id,
+            "title": stage.title,
+            "prompt_file": stage.prompt_file,
+            "template": source.read_text(encoding="utf-8"),
+            "source": str(source),
+            "context": list(stage.context),
+            "produces": stage.artifact_type,
+            "afterward": [
+                {"directive": key, "description": self._describe_transition(workflow, target)}
+                for key, target in stage.transitions.items()
+            ],
+        }
+
+    def next_turn_preview(self, run_id: str) -> dict[str, Any]:
+        """Read-only contract describing exactly what the next provider turn will do.
+
+        Everything here mirrors ``advance`` resolution (override, session,
+        direction, prompt) without mutating run state, so the operator gate can
+        show the truth instead of a generic question.
+        """
+        state = self.state(run_id)
+        if state.get("schema_version") != "toledo_orchestrator.run.v2":
+            return {"available": False, "reason": "legacy run schema"}
+        stage_id = state.get("current_stage")
+        pending = state.get("pending_human_decision")
+        if not stage_id or state.get("inflight") or state.get("status") in {"complete", "cancelled", "failed", "stopped"}:
+            return {"available": False, "reason": pending or state.get("status")}
+        if pending in {"validation_execution_approval", "validation_receipt_required", "unknown_validation_execution"}:
+            return {"available": False, "reason": pending}
+        workflow = self._workflow(state)
+        stage = workflow.stages.get(str(stage_id))
+        if stage is None:
+            return {"available": False, "reason": f"unknown stage {stage_id}"}
+        override = state.get("next_turn_override")
+        override_applies = isinstance(override, dict) and override.get("target_stage") == stage.id
+        active_override = override if override_applies else None
+        profile_id = str(active_override.get("profile") or stage.profile) if active_override else stage.profile
+        profile = self._profile(state, profile_id, active_override)
+        base_profile = self._profile(state, profile_id)
+        profile_overridden = bool(active_override) and (
+            profile_id != stage.profile
+            or profile.model != base_profile.model
+            or profile.effort != base_profile.effort
+        )
+        cycle = self._cycle(state)
+        slot = cycle.get("sessions", {}).get(stage.session_slot) or {}
+        action_override = str(active_override.get("session_action")) if active_override and active_override.get("session_action") else None
+        if action_override in {"new", "continue"}:
+            action = action_override
+        elif stage.session_policy in {"new", "continue"}:
+            action = stage.session_policy
+        else:
+            action = "continue" if slot.get("active_session_id") else "new"
+        session_label = slot.get("label") or _session_label(workflow, int(state["cycle"]), stage.session_slot)
+        generation = int(slot.get("active_generation") or 0)
+        direction_text = self._compose_direction_text(state, stage)
+        prompt_text: str | None = None
+        prompt_error: str | None = None
+        try:
+            prompt_text = self._prompt(
+                state, stage, profile, action, str(session_label),
+                direction_text=direction_text or None,
+            ).decode("utf-8")
+        except (OSError, ValueError) as error:
+            prompt_error = f"{type(error).__name__}: {error}"
+        inputs: list[dict[str, Any]] = []
+        for token in stage.context:
+            try:
+                section = self._context_section(state, token)
+            except (OSError, ValueError):
+                section = None
+            if section:
+                title, text = section
+                inputs.append({"token": token, "title": title, "empty": text.strip() in {"", "None."}, "chars": len(text)})
+            else:
+                inputs.append({"token": token, "title": token, "empty": True, "chars": 0})
+        rounds = None
+        if stage.round_counter and stage.round_cap is not None:
+            record = self._round_record(cycle, stage.round_counter)
+            rounds = {
+                "counter": stage.round_counter,
+                "used": int(record["count"]),
+                "cap": int(stage.round_cap) + int(record["extension"]),
+            }
+        return {
+            "available": True,
+            "run_id": run_id,
+            "status": state.get("status"),
+            "pending_human_decision": pending,
+            "run_mode": state.get("run_mode"),
+            "stage": {
+                "id": stage.id,
+                "title": stage.title,
+                "phase": stage.phase,
+                "role": stage.role,
+                "prompt_label": stage.prompt_label,
+                "prompt_file": stage.prompt_file,
+                "produces": stage.artifact_type,
+                "provider_switchable": stage.provider_switchable,
+            },
+            "profile": {
+                "id": profile_id,
+                "label": profile.label,
+                "provider": profile.provider,
+                "model": profile.model,
+                "effort": profile.effort,
+                "permission": profile.permission,
+                "custom": profile.custom,
+                "overridden": profile_overridden,
+            },
+            "session": {
+                "slot": stage.session_slot,
+                "label": session_label,
+                "action": action,
+                "policy": stage.session_policy,
+                "generation": generation,
+                "overridden": bool(action_override),
+            },
+            "inputs": inputs,
+            "rounds": rounds,
+            "afterward": [
+                {"directive": key, "description": self._describe_transition(workflow, target)}
+                for key, target in stage.transitions.items()
+            ],
+            "direction_preview": direction_text or None,
+            "prompt": prompt_text,
+            "prompt_error": prompt_error,
+        }
+
+    @_locked
+    def stop_run(self, run_id: str, note: bytes = b"") -> dict[str, Any]:
+        """Record a deliberate operator finish. Unlike cancel, this is not a failure label."""
+        state = self.state(run_id)
+        if state.get("status") != "paused" or state.get("inflight") or state.get("validation_inflight"):
+            raise ValueError("only a paused run with no active operation can be finished")
+        decode_text_artifact(note, "operator stop note")
+        reason = str(state.get("pending_human_decision") or "operator_stop")
+        payload = note if note.strip() else b"Operator finished the run here.\n"
+        self._record_decision(state, payload=payload, choice="stop", reason=reason, title="Human: finish run")
+        cycle = self._cycle(state)
+        cycle["status"] = "stopped"
+        cycle["end_turn"] = state["current_turn"]
+        state["status"] = "stopped"
+        state["current_stage"] = None
+        state["pending_human_decision"] = None
+        state["pending_validation"] = None
+        state["pending_completion"] = None
+        state["pending_commit"] = None
+        state["pending_round_extension"] = None
+        state["pending_repair_stage"] = None
+        state["pending_baseline_acceptance"] = None
+        state["inflight"] = None
+        self._event(state, "run.stopped", title="Run finished by operator", details={"reason": reason})
+        self._save(run_id, state)
+        return state
+
+    def _capture_baseline_validations(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Run the project validations once at the clean base revision.
+
+        Uses a disposable detached worktree so environment-specific failures
+        (present only inside worktrees) are measured in the same environment
+        kind as the implementation run.
+        """
+        project = self._project(state)
+        evidence = state.get("current_implementation_evidence") or {}
+        revision = str(evidence.get("revision") or state["working_revision"])
+        target = self.runtime_dir / "worktrees" / f"{state['run_id']}-baseline"
+        if target.exists():
+            remove_execution_worktree(project, target, force=True)
+        create_execution_worktree(project, target, revision)
+        try:
+            results = run_project_validations(
+                project, target, self._run_dir(state["run_id"]), state["cycle"], 0,
+            )
+        finally:
+            try:
+                remove_execution_worktree(project, target, force=True)
+            except ValueError:
+                pass
+        run_dir = self._run_dir(state["run_id"])
+        captured: dict[str, Any] = {}
+        for validation_id, record in results.items():
+            entry: dict[str, Any] = {
+                "state": record.get("state"),
+                "exit_code": record.get("exit_code"),
+            }
+            if record.get("state") == "failed":
+                entry["signature"] = self._validation_signature(run_dir, record)
+            captured[validation_id] = entry
+        baseline = {
+            "revision": revision,
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "environment": "detached-worktree",
+            "results": captured,
+        }
+        state["baseline_validations"] = baseline
+        self._event(state, "validation.baseline.captured", title="Baseline validation captured", details=baseline)
+        return baseline
+
+    @staticmethod
+    def _validation_signature(run_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
+        def stream_text(key: str) -> str:
+            value = record.get(key)
+            if not isinstance(value, dict) or not value.get("path"):
+                return ""
+            try:
+                return (run_dir / str(value["path"])).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return ""
+        return failure_signature(stream_text("stdout"), stream_text("stderr"), int(record.get("exit_code", -1)))
+
+    def _classify_required_failures(self, state: dict[str, Any], validations: dict[str, Any]) -> dict[str, Any] | None:
+        """Compare required validation failures against the clean-base baseline.
+
+        overall: "unchanged_baseline" when every required failure matches a
+        failure already present before the implementation; "new_regression"
+        when any failure is new or changed; "indeterminate" when the baseline
+        could not be captured or a signature is too weak to trust.
+        """
+        run_dir = self._run_dir(state["run_id"])
+        failed = {
+            key: value for key, value in validations.items()
+            if value.get("required", True) and value.get("state") == "failed"
+        }
+        if not failed:
+            return None
+        baseline = state.get("baseline_validations")
+        if not isinstance(baseline, dict):
+            try:
+                baseline = self._capture_baseline_validations(state)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                return {
+                    "overall": "indeterminate",
+                    "error": f"baseline capture failed: {type(error).__name__}: {error}",
+                    "failures": {key: {"match": "unknown"} for key in failed},
+                }
+        failures: dict[str, Any] = {}
+        matches: list[bool] = []
+        indeterminate = False
+        for validation_id, record in failed.items():
+            current = self._validation_signature(run_dir, record)
+            base_entry = (baseline.get("results") or {}).get(validation_id) or {}
+            base_signature = base_entry.get("signature") if base_entry.get("state") == "failed" else None
+            if base_signature is None:
+                verdict = "new_regression"
+                matches.append(False)
+            elif current.get("weak") or base_signature.get("weak"):
+                verdict = "indeterminate"
+                indeterminate = True
+            elif current["fingerprint"] == base_signature["fingerprint"]:
+                verdict = "unchanged_baseline"
+                matches.append(True)
+            else:
+                verdict = "new_regression"
+                matches.append(False)
+            failures[validation_id] = {
+                "match": verdict,
+                "current": current,
+                "baseline": base_signature,
+            }
+        if indeterminate:
+            overall = "indeterminate"
+        elif matches and all(matches):
+            overall = "unchanged_baseline"
+        else:
+            overall = "new_regression"
+        return {
+            "overall": overall,
+            "baseline_revision": baseline.get("revision"),
+            "baseline_captured_at": baseline.get("captured_at"),
+            "failures": failures,
+        }
+
     def _transition(self, state: dict[str, Any], stage: StageDefinition, directive: Directive) -> None:
         workflow = self._workflow(state)
         cycle = self._cycle(state)
@@ -1440,6 +1774,23 @@ class CycleOrchestrator:
                 })
                 return
             if not required_local_validations_passed(validations):
+                classification = self._classify_required_failures(state, validations)
+                if classification and classification.get("overall") == "unchanged_baseline":
+                    # The implementation did not introduce this failure; looping
+                    # repair on it burns rounds without any possible fix. The
+                    # closure decision belongs to the operator.
+                    state["status"] = "paused"
+                    state["pending_human_decision"] = "validation_baseline_failure_decision"
+                    state["pending_baseline_acceptance"] = {
+                        "stage": stage.id,
+                        "next_stage": next_stage,
+                        "classification": classification,
+                    }
+                    self._event(state, "human.gate.opened", title="Pre-existing validation failure", details={
+                        "reason": "validation_baseline_failure_decision",
+                        "classification": classification,
+                    })
+                    return
                 repair_stage = self._repair_stage(stage)
                 if not repair_stage:
                     raise ValueError(f"stage {stage.id} has no repair stage for failed validation")
@@ -1451,66 +1802,77 @@ class CycleOrchestrator:
                 ):
                     return
                 state["errors"].append("reviewer_ready_but_validation_failed")
+                if classification:
+                    self._event(state, "validation.classified", title="Validation failure classified", details=classification)
                 state["current_stage"] = repair_stage
                 state["status"] = "running"
                 return
-            project = self._project(state)
-            worktree = Path(state["execution_worktree"])
-            current_evidence = collect_worktree_evidence(worktree)
-            try:
-                assert_allowed_changes(project, current_evidence.changed_paths)
-            except ValueError as error:
-                state["status"] = "paused"
-                state["pending_human_decision"] = "implementation_boundary_failed_before_commit"
-                state["pending_repair_stage"] = self._repair_stage(stage)
-                state["errors"].append(str(error))
-                return
-            expected_patch = evidence.get("patch", {}).get("sha256")
-            if (
-                expected_patch != sha256(current_evidence.patch)
-                or list(current_evidence.changed_paths) != list(evidence.get("changed_paths", []))
-            ):
-                state["status"] = "paused"
-                state["pending_human_decision"] = "implementation_changed_after_review"
-                state["pending_repair_stage"] = self._repair_stage(stage)
-                state["errors"].append("implementation evidence no longer matches the worktree")
-                return
-            if project.commit_on_accept:
-                state["pending_commit"] = {
-                    "base_revision": state["working_revision"],
-                    "patch_sha256": expected_patch,
-                    "next_stage": next_stage,
-                    "review_stage": stage.id,
-                    "message": f"orchestrator: accept cycle {state['cycle']:04d}",
-                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                }
-                self._save(state["run_id"], state)
-                try:
-                    accepted_revision = commit_accepted_changes(
-                        worktree,
-                        str(state["pending_commit"]["message"]),
-                        current_evidence.patch,
-                        self._run_dir(state["run_id"]) / "empty-git-hooks",
-                    )
-                except ValueError as error:
-                    state["status"] = "paused"
-                    state["pending_human_decision"] = "acceptance_commit_failed"
-                    state["errors"].append(str(error))
-                    return
-                state["pending_commit"]["accepted_revision"] = accepted_revision
-                state["working_revision"] = accepted_revision
-                self._save(state["run_id"], state)
-            else:
-                accepted_revision = current_revision(worktree)
-            self._finalize_acceptance(
-                state,
-                next_stage=next_stage,
-                accepted_revision=accepted_revision,
-                evidence=evidence,
-            )
+            self._accept_implementation(state, stage, next_stage, evidence)
             return
         state["current_stage"] = target
         state["status"] = "running"
+
+    def _accept_implementation(
+        self,
+        state: dict[str, Any],
+        stage: StageDefinition,
+        next_stage: str,
+        evidence: dict[str, Any],
+    ) -> None:
+        project = self._project(state)
+        worktree = Path(state["execution_worktree"])
+        current_evidence = collect_worktree_evidence(worktree)
+        try:
+            assert_allowed_changes(project, current_evidence.changed_paths)
+        except ValueError as error:
+            state["status"] = "paused"
+            state["pending_human_decision"] = "implementation_boundary_failed_before_commit"
+            state["pending_repair_stage"] = self._repair_stage(stage)
+            state["errors"].append(str(error))
+            return
+        expected_patch = evidence.get("patch", {}).get("sha256")
+        if (
+            expected_patch != sha256(current_evidence.patch)
+            or list(current_evidence.changed_paths) != list(evidence.get("changed_paths", []))
+        ):
+            state["status"] = "paused"
+            state["pending_human_decision"] = "implementation_changed_after_review"
+            state["pending_repair_stage"] = self._repair_stage(stage)
+            state["errors"].append("implementation evidence no longer matches the worktree")
+            return
+        if project.commit_on_accept:
+            state["pending_commit"] = {
+                "base_revision": state["working_revision"],
+                "patch_sha256": expected_patch,
+                "next_stage": next_stage,
+                "review_stage": stage.id,
+                "message": f"orchestrator: accept cycle {state['cycle']:04d}",
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            self._save(state["run_id"], state)
+            try:
+                accepted_revision = commit_accepted_changes(
+                    worktree,
+                    str(state["pending_commit"]["message"]),
+                    current_evidence.patch,
+                    self._run_dir(state["run_id"]) / "empty-git-hooks",
+                )
+            except ValueError as error:
+                state["status"] = "paused"
+                state["pending_human_decision"] = "acceptance_commit_failed"
+                state["errors"].append(str(error))
+                return
+            state["pending_commit"]["accepted_revision"] = accepted_revision
+            state["working_revision"] = accepted_revision
+            self._save(state["run_id"], state)
+        else:
+            accepted_revision = current_revision(worktree)
+        self._finalize_acceptance(
+            state,
+            next_stage=next_stage,
+            accepted_revision=accepted_revision,
+            evidence=evidence,
+        )
 
     @_locked
     def run_to_stop(self, run_id: str) -> dict[str, Any]:
@@ -1518,7 +1880,7 @@ class CycleOrchestrator:
         if state["status"] == "created":
             state["status"] = "running"
             self._save(run_id, state)
-        while self.state(run_id)["status"] not in {"complete", "cancelled", "paused", "failed"}:
+        while self.state(run_id)["status"] not in {"complete", "cancelled", "stopped", "paused", "failed"}:
             self.advance(run_id)
         return self.state(run_id)
 
@@ -1555,6 +1917,7 @@ class CycleOrchestrator:
         state["pending_commit"] = None
         state["pending_round_extension"] = None
         state["pending_repair_stage"] = None
+        state["pending_baseline_acceptance"] = None
         state["inflight"] = None
         self._event(state, "run.cancelled", title="Run cancelled", details={"reason": reason})
 
@@ -1797,6 +2160,56 @@ class CycleOrchestrator:
             self._save(run_id, state)
             return self.run_to_stop(run_id)
 
+        if reason == "validation_baseline_failure_decision":
+            pending = state.get("pending_baseline_acceptance")
+            if not isinstance(pending, dict):
+                raise ValueError("the baseline acceptance context is missing")
+            state["pending_baseline_acceptance"] = None
+            workflow = self._workflow(state)
+            review_stage = workflow.stages[str(pending["stage"])]
+            if choice == "no":
+                # Deliberate stop without commit — not a cancellation label.
+                cycle = self._cycle(state)
+                cycle["status"] = "stopped"
+                cycle["end_turn"] = state["current_turn"]
+                state["status"] = "stopped"
+                state["current_stage"] = None
+                state["inflight"] = None
+                self._event(state, "run.stopped", title="Stopped without commit", details={"reason": reason})
+                self._save(run_id, state)
+                return state
+            if choice == "other":
+                repair_stage = self._repair_stage(review_stage)
+                if not repair_stage:
+                    raise ValueError("this stage has no configured repair stage")
+                state["current_stage"] = repair_stage
+                state["status"] = "running"
+                self._save(run_id, state)
+                return self.run_to_stop(run_id)
+            classification = pending.get("classification") or {}
+            evidence = state.get("current_implementation_evidence") or {}
+            debt = {
+                "schema_version": "toledo_orchestrator.baseline_debt.v1",
+                "cycle": state["cycle"],
+                "decided_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "base_revision": classification.get("baseline_revision"),
+                "patch_sha256": evidence.get("patch", {}).get("sha256"),
+                "classification": classification,
+                "note": "Accepted with a pre-existing validation failure recorded as baseline debt.",
+            }
+            relative = Path("artifacts") / f"cycle.{state['cycle']:04d}.baseline-debt.json"
+            digest = write_json(self._run_dir(run_id) / relative, debt)
+            normalized = str(relative).replace("\\", "/")
+            state["artifacts"][normalized] = {"sha256": digest, "type": "baseline-debt", "cycle": state["cycle"]}
+            self._event(state, "validation.baseline.debt_accepted", title="Baseline debt accepted", details={
+                "file": normalized, "sha256": digest,
+                "baseline_revision": classification.get("baseline_revision"),
+            })
+            state["status"] = "running"
+            self._accept_implementation(state, review_stage, str(pending["next_stage"]), evidence)
+            self._save(run_id, state)
+            return self.run_to_stop(run_id) if state["status"] == "running" else state
+
         if choice == "no":
             self._cancel(state, reason)
             self._save(run_id, state)
@@ -1931,7 +2344,7 @@ class CycleOrchestrator:
         state = self.state(run_id)
         detail = f"{type(error).__name__}: {error}"
         state["errors"].append(f"background_operation_failed:{detail}")
-        if state.get("status") not in {"complete", "cancelled", "failed"}:
+        if state.get("status") not in {"complete", "cancelled", "stopped", "failed"}:
             state["status"] = "paused"
             if state.get("validation_inflight"):
                 state["pending_human_decision"] = "unknown_validation_execution"
@@ -2138,7 +2551,7 @@ class CycleOrchestrator:
         state = self.state(run_id)
         if state.get("inflight"):
             raise ValueError("cannot backfill captions while a provider call is active")
-        catalog = load_catalog(self.runtime_dir)
+        catalog = load_catalog(self.runtime_dir, refresh=False)
         candidates = [item for item in catalog.get("models", []) if "low" in item.get("supported_efforts", [])]
         candidates.sort(key=lambda item: (0 if item.get("provider") == "codex" else 1, str(item.get("selection_token"))))
         if not candidates:
@@ -2275,7 +2688,7 @@ class CycleOrchestrator:
         # A populated catalog is authoritative for the ordinary picker path.
         # Discovery failure/staleness remains a warning rather than a run
         # blocker, and the deliberate custom escape hatch records its status.
-        catalog = load_catalog(self.runtime_dir)
+        catalog = load_catalog(self.runtime_dir, refresh=False)
         if catalog.get("models") and (model is not None or effort is not None):
             validate_selection(
                 catalog,
@@ -2302,7 +2715,7 @@ class CycleOrchestrator:
         state = self.state(run_id)
         if state.get("inflight"):
             raise ValueError("cannot clean a worktree while a provider invocation is active")
-        if state["status"] not in {"complete", "cancelled", "failed"} and not force:
+        if state["status"] not in {"complete", "cancelled", "stopped", "failed"} and not force:
             raise ValueError("only terminal run worktrees can be cleaned without --force")
         target = Path(state["execution_worktree"])
         expected_parent = (self.runtime_dir / "worktrees").resolve()

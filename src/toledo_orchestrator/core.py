@@ -189,6 +189,25 @@ class ProviderResult:
         return self.stdout.decode("utf-8", errors="replace")
 
 
+def resolve_cli_executable(name: str) -> str:
+    """Prefer real Windows executables over npm's extensionless/PowerShell shims.
+
+    Launching the bare npm command name from Python on Windows resolves to the
+    extensionless shim, which fails (WinError 5 / not found) even though the
+    `.cmd` shim works. Every subprocess that talks to a provider CLI must go
+    through this resolver.
+    """
+    if os.name == "nt":
+        # The desktop-app copy can be non-executable to child processes; npm's .cmd shim is reliable.
+        shim = shutil.which(f"{name}.cmd")
+        if shim:
+            return shim
+        native = shutil.which(f"{name}.exe")
+        if native:
+            return native
+    return name
+
+
 class ProviderAdapter:
     provider: str
 
@@ -197,18 +216,9 @@ class ProviderAdapter:
         self.timeout = timeout
 
     def executable_path(self) -> str:
-        """Prefer real Windows executables over npm's extensionless/PowerShell shims."""
         if self.executable != self.provider:
             return self.executable
-        if os.name == "nt":
-            # The desktop-app copy can be non-executable to child processes; npm's .cmd shim is reliable.
-            shim = shutil.which(f"{self.provider}.cmd")
-            if shim:
-                return shim
-            native = shutil.which(f"{self.provider}.exe")
-            if native:
-                return native
-        return self.executable
+        return resolve_cli_executable(self.provider)
 
     def invoke(self, route: str, prompt: bytes, working_directory: Path) -> ProviderResult:
         raise NotImplementedError

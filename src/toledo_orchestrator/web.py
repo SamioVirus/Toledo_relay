@@ -206,6 +206,13 @@ def make_handler(
                     self._send(_run_summaries(engine, workers))
                     return
                 parts = [value for value in path.split("/") if value]
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "next-turn":
+                    self._send(engine.next_turn_preview(parts[2]))
+                    return
+                if len(parts) == 4 and parts[:2] == ["api", "workflows"] and parts[3] == "stage-prompt":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    self._send(engine.stage_prompt_template(parts[2], query.get("stage", [""])[0]))
+                    return
                 if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "head":
                     # Cheap change-detection so idle polling does not re-read every
                     # turn artifact each tick. event_sequence advances on every run
@@ -285,11 +292,15 @@ def make_handler(
                     request = str(value.get("request", "")).encode("utf-8")
                     if not request.strip():
                         raise ValueError("request cannot be empty")
+                    overrides = value.get("profile_overrides")
+                    if overrides is not None and not isinstance(overrides, dict):
+                        raise ValueError("profile_overrides must be an object")
                     run_id = engine.create_run(
                         request,
                         str(value.get("project", "toledo")),
                         str(value.get("workflow", "continuous-development")),
                         run_mode=str(value.get("run_mode", "auto")),
+                        profile_overrides=overrides,
                     )
                     workers.start(
                         run_id,
@@ -318,6 +329,10 @@ def make_handler(
                         lambda error: engine.record_background_failure(run_id, error),
                     )
                     self._send({"run_id": run_id, "worker": workers.status(run_id)}, HTTPStatus.ACCEPTED)
+                    return
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "stop":
+                    note = str(value.get("note", "")).encode("utf-8")
+                    self._send(engine.stop_run(parts[2], note))
                     return
                 if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
                     run_id = parts[2]
@@ -358,7 +373,7 @@ def make_handler(
                     current = workflow.profiles[profile_id]
                     model = str(value["model"]) if "model" in value else current.model
                     effort = str(value["effort"]) if "effort" in value else current.effort
-                    catalog = load_catalog(engine.runtime_dir)
+                    catalog = load_catalog(engine.runtime_dir, refresh=False)
                     # Discovery can be unavailable (for example a locked-down
                     # field host).  A stale/empty catalog warns the UI but is
                     # never a persistence or run blocker; when it has entries,

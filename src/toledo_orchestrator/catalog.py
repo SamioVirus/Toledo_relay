@@ -7,13 +7,12 @@ network dependency or a run precondition.
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .core import atomic_write, read_json
+from .core import atomic_write, read_json, resolve_cli_executable
 
 
 CATALOG_SCHEMA = "toledo_orchestrator.capability_catalog.v1"
@@ -24,10 +23,12 @@ STALE_AFTER_SECONDS = 7 * 24 * 60 * 60
 # These are official model identifiers, intentionally marked curated rather
 # than account-entitled.  Claude Code's installed binary has no account-aware
 # listing command; successful Toledo observations add account evidence later.
+# Full IDs only: headless `--model` silently ignores family aliases.
 CURATED_CLAUDE_MODELS = (
     ("claude-fable-5", "Claude Fable 5"),
     ("claude-opus-4-8", "Claude Opus 4.8"),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("claude-sonnet-5", "Claude Sonnet 5"),
+    ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
 )
 
 
@@ -36,13 +37,19 @@ def _now() -> str:
 
 
 def _run_text(command: list[str]) -> tuple[str, str | None]:
+    resolved = [resolve_cli_executable(command[0]), *command[1:]]
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+        # Bytes, not text=True: on Windows text mode decodes with the console
+        # codepage (cp1252) and CLI output containing UTF-8 punctuation kills
+        # the reader thread, silently yielding stdout=None.
+        completed = subprocess.run(resolved, capture_output=True, timeout=30, check=False)
     except (OSError, subprocess.SubprocessError) as error:
         return "", f"{type(error).__name__}: {error}"
+    stdout = (completed.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (completed.stderr or b"").decode("utf-8", errors="replace")
     if completed.returncode:
-        return "", (completed.stderr.strip() or f"exit {completed.returncode}")
-    return completed.stdout, None
+        return "", (stderr.strip() or f"exit {completed.returncode}")
+    return stdout, None
 
 
 def _observed_models(runtime_dir: Path) -> list[dict[str, str]]:
@@ -75,11 +82,17 @@ def _codex_models() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     for item in values:
         if not isinstance(item, dict) or not item.get("slug"):
             continue
+        # Internal entries (e.g. codex-auto-review) report visibility "hide";
+        # offering them in a picker would record selections the CLI never meant
+        # to expose.
+        if item.get("visibility") not in {None, "list"}:
+            continue
         efforts = [str(level.get("effort")) for level in item.get("supported_reasoning_levels", []) if isinstance(level, dict) and level.get("effort")]
         models.append({
             "provider": "codex", "selection_token": str(item["slug"]),
             "display_name": str(item.get("display_name") or item["slug"]),
             "aliases": [], "supported_efforts": efforts,
+            "default_effort": str(item.get("default_reasoning_level") or "") or None,
             "special_modes": [str(value) for value in item.get("additional_speed_tiers", [])],
             "availability": "installed-account", "source": "codex debug models",
             "supported_in_api": bool(item.get("supported_in_api")), "visibility": item.get("visibility"),
@@ -106,6 +119,7 @@ def _claude_models() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return [{
         "provider": "claude", "selection_token": token, "display_name": name,
         "aliases": [], "supported_efforts": efforts,
+        "default_effort": None,
         "special_modes": ["ultracode"] if supports_ultracode else [],
         "availability": "curated-cli-compatible", "source": "curated official manifest + claude --help",
         "subscription_entitlement": "unknown",
@@ -152,17 +166,33 @@ def research_catalog(runtime_dir: Path) -> dict[str, Any]:
 
 
 def refresh_catalog(runtime_dir: Path) -> dict[str, Any]:
-    """Query local CLIs only, atomically retaining the prior good catalog."""
+    """Query local CLIs only, atomically retaining the prior good catalog.
+
+    The refresh outcome is always persisted — including a total discovery
+    failure. An unwritten failure would make every subsequent load retry
+    discovery (a multi-second hang per page load) and would leave the UI with
+    an empty picker and no explanation.
+    """
     codex, codex_source = _codex_models()
     claude, claude_source = _claude_models()
-    if not codex and not claude:
-        return load_catalog(runtime_dir, refresh=False)
     discovered_at = _now()
+    sources = {"codex": codex_source, "claude": claude_source}
+    if not codex and not claude:
+        value = load_catalog(runtime_dir, refresh=False)
+        value["last_refresh"] = {"at": discovered_at, "sources": sources, "succeeded": False}
+        payload = {key: item for key, item in value.items() if key != "stale"}
+        payload.setdefault("schema_version", CATALOG_SCHEMA)
+        payload.setdefault("models", [])
+        payload.setdefault("observed_models", [])
+        payload.setdefault("sources", sources)
+        atomic_write(catalog_path(runtime_dir), (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+        return load_catalog(runtime_dir, refresh=False)
     observed = _observed_models(runtime_dir)
     value = {
         "schema_version": CATALOG_SCHEMA, "discovered_at": discovered_at,
         "verified_at": discovered_at, "models": codex + claude,
-        "observed_models": observed, "sources": {"codex": codex_source, "claude": claude_source},
+        "observed_models": observed, "sources": sources,
+        "last_refresh": {"at": discovered_at, "sources": sources, "succeeded": True},
     }
     atomic_write(catalog_path(runtime_dir), (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     return value
@@ -180,7 +210,7 @@ def load_catalog(runtime_dir: Path, *, refresh: bool = True) -> dict[str, Any]:
         return {"schema_version": CATALOG_SCHEMA, "models": [], "observed_models": [], "sources": {}, "stale": True}
     try:
         age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(value["verified_at"]))).total_seconds()
-    except (KeyError, ValueError):
+    except (KeyError, TypeError, ValueError):
         age = STALE_AFTER_SECONDS + 1
     value["stale"] = age > STALE_AFTER_SECONDS
     return value

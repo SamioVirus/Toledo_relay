@@ -178,17 +178,25 @@ function renderRun() {
   $("#timeline").hidden = false;
   const cycle = state.cycles?.[state.cycle - 1];
   const canRecover = state.schema_version === "toledo_orchestrator.run.v2" && ["created", "running"].includes(state.status) && !state.worker?.active;
+  const terminalHeadings = {
+    complete: "Run complete",
+    cancelled: "Run cancelled",
+    stopped: "Run finished by operator",
+    failed: "Run failed",
+  };
   const heading = canRecover
     ? "Run interrupted — recovery available"
     : state.worker?.active
       ? `${state.inflight?.title || stageTitle(state.current_stage)} is running…`
-      : stageTitle(state.current_stage);
+      : terminalHeadings[state.status] || stageTitle(state.current_stage);
   const retryReasons = new Set(["operator_step", "provider_requested_human", "provider_invocation_failed", "provider_session_id_missing", "provider_session_missing", "provider_session_not_new", "provider_session_changed_unexpectedly", "missing_substantive_output", "malformed_directive", "unsupported_stage_directive", "invalid_next_turn_profile", "profile_permission_exceeds_stage", "background_operation_failed"]);
   const canOverride = state.schema_version === "toledo_orchestrator.run.v2" && state.current_stage && !state.inflight && (state.status === "created" || state.status === "running" || retryReasons.has(state.pending_human_decision));
   const canSteer = state.schema_version === "toledo_orchestrator.run.v2" && state.status === "paused" && !state.inflight && Boolean(state.turns?.length);
   const workflow = bootstrap.workflows[state.workflow];
   const stage = workflow?.stages?.[state.current_stage] || {};
-  const profile = workflow?.profiles?.[state.next_turn_override?.profile || stage.profile] || {};
+  const override = state.next_turn_override;
+  const overrideValue = override?.target_stage === state.current_stage ? override?.profile_value : null;
+  const profile = overrideValue || workflow?.profiles?.[override?.profile || stage.profile] || {};
   const cost = (state.turns || []).reduce((sum, turn) => sum + Number(turn.usage?.total_cost_usd || 0), 0);
   const strip = $("#run-status-strip");
   strip.hidden = false;
@@ -311,6 +319,8 @@ function renderTimeline(state) {
     }
     root.append(block);
   }
+  const activeGate = $("#active-gate", root);
+  if (activeGate && state.pending_human_decision) populateGateUpnext(activeGate, state);
   hydratePromptPreviews();
   hydrateDecisionPreviews();
 }
@@ -502,6 +512,55 @@ function bindGate(fragment) {
       await refreshCurrent();
     } catch (error) { alert(error.message); button.disabled = false; }
   }));
+  $("[data-gate-stop]", gate)?.addEventListener("click", async (event) => {
+    if (!window.confirm("Finish this run here? It is recorded as finished by you — nothing is committed and nothing further runs.")) return;
+    event.target.disabled = true;
+    try {
+      await api(`/api/runs/${encodeURIComponent(currentRunId)}/stop`, {method:"POST", body:JSON.stringify({note:textarea.value})});
+      gateDrafts.delete(gate.dataset.draftKey);
+      await refreshCurrent();
+      await refreshRuns();
+    } catch (error) { alert(error.message); event.target.disabled = false; }
+  });
+}
+
+async function populateGateUpnext(gate, state) {
+  const panel = $("[data-gate-upnext]", gate);
+  const tools = $("[data-gate-tools]", gate);
+  if (!panel || state.schema_version !== "toledo_orchestrator.run.v2" || !state.current_stage || state.worker?.active) return;
+  let preview;
+  try {
+    preview = await api(`/api/runs/${encodeURIComponent(currentRunId)}/next-turn`);
+  } catch { return; }
+  if (!preview?.available || !gate.isConnected) return;
+  const profile = preview.profile || {};
+  const session = preview.session || {};
+  const receives = (preview.inputs || []).map((input) => `${input.title}${input.empty ? " (none yet)" : ` (${input.chars >= 1000 ? `${(input.chars / 1000).toFixed(1)}k` : input.chars} chars)`}`).join(", ") || "nothing beyond the session";
+  const afterward = (preview.afterward || []).map((item) => `${item.directive} → ${item.description}`);
+  const dedupedAfterward = [...new Set(afterward)];
+  panel.innerHTML = `<div class="gate-upnext-line"><strong>${escapeHtml(profile.model || "provider default")}</strong><span>·</span><span>${escapeHtml(profile.effort || "default effort")}</span><span>·</span><span>${escapeHtml(profile.provider || "")}</span><span>·</span><span>${escapeHtml(profile.permission || "")}</span>${profile.overridden || session.overridden ? '<span class="override-chip">one-turn override active</span>' : ""}${profile.custom ? '<span class="warn-chip">custom — unverified</span>' : ""}</div>
+    <dl>
+      <div><dt>Actor</dt><dd>${escapeHtml(session.label || "?")} (${escapeHtml(preview.stage?.role || "agent")}) · ${escapeHtml(session.action || "?")} session</dd></div>
+      <div><dt>Receives</dt><dd>${escapeHtml(receives)}</dd></div>
+      <div><dt>Produces</dt><dd>${escapeHtml(String(preview.stage?.produces || "").replaceAll("-", " "))}</dd></div>
+      <div><dt>Afterward</dt><dd>${dedupedAfterward.map((line) => escapeHtml(line)).join("<br>")}</dd></div>
+      ${preview.rounds ? `<div><dt>Rounds</dt><dd>${preview.rounds.used} of ${preview.rounds.cap} used</dd></div>` : ""}
+      ${preview.direction_preview ? `<div><dt>Direction</dt><dd>${escapeHtml(preview.direction_preview.replace(/\s+/g, " ").slice(0, 220))}</dd></div>` : ""}
+    </dl>`;
+  panel.hidden = false;
+  tools.hidden = false;
+  $("[data-gate-prompt]", gate).onclick = () => {
+    inspectorPayload = {
+      transport: preview.prompt || `Prompt preview unavailable: ${preview.prompt_error || "unknown"}`,
+      metadata: JSON.stringify({stage: preview.stage, profile: preview.profile, session: preview.session, inputs: preview.inputs}, null, 2),
+    };
+    setDirectionTabLabel("Situational");
+    $("#inspector-kicker").textContent = "EXACT NEXT PROMPT · PREVIEW";
+    $("#inspector-title").textContent = preview.stage?.title || "Next turn";
+    $("#inspector-meta").innerHTML = `<span class="chip">${escapeHtml(profile.provider || "")}</span><span class="chip">${escapeHtml(profile.model || "")} · ${escapeHtml(profile.effort || "")}</span><span class="chip ${escapeHtml(session.action || "")}">${escapeHtml(session.action || "")} session</span><span class="chip">${escapeHtml(profile.permission || "")}</span>`;
+    openInspector("transport");
+  };
+  $("[data-gate-adjust]", gate).onclick = () => openNextTurnControl();
 }
 
 function configureGate(fragment, state) {
@@ -511,19 +570,23 @@ function configureGate(fragment, state) {
   const description = $("[data-gate-description]", gate);
   const textarea = $("[data-gate-text]", gate);
   const label = $("[data-gate-label]", gate);
+  const note = $("[data-gate-note]", gate);
+  const stop = $("[data-gate-stop]", gate);
   const yes = $('[data-choice="yes"]', gate);
   const no = $('[data-choice="no"]', gate);
   const other = $('[data-choice="other"]', gate);
+  const nextTitle = stageTitle(state.current_stage) || "next turn";
   const copy = {
-    operator_step: ["Ready for the next turn?", "Step mode paused before the next provider invocation. You can adjust the one-turn profile or session action above, add a concise direction, then continue.", "Run next turn", "", "", "Optional direction for the next turn"],
+    operator_step: [`Up next: ${nextTitle}`, "", `Run: ${nextTitle}`, "", "", "One-turn guidance (optional)"],
     next_task_approval: ["Is this the right next task?", "The proposal is preserved exactly. Accept it, finish the loop, or redirect the current strategic session.", "Yes — start planning", "No — finish here", "Other — revise proposal", "Tell the strategic session what to change"],
-    validation_execution_approval: ["Run the validation commands?", "These commands execute on the host against the isolated implementation worktree. Review the pending commands before approving.", "Yes — run validation", "No — cancel run", "Other — send to repair", "Explain what session C must change before validation"],
+    validation_execution_approval: ["Run the validation commands?", "These commands execute on the host against the isolated implementation worktree. Review the pending commands before approving.", "Yes — run validation", "No — cancel run", "Other — send to repair", "Explain what the implementation session must change before validation"],
     validation_receipt_required: ["Validation receipt required", `Attach the patch-bound receipt from a terminal with: python -m toledo_orchestrator validate ${state.run_id} --receipt-file "C:\\path\\to\\receipt.json"`, "", "No — cancel run", "Other — add direction", "Add receipt or validation guidance"],
     unknown_validation_execution: ["Validation completion is unknown", "The controller stopped after host validation started but before a trustworthy completion record was sealed. It will not rerun the commands automatically. Route the work to repair/inspection, cancel, or add exact recovery direction.", "Yes — inspect and repair", "No — cancel run", "Other — direct recovery", "Tell the implementation session what evidence to inspect before any rerun"],
-    provider_invocation_failed: ["Provider invocation failed", "No successful model response was accepted. Set any one-turn model, effort, or session override above, then retry; the saved override will be used for that retry.", "Retry with displayed settings", "Cancel run", "Retry with direction", "Optional direction for the retried turn"],
+    provider_invocation_failed: ["Provider invocation failed", "No successful model response was accepted (quota, network, or CLI failure). Use “Change model · effort · session” below to switch to a model with headroom, then retry — the override applies to the retried turn.", "Retry with displayed settings", "Cancel run", "Retry with direction", "Optional direction for the retried turn"],
     planning_round_cap_reached: ["Planning round cap reached", "The planning loop used its configured rounds without agreement. Extend it, stop, or redirect the next revision.", "Yes — extend one round", "No — cancel run", "Other — extend with direction", "Tell the planning sessions what must change"],
     implementation_round_cap_reached: ["Implementation round cap reached", "The implementation loop used its configured repair rounds. Extend it, stop, or direct one more repair.", "Yes — extend one round", "No — cancel run", "Other — extend with direction", "Tell the implementation sessions what must change"],
-    validation_failed_at_repair_cap: ["Validation still fails", "Required validation failed after the configured repair rounds. Extend repair, stop, or give a specific recovery direction.", "Yes — extend repair", "No — cancel run", "Other — direct repair", "Describe the evidence or repair you require"],
+    validation_failed_at_repair_cap: ["Validation still fails", "Required validation failed after the configured repair rounds, and the failure does not match the clean baseline. Extend repair, stop, or give a specific recovery direction.", "Yes — extend repair", "No — cancel run", "Other — direct repair", "Describe the evidence or repair you require"],
+    validation_baseline_failure_decision: ["Only a pre-existing failure remains", "Required validation failed, but every failure matches the clean baseline at the same revision — this change did not introduce it. Accept and commit with the debt recorded, stop without committing, or send it to repair anyway.", "Yes — accept with recorded debt", "No — stop without commit", "Other — repair with direction", "Tell the implementation session what to change instead of accepting"],
   }[reason];
   if (copy) {
     [title.textContent, description.textContent, yes.textContent, no.textContent, other.textContent, textarea.placeholder] = copy;
@@ -541,10 +604,22 @@ function configureGate(fragment, state) {
     textarea.hidden = true;
     label.hidden = true;
   }
+  if (reason === "validation_baseline_failure_decision") {
+    const classification = state.pending_baseline_acceptance?.classification;
+    if (classification) {
+      const failures = Object.entries(classification.failures || {})
+        .map(([id, item]) => `${id}: ${(item.current?.lines || []).join("; ") || "see validation output"}`);
+      description.textContent += `\n\nBaseline ${String(classification.baseline_revision || "").slice(0, 12)} · matched failures:\n${failures.join("\n")}`;
+    }
+  }
   gate.dataset.reason = reason;
   if (reason === "operator_step") {
     no.hidden = true;
     other.hidden = true;
+    stop.hidden = false;
+    description.hidden = true;
+    note.hidden = false;
+    note.textContent = "Guidance is appended to this turn's prompt only — the workflow instruction is unchanged. It is recorded as an operator decision.";
   }
   if (reason === "validation_receipt_required") yes.hidden = true;
 }
@@ -560,38 +635,148 @@ function populateNewRun() {
   renderNewRunPreflight();
 }
 
+const launchOverrides = new Map();
+const stagePromptCache = new Map();
+
+function describeTransition(workflow, target) {
+  const value = String(target);
+  if (value.startsWith("@pause:")) {
+    const reason = value.split(":")[1];
+    const named = {
+      next_task_approval: "pause for your approval of the proposed next task",
+      provider_requested_human: "pause for your input",
+    };
+    return named[reason] || `pause: ${reason.replaceAll("_", " ")}`;
+  }
+  if (value.startsWith("@seal:")) {
+    const [, sealedType, next] = value.split(":");
+    return `seal the ${sealedType.replaceAll("-", " ")} and move to ${workflow.stages?.[next]?.title || next}`;
+  }
+  if (value.startsWith("@complete:")) {
+    const next = value.split(":")[1];
+    return `run validation, commit the accepted change, then ${workflow.stages?.[next]?.title || next}`;
+  }
+  return `move to ${workflow.stages?.[value]?.title || value}`;
+}
+
+function transitionLines(workflow, stage) {
+  const seen = new Set();
+  const lines = [];
+  for (const [directive, target] of Object.entries(stage.transitions || {})) {
+    const description = describeTransition(workflow, target);
+    if (seen.has(description)) continue;
+    seen.add(description);
+    lines.push(`${directive} → ${description}`);
+  }
+  return lines;
+}
+
+function effectiveProfile(workflow, profileId) {
+  const base = workflow.profiles?.[profileId] || {};
+  const draft = launchOverrides.get(profileId);
+  return draft ? {...base, ...draft, overridden: true} : {...base, overridden: false};
+}
+
 function renderNewRunPreflight() {
-  const workflow = bootstrap?.workflows?.[$("#new-workflow").value];
+  const workflowId = $("#new-workflow").value;
+  const workflow = bootstrap?.workflows?.[workflowId];
   const root = $("#new-run-preflight");
   if (!workflow) {
-    root.innerHTML = '<p class="route-preflight-empty">No route definition is available.</p>';
+    root.innerHTML = '<li class="route-preflight-empty">No route definition is available.</li>';
     $("#route-preflight-summary").textContent = "";
+    $("#route-warnings").hidden = true;
     return;
   }
   const stages = orderedWorkflowStages(workflow);
-  $("#route-preflight-summary").textContent = `${stages.length} stages · ${workflow.label}`;
-  root.innerHTML = stages.map((stage, index) => {
-    const profile = workflow.profiles?.[stage.profile] || {};
-    const label = stage.prompt_label || promptShort(stage.prompt_kind);
-    return `<article class="route-preflight-card"><span class="route-index">${String(index + 1).padStart(2, "0")}</span><p>${escapeHtml(label)}</p><h4>${escapeHtml(stage.title)}</h4><dl><div><dt>Actor</dt><dd>${escapeHtml(stage.session_slot)}</dd></div><div><dt>Profile</dt><dd>${escapeHtml(profile.model || stage.profile)} · ${escapeHtml(profile.effort || "default")}</dd></div><div><dt>Access</dt><dd>${escapeHtml(profile.permission || "unspecified")}</dd></div><div><dt>Session</dt><dd>${escapeHtml(stage.session_policy)}</dd></div></dl></article>`;
-  }).join("");
-  // Preflight is display-only: it exposes the same locally verified catalog
-  // facts without creating a second launch controller.
-  $$(".route-preflight-card", root).forEach((card, index) => {
-    const stage = stages[index];
-    const profile = workflow.profiles?.[stage.profile] || {};
-    const entry = catalogModels(profile.provider).find((candidate) => candidate.selection_token === profile.model);
-    const detail = document.createElement("p");
-    detail.className = "catalog-detail";
-    detail.textContent = catalogDetail(profile.provider, profile.model, !entry);
-    card.append(detail);
-    if (entry?.special_modes?.length) {
-      const modes = document.createElement("p");
-      modes.className = "catalog-special-mode";
-      modes.textContent = `Verified special mode: ${entry.special_modes.join(", ")}`;
-      card.append(modes);
+  const verified = bootstrap?.catalog?.verified_at ? new Date(bootstrap.catalog.verified_at).toLocaleDateString() : "never";
+  $("#route-preflight-summary").textContent = `${stages.length} stages · catalog verified ${verified}${bootstrap?.catalog?.stale ? " (stale)" : ""}`;
+  root.innerHTML = "";
+  for (const [index, stage] of stages.entries()) root.append(routeStepRow(workflowId, workflow, stage, index));
+  renderRouteWarnings(workflow, stages);
+}
+
+function routeStepRow(workflowId, workflow, stage, index) {
+  const row = document.createElement("li");
+  row.className = "route-step";
+  const profile = effectiveProfile(workflow, stage.profile);
+  const inCatalog = catalogModels(profile.provider).some((entry) => entry.selection_token === profile.model);
+  const sharedWith = Object.values(workflow.stages || {}).filter((other) => other.profile === stage.profile && other.id !== stage.id).map((other) => other.title);
+  const round = stage.round;
+  row.innerHTML = `<span class="route-step-marker">${index + 1}</span>
+    <div class="route-step-head"><span class="route-step-kind">${escapeHtml(stage.prompt_label || promptShort(stage.prompt_kind))}</span><h4>${escapeHtml(stage.title)}</h4>${round ? `<span class="route-step-loop">up to ${round.cap} rounds</span>` : ""}</div>
+    <p class="route-step-who">${escapeHtml(stage.session_slot)}<span class="dot">·</span>${escapeHtml(profile.provider)}<span class="dot">·</span><strong>${escapeHtml(profile.model || "provider default")}</strong><span class="dot">·</span>${escapeHtml(profile.effort || "default")}<span class="dot">·</span>${escapeHtml(profile.permission || "read-only")}<span class="dot">·</span>${escapeHtml(stage.session_policy)} session${profile.overridden ? '<span class="override-chip">this run only</span>' : ""}${!inCatalog && catalogModels(profile.provider).length ? '<span class="unverified-chip">not in catalog</span>' : ""}</p>
+    <p class="route-step-then">Produces ${escapeHtml(String(stage.artifact_type || "").replaceAll("-", " "))}. ${escapeHtml(transitionLines(workflow, stage).join(" · "))}</p>
+    <div class="route-step-actions"><button type="button" class="quiet-button" data-step-instruction>View instruction</button><button type="button" class="quiet-button" data-step-adjust>Change model · effort</button></div>
+    <div class="route-step-detail" data-step-detail hidden></div>
+    <div class="route-step-editor" data-step-editor hidden></div>`;
+  $("[data-step-instruction]", row).addEventListener("click", () => toggleStageInstruction(row, workflowId, stage));
+  $("[data-step-adjust]", row).addEventListener("click", () => toggleStageEditor(row, workflow, stage, sharedWith));
+  return row;
+}
+
+async function toggleStageInstruction(row, workflowId, stage) {
+  const detail = $("[data-step-detail]", row);
+  if (!detail.hidden) { detail.hidden = true; detail.innerHTML = ""; return; }
+  detail.hidden = false;
+  detail.innerHTML = '<pre>Loading exact instruction…</pre>';
+  const key = `${workflowId}:${stage.id}`;
+  try {
+    let value = stagePromptCache.get(key);
+    if (!value) {
+      value = await api(`/api/workflows/${encodeURIComponent(workflowId)}/stage-prompt?stage=${encodeURIComponent(stage.id)}`);
+      stagePromptCache.set(key, value);
     }
+    const contextLine = (value.context || []).length ? `Receives: ${value.context.join(", ")}` : "Receives: nothing beyond the session";
+    detail.innerHTML = "";
+    const pre = document.createElement("pre");
+    pre.textContent = `# ${value.prompt_file} — exact static instruction\n# ${contextLine}\n# The full transport prompt adds the orchestration law (new sessions), the listed context artifacts, and the strict contract.\n\n${value.template}`;
+    detail.append(pre);
+  } catch (error) {
+    detail.innerHTML = `<pre>Instruction unavailable: ${escapeHtml(error.message)}</pre>`;
+  }
+}
+
+function toggleStageEditor(row, workflow, stage, sharedWith) {
+  const editor = $("[data-step-editor]", row);
+  if (!editor.hidden) { editor.hidden = true; editor.innerHTML = ""; return; }
+  const profile = effectiveProfile(workflow, stage.profile);
+  editor.hidden = false;
+  editor.innerHTML = `<div class="editor-grid"><label>Model<select data-field="model" aria-label="${escapeHtml(stage.title)} model"></select></label><label>Reasoning effort<select data-field="effort" aria-label="${escapeHtml(stage.title)} reasoning effort"></select></label></div><div data-catalog-custom hidden><label>Exact model ID<input data-field="custom-model" autocomplete="off"></label><label>Exact reasoning effort<input data-field="custom-effort" autocomplete="off"></label></div><p class="catalog-detail" data-catalog-detail hidden></p><p class="editor-note">Applies to route profile <strong>${escapeHtml(stage.profile)}</strong> for this run only${sharedWith.length ? ` — also used by: ${escapeHtml(sharedWith.join(", "))}` : ""}. Saved defaults are in Settings.</p><div class="editor-actions">${launchOverrides.has(stage.profile) ? '<button type="button" class="ghost-button" data-editor-reset>Reset to default</button>' : ""}<button type="button" class="primary-button" data-editor-apply>Apply to this run</button></div>`;
+  installCatalogPicker(editor, profile.provider, profile.model, profile.effort);
+  $("[data-editor-apply]", editor).addEventListener("click", () => {
+    const selection = catalogSelection(editor);
+    if (!selection.model || !selection.effort) { alert("Model and reasoning effort are required."); return; }
+    launchOverrides.set(stage.profile, selection);
+    renderNewRunPreflight();
   });
+  $("[data-editor-reset]", editor)?.addEventListener("click", () => {
+    launchOverrides.delete(stage.profile);
+    renderNewRunPreflight();
+  });
+}
+
+function renderRouteWarnings(workflow, stages) {
+  const root = $("#route-warnings");
+  const catalog = bootstrap?.catalog || {};
+  const lines = [];
+  const usedProfiles = [...new Set(stages.map((stage) => stage.profile))];
+  const missing = [];
+  for (const profileId of usedProfiles) {
+    const profile = effectiveProfile(workflow, profileId);
+    const entries = catalogModels(profile.provider);
+    if (entries.length && !entries.some((entry) => entry.selection_token === profile.model)) {
+      missing.push(`${profile.model} (${profileId})`);
+    }
+  }
+  if (missing.length) lines.push(`Not in the local catalog — will run as unverified custom selections: ${missing.join(", ")}.`);
+  for (const provider of ["codex", "claude"]) {
+    const error = catalog.sources?.[provider]?.error || catalog.last_refresh?.sources?.[provider]?.error;
+    if (!catalogModels(provider).length) {
+      lines.push(`${provider === "codex" ? "Codex" : "Claude"} discovery unavailable${error ? `: ${error}` : ""} — refresh from Settings → Models.`);
+    }
+  }
+  root.hidden = !lines.length;
+  root.innerHTML = lines.map((line) => `<span>${escapeHtml(line)}</span>`).join("");
 }
 
 function orderedWorkflowStages(workflow) {
@@ -618,11 +803,35 @@ function catalogModels(provider) {
   return (bootstrap?.catalog?.models || []).filter((model) => model.provider === provider);
 }
 
-function catalogDetail(provider, model, custom) {
-  const entry = catalogModels(provider).find((candidate) => candidate.selection_token === model);
-  if (custom || !entry) return "Custom selection — unverified; recorded as evidence.";
-  const checked = bootstrap?.catalog?.verified_at ? `verified ${new Date(bootstrap.catalog.verified_at).toLocaleDateString()}` : "verification date unavailable";
-  return `${entry.source || "local catalog"} · ${entry.availability || "availability unknown"} · ${checked}${bootstrap?.catalog?.stale ? " · stale" : ""}`;
+function renderCatalogStatus() {
+  const root = $("#catalog-status");
+  if (!root) return;
+  const catalog = bootstrap?.catalog || {};
+  const refreshInfo = catalog.last_refresh;
+  const verified = catalog.verified_at ? new Date(catalog.verified_at).toLocaleString() : "never";
+  root.innerHTML = `<div class="catalog-meta"><span>${(catalog.models || []).length} selectable models</span><span>verified ${escapeHtml(verified)}</span>${catalog.stale ? '<span class="warn">stale — refresh recommended</span>' : ""}${refreshInfo && !refreshInfo.succeeded ? `<span class="warn">last refresh failed ${escapeHtml(new Date(refreshInfo.at).toLocaleString())}</span>` : ""}<button type="button" class="quiet-button" id="catalog-refresh">Refresh from installed CLIs</button></div>` +
+    [["codex", "Codex CLI"], ["claude", "Claude Code"]].map(([provider, providerLabel]) => {
+      const source = catalog.sources?.[provider] || refreshInfo?.sources?.[provider] || {};
+      const models = catalogModels(provider);
+      const rows = models.map((model) => `<li><strong>${escapeHtml(model.display_name || model.selection_token)}</strong><code>${escapeHtml(model.selection_token)}</code><span>${escapeHtml((model.supported_efforts || []).join(" · "))}</span>${model.special_modes?.length ? `<em>${escapeHtml(model.special_modes.join(", "))}</em>` : ""}</li>`).join("");
+      const footnote = provider === "codex"
+        ? "Discovered from the installed CLI (codex debug models) — reflects this account and build."
+        : "Curated official manifest; the installed CLI is verified for --model/--effort support. Pass full model IDs — family aliases are unreliable headless.";
+      return `<article class="catalog-provider"><header><strong>${providerLabel}</strong><span>${escapeHtml(source.cli_version || "version unknown")}</span></header>${source.error ? `<p class="catalog-error">Discovery failed: ${escapeHtml(source.error)}</p>` : ""}${rows ? `<ul>${rows}</ul>` : '<p class="settings-hint">No selectable models recorded. Refresh to query the installed CLI.</p>'}<p class="catalog-footnote">${footnote}</p></article>`;
+    }).join("");
+  $("#catalog-refresh")?.addEventListener("click", async (event) => {
+    const button = event.target;
+    button.disabled = true;
+    button.textContent = "Refreshing…";
+    try {
+      await api("/api/catalog/refresh", {method: "POST", body: "{}"});
+      await loadBootstrap();
+    } catch (error) {
+      alert(`Refresh failed: ${error.message}`);
+      button.disabled = false;
+      button.textContent = "Refresh from installed CLIs";
+    }
+  });
 }
 
 function installCatalogPicker(root, provider, model, effort) {
@@ -643,14 +852,18 @@ function installCatalogPicker(root, provider, model, effort) {
     const custom = !selected;
     customBox.hidden = !custom;
     effortSelect.closest("label").hidden = custom;
+    // The catalog provenance lives once in Settings → Models; per-card text
+    // appears only for the deliberate custom escape hatch.
     if (custom) {
-      detail.textContent = catalogDetail(provider, customModel.value, true);
+      detail.hidden = false;
+      detail.textContent = "Not in the local catalog — runs as an unverified custom selection, recorded as evidence.";
       return;
     }
+    detail.hidden = true;
+    detail.textContent = "";
     const efforts = selected.supported_efforts || [];
     effortSelect.innerHTML = efforts.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
     effortSelect.value = efforts.includes(effortSelect.value) ? effortSelect.value : (efforts.includes(effort) ? effort : (efforts[0] || ""));
-    detail.textContent = catalogDetail(provider, selected.selection_token, false);
   };
   effortSelect.value = effort || "";
   modelSelect.addEventListener("change", sync);
@@ -668,6 +881,7 @@ function catalogSelection(root) {
 }
 
 function renderSettings() {
+  renderCatalogStatus();
   const workflows = bootstrap.workflows;
   settingsWorkflowId = workflows[settingsWorkflowId] ? settingsWorkflowId : Object.keys(workflows)[0];
   const selector = $("#settings-workflow");
@@ -784,9 +998,16 @@ async function createRun() {
   const button = $("#create-run");
   button.disabled = true;
   try {
-    const result = await api("/api/runs", {method:"POST",body:JSON.stringify({project:$("#new-project").value,workflow:$("#new-workflow").value,run_mode:$("#new-run-mode").value,request})});
+    const workflowId = $("#new-workflow").value;
+    const workflow = bootstrap?.workflows?.[workflowId] || {};
+    const overrides = {};
+    for (const [profileId, selection] of launchOverrides) {
+      if (workflow.profiles?.[profileId]) overrides[profileId] = selection;
+    }
+    const result = await api("/api/runs", {method:"POST",body:JSON.stringify({project:$("#new-project").value,workflow:workflowId,run_mode:$("#new-run-mode").value,request,profile_overrides:Object.keys(overrides).length ? overrides : null})});
     $("#new-run-dialog").close();
     $("#new-request").value = "";
+    launchOverrides.clear();
     await refreshRuns();
     await selectRun(result.run_id);
   } catch(error) { alert(error.message); }
@@ -858,7 +1079,15 @@ function bindStaticEvents() {
   window.addEventListener("resize", syncRunRail);
   syncRunRail();
   $("#add-project-button").addEventListener("click", showProjectForm);
-  $("#new-workflow").addEventListener("change", renderNewRunPreflight);
+  $("#new-workflow").addEventListener("change", () => { launchOverrides.clear(); renderNewRunPreflight(); });
+  $$("[data-settings-tab]").forEach((button) => button.addEventListener("click", () => {
+    $$("[data-settings-tab]").forEach((other) => {
+      const selected = other === button;
+      other.classList.toggle("active", selected);
+      other.setAttribute("aria-selected", String(selected));
+    });
+    $$("[data-settings-panel]").forEach((panel) => { panel.hidden = panel.dataset.settingsPanel !== button.dataset.settingsTab; });
+  }));
   $("#settings-workflow").addEventListener("change", (event) => { settingsWorkflowId = event.target.value; renderSettings(); });
   $("#refresh-button").addEventListener("click", async () => { await loadBootstrap(); if(currentRunId) await refreshCurrent(); });
   $("#close-inspector").addEventListener("click", closeInspector);
