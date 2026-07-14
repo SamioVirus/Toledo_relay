@@ -74,6 +74,23 @@ def test_profile_api_rejects_unknown_catalog_selection_but_records_custom(tmp_pa
         server.shutdown(); server.server_close(); thread.join(timeout=5)
 
 
+def test_catalog_research_api_is_nonce_protected_and_local(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, report = request_json(
+            f"http://127.0.0.1:{server.server_port}/api/catalog/research",
+            method="POST", nonce="test-nonce", value={},
+        )
+        assert status == 200 and report["method"] == "deterministic-local-audit"
+        assert (engine.runtime_dir / "catalog" / "research.v1.json").is_file()
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=5)
+
+
 def test_local_web_api_serves_ui_requires_nonce_and_blocks_artifact_traversal(tmp_path: Path):
     engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
     workers = RunWorkers()

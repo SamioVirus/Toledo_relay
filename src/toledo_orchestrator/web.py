@@ -19,7 +19,7 @@ from .configuration import (
     save_project_value,
     update_profile,
 )
-from .catalog import load_catalog, refresh_catalog, validate_selection
+from .catalog import load_catalog, refresh_catalog, research_catalog, validate_selection
 from .core import read_json
 from .cycle import CycleOrchestrator
 from .director import state_caption
@@ -378,6 +378,9 @@ def make_handler(
                     return
                 if parsed.path == "/api/catalog/refresh":
                     self._send(refresh_catalog(engine.runtime_dir))
+                    return
+                if parsed.path == "/api/catalog/research":
+                    self._send(research_catalog(engine.runtime_dir))
                     return
                 if parsed.path == "/api/project":
                     project = save_project_value(engine.runtime_dir, value)

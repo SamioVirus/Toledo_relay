@@ -96,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile_set.add_argument("--permission", choices=("read-only", "workspace-write"))
     profile_set.add_argument("--label")
     commands.add_parser("projects")
+    commands.add_parser("catalog-research")
     project_add = commands.add_parser("project-add")
     project_add.add_argument("--id", required=True)
     project_add.add_argument("--root", type=Path, required=True)
@@ -212,6 +213,10 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(engine.attach_receipt(args.run_id, args.receipt_file))
             return 0
     cycle = _cycle(args.runtime_dir)
+    if args.command == "catalog-research":
+        from .catalog import research_catalog
+        _emit(research_catalog(cycle.runtime_dir))
+        return 0
     if args.command == "runs":
         values = []
         for path in sorted(cycle.runs_dir.glob("run_*/run.json"), reverse=True):

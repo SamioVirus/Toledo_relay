@@ -18,6 +18,7 @@ from .core import atomic_write, read_json
 
 CATALOG_SCHEMA = "toledo_orchestrator.capability_catalog.v1"
 CATALOG_RELATIVE_PATH = Path("catalog") / "capabilities.v1.json"
+RESEARCH_RELATIVE_PATH = Path("catalog") / "research.v1.json"
 STALE_AFTER_SECONDS = 7 * 24 * 60 * 60
 
 # These are official model identifiers, intentionally marked curated rather
@@ -113,6 +114,41 @@ def _claude_models() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
 def catalog_path(runtime_dir: Path) -> Path:
     return runtime_dir / CATALOG_RELATIVE_PATH
+
+
+def research_catalog(runtime_dir: Path) -> dict[str, Any]:
+    """Build a read-only, local catalog research report without provider calls.
+
+    It intentionally treats observed/configured values as leads, not
+    entitlement. The launch catalog remains the only selectable authority.
+    """
+    catalog = load_catalog(runtime_dir)
+    available = {
+        (str(item.get("provider")), str(item.get("selection_token")))
+        for item in catalog.get("models", [])
+    }
+    configured: list[dict[str, Any]] = []
+    try:
+        from .configuration import load_configured_workflows
+        for workflow in load_configured_workflows(runtime_dir).values():
+            for profile in workflow.profiles.values():
+                configured.append({
+                    "workflow": workflow.id, "profile": profile.id, "provider": profile.provider,
+                    "model": profile.model, "effort": profile.effort,
+                    "catalog_available": (profile.provider, profile.model) in available,
+                    "custom": profile.custom,
+                })
+    except (OSError, ValueError) as error:
+        configured.append({"error": f"{type(error).__name__}: {error}"})
+    report = {
+        "schema_version": "toledo_orchestrator.catalog_research.v1",
+        "researched_at": _now(), "method": "deterministic-local-audit",
+        "catalog_verified_at": catalog.get("verified_at"), "catalog_stale": bool(catalog.get("stale")),
+        "observed_models": catalog.get("observed_models", []), "configured_profiles": configured,
+        "note": "This report does not add entitlement or launch capabilities.",
+    }
+    atomic_write(runtime_dir / RESEARCH_RELATIVE_PATH, (json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    return report
 
 
 def refresh_catalog(runtime_dir: Path) -> dict[str, Any]:

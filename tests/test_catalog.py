@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from toledo_orchestrator.catalog import CATALOG_SCHEMA, load_catalog, validate_selection
+from toledo_orchestrator.catalog import CATALOG_SCHEMA, load_catalog, research_catalog, validate_selection
 from toledo_orchestrator.core import atomic_write
 
 
@@ -27,3 +27,15 @@ def test_catalog_cache_is_stale_warning_not_a_run_blocker(tmp_path: Path):
         "schema_version": CATALOG_SCHEMA, "verified_at": old, "models": [], "observed_models": [], "sources": {},
     }).encode("utf-8"))
     assert load_catalog(tmp_path, refresh=False)["stale"] is True
+
+
+def test_catalog_research_is_local_audit_not_capability_discovery(tmp_path: Path):
+    target = tmp_path / "catalog" / "capabilities.v1.json"
+    atomic_write(target, json.dumps({
+        "schema_version": CATALOG_SCHEMA, "verified_at": datetime.now(timezone.utc).isoformat(),
+        "models": [{"provider": "codex", "selection_token": "gpt-test"}], "observed_models": [], "sources": {},
+    }).encode("utf-8"))
+    report = research_catalog(tmp_path)
+    assert report["method"] == "deterministic-local-audit"
+    assert "does not add entitlement" in report["note"]
+    assert (tmp_path / "catalog" / "research.v1.json").is_file()

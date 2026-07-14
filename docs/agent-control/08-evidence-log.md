@@ -1,5 +1,11 @@
 # Evidence log
 
+## 2026-07-13 — Phase 4 experiment 3: catalog research automation
+
+- Hypothesis: a deterministic local audit can surface configured/observed model leads and catalog freshness without putting an AI researcher or an external entitlement lookup on the launch path.
+- Cost cap: zero provider calls and zero network calls. Rollback: do not call `catalog-research`/`/api/catalog/research`; its only output is the removable `runtime/catalog/research.v1.json` report.
+- Acceptance proof: unit/API tests create the atomic report and prove it is explicitly labeled `deterministic-local-audit`, nonce-protected, and unable to add launch capabilities or entitlement.
+
 ## 2026-07-13 — Phase 4 experiment 2: curated stance overrides
 
 - Hypothesis: a workflow can explicitly allow one curated prompt-contract stance for its next turn without conflating it with the provider/model profile or mutating the pinned workflow.
