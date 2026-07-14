@@ -1,5 +1,11 @@
 # Evidence log
 
+## 2026-07-13 — Phase 4 experiment 1: provider-switchable stages
+
+- Hypothesis: an explicitly declared stage can safely change providers only by beginning a new physical session, while prior session artifacts remain immutable.
+- Cost cap: no provider invocation was made for this experiment; deterministic fixture only. Rollback: omit `provider_switchable` (the default is false) or remove the one-turn override before it runs.
+- Acceptance proof: a cross-provider override is rejected by default; the test opt-in permits it only with `session_action=new`, records `provider_switch=true`, and invokes the selected provider with a new session. Existing snapshots without the flag retain the historic provider lock.
+
 ## 2026-07-13 — Phase 3 steer and caption sidecars
 
 - Deterministic proof: Steer is accepted only for a paused run with no in-flight call, continues the active provider session, records the exact note in a new sidecar artifact, links the replacement turn to the replaced turn, and does not call transition/round accounting. The latest turn remains the downstream artifact by existing chronological selection.

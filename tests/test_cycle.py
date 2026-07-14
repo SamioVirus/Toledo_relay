@@ -856,6 +856,25 @@ def test_steer_continues_same_session_and_preserves_round_accounting(tmp_path: P
     assert "Address the missing acceptance criterion." in prompt
 
 
+def test_provider_switch_requires_opt_in_and_forces_new_session(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [])
+    claude = SessionAdapter("claude", [("planning-propose", response("human", "Claude replacement"))])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Task", "test")
+    with pytest.raises(ValueError, match="provider switch requires"):
+        app.set_next_turn_override(run_id, profile="claude-planning-review", session_action="new")
+    stage = app.workflows["continuous-development"].stages["planning-propose"]
+    app.workflows["continuous-development"].stages["planning-propose"] = replace(stage, provider_switchable=True)
+    state = app.state(run_id)
+    state["workflow_snapshot"]["stages"]["planning-propose"]["provider_switchable"] = True
+    app._save(run_id, state)
+    state = app.set_next_turn_override(run_id, profile="claude-planning-review", session_action="new")
+    assert state["next_turn_override"]["provider_switch"] is True
+    result = app.run_to_stop(run_id)
+    assert result["turns"][-1]["provider"] == "claude"
+    assert claude.invocations[-1]["session_action"] == "new"
+
+
 def test_provider_failure_retry_preserves_the_selected_profile_model_and_effort(
     tmp_path: Path, writable_project: ProjectDefinition
 ):

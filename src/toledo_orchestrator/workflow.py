@@ -78,6 +78,7 @@ class StageDefinition:
     repair_stage: str | None = None
     seal_source: str | None = None
     direction: dict[str, str] = field(default_factory=dict)
+    provider_switchable: bool = False
 
     @classmethod
     def from_value(cls, stage_id: str, value: dict[str, Any]) -> "StageDefinition":
@@ -144,6 +145,7 @@ class StageDefinition:
             repair_stage=str(value["repair_stage"]) if value.get("repair_stage") else None,
             seal_source=str(value["seal_source"]) if value.get("seal_source") else None,
             direction=direction,
+            provider_switchable=bool(value.get("provider_switchable", False)),
         )
 
 
@@ -373,6 +375,7 @@ class WorkflowDefinition:
                     "repair_stage": stage.repair_stage,
                     "seal_source": stage.seal_source,
                     "direction": dict(stage.direction),
+                    "provider_switchable": stage.provider_switchable,
                 }
                 for key, stage in self.stages.items()
             },
@@ -417,6 +420,7 @@ class WorkflowDefinition:
                     "repair_stage": stage.repair_stage,
                     "seal_source": stage.seal_source,
                     "direction": dict(stage.direction),
+                    "provider_switchable": stage.provider_switchable,
                 }
                 for key, stage in self.stages.items()
             },

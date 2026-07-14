@@ -673,7 +673,13 @@ class CycleOrchestrator:
             }
             sessions[stage.session_slot] = slot
         if slot["provider"] != profile.provider:
-            raise ValueError(f"session slot {stage.session_slot} cannot change providers")
+            if action_override != "new" or not stage.provider_switchable:
+                raise ValueError(f"session slot {stage.session_slot} cannot change providers")
+            for previous in slot["history"]:
+                if previous.get("status") == "active":
+                    previous["status"] = "superseded"
+            slot["provider"] = profile.provider
+            slot["active_session_id"] = None
         if action_override is not None:
             if action_override not in {"new", "continue"}:
                 raise ValueError(f"invalid next-turn session action: {action_override}")
@@ -2135,8 +2141,9 @@ class CycleOrchestrator:
             else self._profile(state, selected_profile)
         )
         expected_provider = self._profile(state, stage.profile).provider
-        if target_profile.provider != expected_provider:
-            raise ValueError("a one-turn profile override cannot change the stage provider")
+        provider_switch = target_profile.provider != expected_provider
+        if provider_switch and (not stage.provider_switchable or session_action != "new"):
+            raise ValueError("a provider switch requires an opt-in provider_switchable stage and a new physical session")
         write_allowed = stage.phase == "implementation" and stage.role == "implementer"
         if target_profile.permission == "workspace-write" and not write_allowed:
             raise ValueError("workspace-write profiles are allowed only for implementation stages")
@@ -2169,6 +2176,7 @@ class CycleOrchestrator:
             "session_action": session_action,
             "target_stage": stage.id,
             "custom": custom,
+            "provider_switch": provider_switch,
         }
         self._event(state, "turn.override.set", title="Next-turn override", details=state["next_turn_override"])
         self._save(run_id, state)
