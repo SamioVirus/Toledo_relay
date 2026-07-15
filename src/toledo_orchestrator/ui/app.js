@@ -682,6 +682,14 @@ function gateProfileOptions(workflow, preview) {
     .filter((candidate) => preview.stage?.provider_switchable || candidate.provider === preview.profile?.provider);
 }
 
+function gateProfileLabel(profile) {
+  const prefix = `${profile.provider || ""}-`;
+  const purposeId = String(profile.id || "route").startsWith(prefix)
+    ? String(profile.id).slice(prefix.length)
+    : String(profile.id || "route");
+  return `${humanizeReason(purposeId)} · ${profile.permission || "default access"} · ${profile.timeout_seconds || "?"}s`;
+}
+
 async function populateGateUpnext(gate, state) {
   const panel = $("[data-gate-upnext]", gate);
   const tools = $("[data-gate-tools]", gate);
@@ -709,7 +717,7 @@ async function populateGateUpnext(gate, state) {
     </dl>
     <div class="gate-picker">
       <label>Provider<select data-gate-provider aria-label="Next turn provider"></select></label>
-      <label title="The provider, access, and timeout preset. Model and effort can be overridden below.">Route preset<select data-gate-profile aria-label="Next turn route preset"></select></label>
+      <label title="The provider, access, and timeout policy. Model and effort are selected separately below.">Access preset<select data-gate-profile aria-label="Next turn access preset"></select></label>
       <label>Model<select data-field="model" aria-label="Next turn model"></select></label>
       <label data-gate-effort>Effort<select data-field="effort" aria-label="Next turn reasoning effort"></select></label>
       <label>Session<select data-field="session" aria-label="Next turn session action"><option value="">As planned (${escapeHtml(session.action || "?")})</option><option value="continue">Continue current session</option><option value="new">Start a new session</option></select></label>
@@ -730,7 +738,7 @@ async function populateGateUpnext(gate, state) {
     : "";
   const fillProfiles = (preferredId = null) => {
     const matching = candidateProfiles.filter((candidate) => candidate.provider === providerSelect.value);
-    profileSelect.innerHTML = matching.map((candidate) => `<option value="${escapeHtml(candidate.id)}">${escapeHtml(candidate.label || candidate.id)}</option>`).join("");
+    profileSelect.innerHTML = matching.map((candidate) => `<option value="${escapeHtml(candidate.id)}">${escapeHtml(gateProfileLabel(candidate))}</option>`).join("");
     profileSelect.value = matching.some((candidate) => candidate.id === preferredId) ? preferredId : (matching[0]?.id || "");
   };
   const selectedProfile = () => candidateProfiles.find((candidate) => candidate.id === profileSelect.value) || candidateProfiles[0] || profile;
@@ -892,13 +900,20 @@ function configureGate(fragment, state) {
 }
 
 function humanizeReason(reason) {
-  const text = String(reason || "review required").replaceAll("_", " ");
+  const text = String(reason || "review required").replace(/[_-]+/g, " ");
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 function populateNewRun() {
+  const selectedProject = $("#new-project").value;
+  const selectedWorkflow = $("#new-workflow").value;
   $("#new-project").innerHTML = Object.entries(bootstrap.projects).map(([id, project]) => `<option value="${escapeHtml(id)}">${escapeHtml(id)} · ${escapeHtml(project.root)}</option>`).join("");
   $("#new-workflow").innerHTML = Object.entries(bootstrap.workflows).map(([id, workflow]) => `<option value="${escapeHtml(id)}">${escapeHtml(workflow.label)}</option>`).join("");
+  if (bootstrap.projects?.[selectedProject]) $("#new-project").value = selectedProject;
+  const initialWorkflow = bootstrap.workflows?.[selectedWorkflow]
+    ? selectedWorkflow
+    : (bootstrap.workflows?.["continuous-development"] ? "continuous-development" : Object.keys(bootstrap.workflows || {})[0]);
+  if (initialWorkflow) $("#new-workflow").value = initialWorkflow;
   renderNewRunPreflight();
 }
 
@@ -970,6 +985,20 @@ function effectiveProfile(workflow, profileId) {
   const base = workflow.profiles?.[profileId] || {};
   const draft = launchOverrides.get(profileId);
   return draft ? {...base, ...draft, overridden: true} : {...base, overridden: false};
+}
+
+function preflightActorLabel(workflow, stage) {
+  const slotIndex = (workflow.session_slots || []).indexOf(stage.session_slot);
+  const actor = slotIndex >= 0 ? String.fromCharCode(65 + slotIndex) : humanizeReason(stage.session_slot);
+  return `${actor} · ${humanizeReason(stage.role)}`;
+}
+
+function preflightSessionPolicy(value) {
+  return ({
+    "new-if-missing": "new session if none",
+    "continue": "continue session",
+    "new": "new session",
+  })[value] || humanizeReason(value);
 }
 
 function concreteTarget(target) {
@@ -1053,7 +1082,7 @@ function semanticPreflightGroups(workflow) {
   const mainIds = new Set(main.map((stage) => stage.id));
   const conditional = Object.values(workflow.stages || {}).filter((stage) => branchOnlyIds.has(stage.id) || !mainIds.has(stage.id));
   const groups = [];
-  if (plan.length) groups.push({id: "plan", title: "Plan", description: "Frame the request and produce the first plan.", stages: plan});
+  if (plan.length) groups.push({id: "plan", title: "Idea generation & planning", description: "Generate options, explain the rationale, and produce the first plan.", stages: plan});
   if (planningLoop.length) {
     const policy = planningLoop.find((stage) => stage.round)?.round;
     groups.push({id: "plan-review", title: "Plan review loop", description: "Challenge the plan, adjudicate findings, and seal the approved handoff.", stages: planningLoop, loop: policy});
@@ -1095,11 +1124,11 @@ function routeProfileRow(workflow, stage, groupStages) {
   const profile = effectiveProfile(workflow, stage.profile);
   const profileStages = Object.values(workflow.stages || {}).filter((other) => other.profile === stage.profile);
   const visibleProfileStages = groupStages.filter((other) => other.profile === stage.profile);
-  const actors = [...new Set(visibleProfileStages.map((item) => `${item.session_slot} (${item.role})`))];
-  const policies = [...new Set(visibleProfileStages.map((item) => item.session_policy))];
+  const actors = [...new Set(visibleProfileStages.map((item) => preflightActorLabel(workflow, item)))];
+  const policies = [...new Set(visibleProfileStages.map((item) => preflightSessionPolicy(item.session_policy)))];
   const inCatalog = catalogModels(profile.provider).some((entry) => entry.selection_token === profile.model);
   const sharedWith = profileStages.filter((other) => other.id !== stage.id).map((other) => other.title);
-  row.innerHTML = `<div><strong>${escapeHtml(actors.join(" / "))}</strong><span>${escapeHtml(profile.provider)} · ${escapeHtml(profile.model || "provider default")} · ${escapeHtml(profile.effort || "default")} · ${escapeHtml(profile.permission || "read-only")} · ${escapeHtml(policies.join(" / "))} session</span></div><div class="route-profile-actions">${profile.overridden ? '<span class="text-status success">This run only</span>' : ""}${!inCatalog && catalogModels(profile.provider).length ? '<span class="text-status warning">Not in catalog</span>' : ""}<button type="button" class="quiet-button" data-profile-adjust>Change for this run</button></div><div class="route-step-editor" data-step-editor hidden></div>`;
+  row.innerHTML = `<div><strong>${escapeHtml(actors.join(" / "))}</strong><span>${escapeHtml(profile.provider)} · ${escapeHtml(profile.model || "provider default")} · ${escapeHtml(profile.effort || "default")} · ${escapeHtml(profile.permission || "read-only")} · ${escapeHtml(policies.join(" / "))}</span></div><div class="route-profile-actions">${profile.overridden ? '<span class="text-status success">This run only</span>' : ""}${!inCatalog && catalogModels(profile.provider).length ? '<span class="text-status warning">Not in catalog</span>' : ""}<button type="button" class="quiet-button" data-profile-adjust>Change for this run</button></div><div class="route-step-editor" data-step-editor hidden></div>`;
   $("[data-profile-adjust]", row).addEventListener("click", () => toggleStageEditor(row, workflow, stage, sharedWith));
   return row;
 }
@@ -1108,7 +1137,7 @@ function routeActionRow(workflowId, workflow, stage) {
   const row = document.createElement("li");
   row.className = "route-action-row";
   const edited = launchPromptOverrides.has(stage.prompt_file);
-  row.innerHTML = `<div class="route-action-copy"><span>${escapeHtml(stage.session_slot)} · ${escapeHtml(stage.role)}</span><strong>${escapeHtml(stage.title)}</strong><p>Produces ${escapeHtml(String(stage.artifact_type || "").replaceAll("-", " "))}. ${escapeHtml(transitionLines(workflow, stage).join(" · "))}</p></div><div class="route-action-tools">${edited ? '<span class="text-status success">Edited for this run</span>' : ""}<button type="button" class="quiet-button" data-step-instruction>Edit instruction</button></div><div class="route-step-detail" data-step-detail hidden></div>`;
+  row.innerHTML = `<div class="route-action-copy"><span>${escapeHtml(preflightActorLabel(workflow, stage))}</span><strong>${escapeHtml(stage.title)}</strong><p>Produces ${escapeHtml(String(stage.artifact_type || "").replaceAll("-", " "))}. ${escapeHtml(transitionLines(workflow, stage).join(" · "))}</p></div><div class="route-action-tools">${edited ? '<span class="text-status success">Edited for this run</span>' : ""}<button type="button" class="quiet-button" data-step-instruction>Edit instruction</button></div><div class="route-step-detail" data-step-detail hidden></div>`;
   $("[data-step-instruction]", row).addEventListener("click", () => toggleStageInstruction(row, workflowId, stage));
   return row;
 }
@@ -1121,17 +1150,26 @@ function routeGroupRow(workflowId, workflow, group) {
     const counter = String(group.loop.counter);
     const baseCap = Number(group.loop.cap);
     const shownCap = launchRoundOverrides.has(counter) ? launchRoundOverrides.get(counter) : baseCap;
-    loopControl = `<label class="route-group-loop">Up to <input type="number" data-loop-cap min="1" max="20" step="1" value="${shownCap}" aria-label="Maximum ${escapeHtml(counter)} rounds for this run"> ${escapeHtml(counter)} rounds, then pause${launchRoundOverrides.has(counter) ? ' <span class="text-status success">This run only</span>' : ""}</label>`;
+    const roundLabel = counter === "planning" ? "review rounds" : `${counter} rounds`;
+    loopControl = `<label class="route-group-loop">Up to <input type="number" data-loop-cap min="1" max="20" step="1" value="${shownCap}" aria-label="Maximum ${escapeHtml(counter)} rounds for this run"> ${escapeHtml(roundLabel)}, then pause <span class="text-status success" data-loop-override ${launchRoundOverrides.has(counter) ? "" : "hidden"}>This run only</span></label>`;
   }
   row.innerHTML = `<header class="route-group-head"><div><h4>${escapeHtml(group.title)}</h4><p>${escapeHtml(group.description)}</p></div>${loopControl}</header><div class="route-group-profiles"></div><ul class="route-action-list"></ul>${group.conditional?.length ? '<section class="route-conditional"><strong>If you redirect or request changes</strong><ul></ul></section>' : ""}`;
   if (group.loop) {
     const counter = String(group.loop.counter);
     const baseCap = Number(group.loop.cap);
-    $("[data-loop-cap]", row).addEventListener("change", (event) => {
-      const cap = Math.min(20, Math.max(1, Math.round(Number(event.target.value) || baseCap)));
-      if (cap === baseCap) launchRoundOverrides.delete(counter);
-      else launchRoundOverrides.set(counter, cap);
-      renderNewRunPreflight();
+    const capInput = $("[data-loop-cap]", row);
+    const captureCap = (event) => {
+      const raw = event.target.value;
+      const cap = Number(raw);
+      const valid = raw !== "" && Number.isInteger(cap) && cap >= 1 && cap <= 20;
+      if (valid && cap === baseCap) launchRoundOverrides.delete(counter);
+      else launchRoundOverrides.set(counter, valid ? cap : raw);
+      $("[data-loop-override]", row).hidden = valid && cap === baseCap;
+      return valid;
+    };
+    capInput.addEventListener("input", captureCap);
+    capInput.addEventListener("change", (event) => {
+      if (captureCap(event)) renderNewRunPreflight();
     });
   }
   const profilesRoot = $(".route-group-profiles", row);
@@ -1354,7 +1392,9 @@ function catalogSelection(root) {
 function renderSettings() {
   renderCatalogStatus();
   const workflows = bootstrap.workflows;
-  settingsWorkflowId = workflows[settingsWorkflowId] ? settingsWorkflowId : Object.keys(workflows)[0];
+  settingsWorkflowId = workflows[settingsWorkflowId]
+    ? settingsWorkflowId
+    : (workflows["continuous-development"] ? "continuous-development" : Object.keys(workflows)[0]);
   const selector = $("#settings-workflow");
   selector.innerHTML = Object.entries(workflows).map(([id, workflow]) => `<option value="${escapeHtml(id)}">${escapeHtml(workflow.label)}</option>`).join("");
   selector.value = settingsWorkflowId;
@@ -1431,6 +1471,8 @@ function showProjectForm() {
 async function createRun() {
   const request = $("#new-request").value.trim();
   if (!request) { $("#new-request").focus(); return; }
+  const invalidControl = $("#new-run-preflight input:invalid");
+  if (invalidControl) { invalidControl.reportValidity(); invalidControl.focus(); return; }
   const button = $("#create-run");
   button.disabled = true;
   showNewRunError("");
@@ -1452,6 +1494,8 @@ async function saveWorkflowAs() {
   const nameInput = $("#workflow-saveas-name");
   const label = nameInput.value.trim();
   if (!label) { nameInput.focus(); return; }
+  const invalidControl = $("#new-run-preflight input:invalid");
+  if (invalidControl) { invalidControl.reportValidity(); invalidControl.focus(); return; }
   const id = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
   const button = $("#workflow-saveas-confirm");
   if (!id) { showNewRunError("Workflow names need at least one letter or digit."); return; }

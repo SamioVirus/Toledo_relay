@@ -229,7 +229,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .route-step-editor .editor-actions button { padding:5px 9px; font-size:10px; }
 .route-action-tools { display:flex; align-items:center; gap:8px; justify-self:end; }
 .route-action-tools button { padding:5px 8px; font-size:10px; }
-.route-group-loop input[type="number"] { width:52px; padding:4px 5px; color:var(--ink); background:#09131e; border:1px solid #4e4630; border-radius:7px; font:600 11px ui-monospace,Consolas,monospace; text-align:center; }
+.route-group-loop input[type="number"] { width:56px; min-height:30px; padding:4px 5px; color:var(--ink); background:#09131e; border:1px solid #4e4630; border-radius:7px; font:600 11px ui-monospace,Consolas,monospace; text-align:center; }
+.route-profile-actions button,.route-action-tools button { min-height:30px; }
 .instruction-meta { margin:0 0 7px; color:var(--faint); font:9px/1.5 ui-monospace,Consolas,monospace; overflow-wrap:anywhere; }
 .route-step-detail textarea { width:100%; min-height:220px; resize:vertical; color:#c6d2e0; background:#0a141f; border:1px solid #26384c; border-radius:8px; padding:10px; font:10px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; }
 .route-step-detail .editor-actions { display:flex; gap:6px; justify-content:flex-end; margin-top:7px; }

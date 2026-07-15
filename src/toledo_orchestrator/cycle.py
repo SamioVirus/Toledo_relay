@@ -3142,6 +3142,7 @@ class CycleOrchestrator:
             profile_value["effort"] = effort.strip()
         if model is not None or effort is not None:
             profile_value["custom"] = bool(custom)
+            profile_value["label"] = f"{profile_value['model']} · {profile_value['effort']}"
         # A populated catalog is authoritative for the ordinary picker path.
         # Discovery failure/staleness remains a warning rather than a run
         # blocker, and the deliberate custom escape hatch records its status.

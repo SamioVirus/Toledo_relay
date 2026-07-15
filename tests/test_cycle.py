@@ -834,6 +834,7 @@ def test_run_profiles_are_snapshotted_and_explicit_override_is_recorded(tmp_path
     )
     assert state["next_turn_override"]["profile_value"]["model"] == "gpt-one-turn"
     assert state["next_turn_override"]["profile_value"]["effort"] == "medium"
+    assert state["next_turn_override"]["profile_value"]["label"] == "gpt-one-turn · medium"
     app_override.run_to_stop(run_override)
     assert codex_override.invocations[0]["model"] == "gpt-one-turn"
     assert codex_override.invocations[0]["reasoning"] == "medium"
