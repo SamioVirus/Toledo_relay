@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -183,6 +184,8 @@ class ProviderResult:
     observation_source: str | None = None
     observation_error: str | None = None
     session_action: str = "new"
+    reasoning_observation_source: str | None = None
+    reasoning_observation_error: str | None = None
 
     @property
     def text(self) -> str:
@@ -268,6 +271,61 @@ class ProviderAdapter:
             return b"", str(error).encode("utf-8", errors="replace"), 127, int((time.monotonic() - started) * 1000)
 
 
+_CLAUDE_STOP_EFFORT_CAPTURE_SCRIPT = """\
+from __future__ import annotations
+
+import json
+import sys
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+        if payload.get("hook_event_name") != "Stop":
+            return
+        record = {
+            "hook_event_name": payload.get("hook_event_name"),
+            "session_id": payload.get("session_id"),
+            "prompt_id": payload.get("prompt_id"),
+            "effort": payload.get("effort"),
+        }
+        with open(sys.argv[1], "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\\n")
+    except Exception:
+        # Observation must never block or alter the provider turn.
+        return
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def _observe_claude_stop_effort(capture_path: Path, session_id: str | None) -> tuple[str | None, str | None, str | None]:
+    """Read the last Stop event matching the Claude result session."""
+    if not session_id:
+        return None, None, "Claude result did not include a session id for Stop-hook correlation"
+    try:
+        lines = capture_path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        return None, None, f"Claude Stop-hook effort capture unavailable: {error}"
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("hook_event_name") != "Stop" or str(event.get("session_id") or "") != session_id:
+            continue
+        effort = event.get("effort")
+        level = effort.get("level") if isinstance(effort, dict) else None
+        if isinstance(level, str) and level in {"low", "medium", "high", "xhigh", "max"}:
+            return level, "claude-stop-hook", None
+        return None, None, "matching Claude Stop hook did not expose a supported effort level"
+    return None, None, "no Claude Stop-hook effort event matched the provider session"
+
+
 class CodexAdapter(ProviderAdapter):
     provider = "codex"
 
@@ -300,7 +358,7 @@ class CodexAdapter(ProviderAdapter):
         common: list[str] = ["-c", 'approval_policy="never"', "--skip-git-repo-check", "--json"]
         if model != "provider-default":
             common.extend(["-m", model])
-        if reasoning != "provider-default":
+        if reasoning not in {"provider-default", "default"}:
             common.extend(["-c", f"model_reasoning_effort={json.dumps(reasoning)}"])
         if session_action == "new":
             command = [executable, "exec", "--sandbox", permission, *common, "-"]
@@ -381,15 +439,110 @@ class ClaudeAdapter(ProviderAdapter):
         session_id: str | None = None,
         timeout: int | None = None,
     ) -> ProviderResult:
+        return self._invoke_configured(
+            route, prompt, working_directory,
+            model=model,
+            reasoning=reasoning,
+            permission=permission,
+            session_action=session_action,
+            session_id=session_id,
+            timeout=timeout,
+        )
+
+    def invoke_configured_with_effort_observation(
+        self,
+        route: str,
+        prompt: bytes,
+        working_directory: Path,
+        *,
+        model: str = "provider-default",
+        reasoning: str = "provider-default",
+        permission: str = "read-only",
+        session_action: str = "new",
+        session_id: str | None = None,
+        timeout: int | None = None,
+    ) -> ProviderResult:
+        """Invoke Claude with a temporary Stop hook that observes effective effort.
+
+        Claude Code 2.1.196+ includes the active (and, when applicable,
+        downgraded) effort level in Stop-hook input.  A run-scoped exec-form
+        Python hook records only that typed metadata; it never records prompts,
+        responses, or transcript contents.  The temporary settings and capture
+        files are removed immediately after the invocation.
+        """
+        if reasoning in {"provider-default", "default"}:
+            return self.invoke_configured(
+                route, prompt, working_directory,
+                model=model,
+                reasoning=reasoning,
+                permission=permission,
+                session_action=session_action,
+                session_id=session_id,
+                timeout=timeout,
+            )
+        with tempfile.TemporaryDirectory(prefix="toledo-claude-effort-") as temporary:
+            temporary_dir = Path(temporary)
+            capture_path = temporary_dir / "stop-events.jsonl"
+            script_path = temporary_dir / "capture_stop_effort.py"
+            settings_path = temporary_dir / "settings.json"
+            script_path.write_text(_CLAUDE_STOP_EFFORT_CAPTURE_SCRIPT, encoding="utf-8")
+            settings = {
+                "hooks": {
+                    "Stop": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": sys.executable,
+                            "args": [str(script_path), str(capture_path)],
+                            "timeout": 5,
+                        }],
+                    }],
+                },
+            }
+            settings_path.write_text(json.dumps(settings, ensure_ascii=False), encoding="utf-8")
+            result = self._invoke_configured(
+                route, prompt, working_directory,
+                model=model,
+                reasoning=reasoning,
+                permission=permission,
+                session_action=session_action,
+                session_id=session_id,
+                timeout=timeout,
+                settings_path=settings_path,
+            )
+            observed, source, error = _observe_claude_stop_effort(capture_path, result.session_id)
+            result.observed_reasoning = observed or result.observed_reasoning
+            result.reasoning_observation_source = source or result.reasoning_observation_source
+            result.reasoning_observation_error = None if result.observed_reasoning else error
+            return result
+
+    def _invoke_configured(
+        self,
+        route: str,
+        prompt: bytes,
+        working_directory: Path,
+        *,
+        model: str,
+        reasoning: str,
+        permission: str,
+        session_action: str,
+        session_id: str | None,
+        timeout: int | None,
+        settings_path: Path | None = None,
+    ) -> ProviderResult:
         if session_action not in {"new", "continue"}:
             raise ValueError(f"unsupported Claude session action: {session_action}")
         if session_action == "continue" and not session_id:
             raise ValueError("continuing a Claude session requires a session id")
         mode = "plan" if permission == "read-only" else "acceptEdits"
         command = [self.executable_path(), "-p", "--output-format", "json", "--permission-mode", mode]
+        if settings_path is not None:
+            command.extend(["--settings", str(settings_path)])
         if model != "provider-default":
             command.extend(["--model", model])
-        if reasoning != "provider-default":
+        # "default" marks models with no documented effort control (Haiku 4.5
+        # per the official effort docs); passing --effort there would claim a
+        # capability the model does not advertise.
+        if reasoning not in {"provider-default", "default"}:
             command.extend(["--effort", reasoning])
         if session_action == "continue":
             command.extend(["--resume", str(session_id)])
@@ -513,10 +666,17 @@ def parse_claude_result(route: str, stdout: bytes, stderr: bytes = b"", exit_cod
     response = None
     model_usage: dict[str, Any] = {}
     observation_source = None
+    observed_reasoning = None
+    reasoning_observation_source = None
     try:
         envelope = json.loads(stdout.decode("utf-8"))
         session_id = envelope.get("session_id")
         observed_model = envelope.get("model")
+        for key in ("effective_effort", "effort", "effortLevel"):
+            if isinstance(envelope.get(key), str) and envelope[key].strip():
+                observed_reasoning = envelope[key].strip()
+                reasoning_observation_source = "claude-result-envelope"
+                break
         if isinstance(envelope.get("modelUsage"), dict):
             model_usage = dict(envelope["modelUsage"])
             observation_source = "claude-modelUsage"
@@ -541,6 +701,8 @@ def parse_claude_result(route: str, stdout: bytes, stderr: bytes = b"", exit_cod
     return ProviderResult(
         "claude", route, stdout, stderr, effective_exit, elapsed_ms, observed_model, session_id,
         usage, provider_error, response, model_usage=model_usage, observation_source=observation_source,
+        observed_reasoning=observed_reasoning,
+        reasoning_observation_source=reasoning_observation_source,
         observation_error=None if observed_model or model_usage else "Claude result did not expose model usage",
     )
 

@@ -27,6 +27,8 @@ from .core import (
     extract_directive,
     extract_self_caption,
     has_substantive_work,
+    parse_claude_result,
+    parse_codex_result,
     read_json,
     result_text,
     sha256,
@@ -501,16 +503,29 @@ class CycleOrchestrator:
         for turn in state.get("turns", []):
             for file_key, hash_key in (
                 ("prompt_file", "prompt_sha256"),
+                ("response_file", "response_sha256"),
                 ("output_file", "output_sha256"),
                 ("raw_file", "raw_sha256"),
                 ("stderr_file", "stderr_sha256"),
                 ("direction_file", "direction_sha256"),
+                ("steer_note_file", "steer_note_sha256"),
+                ("stance_override_file", "stance_override_sha256"),
             ):
                 if turn.get(file_key) and f"turns/{turn.get(file_key)}" == normalized:
-                    return str(turn.get(hash_key))
+                    digest = turn.get(hash_key)
+                    return str(digest) if isinstance(digest, str) and digest else None
             if f"turns/{turn.get('id')}.json" == normalized:
-                return str(turn.get("metadata_sha256"))
-        for container in (state.get("current_implementation_evidence"), state.get("validations")):
+                digest = turn.get("metadata_sha256")
+                return str(digest) if isinstance(digest, str) and digest else None
+        for event in state.get("events", []):
+            if event.get("id") and f"events/{event['id']}.json" == normalized:
+                return str(event.get("sha256"))
+        for container in (
+            state.get("current_implementation_evidence"),
+            state.get("validations"),
+            state.get("baseline_validations"),
+            state.get("pending_baseline_acceptance"),
+        ):
             found = self._nested_path_hash(container, normalized)
             if found:
                 return found
@@ -751,10 +766,12 @@ class CycleOrchestrator:
         turn_id = f"turn.{number:04d}"
         turns = self._run_dir(state["run_id"]) / "turns"
         prompt_name = f"{turn_id}.prompt.md"
+        response_name = f"{turn_id}.response.md"
         raw_name = f"{turn_id}.output.raw"
         stderr_name = f"{turn_id}.stderr.raw"
         text_name = f"{turn_id}.output.md"
         prompt_hash = atomic_write(turns / prompt_name, prompt)
+        response_hash = write_text(turns / response_name, result_text(result))
         raw_hash = atomic_write(turns / raw_name, result.stdout)
         stderr_hash = atomic_write(turns / stderr_name, result.stderr)
         output = result_text(result)
@@ -805,6 +822,7 @@ class CycleOrchestrator:
             "profile_label": profile.label,
             "configured_model": profile.model,
             "configured_reasoning": profile.effort,
+            "custom_selection": profile.custom,
             "observed_model": result.observed_model,
             "observed_reasoning": result.observed_reasoning,
             "observation_source": result.observation_source,
@@ -818,6 +836,7 @@ class CycleOrchestrator:
             "session_id": result.session_id,
             "session_promoted": session_promotable,
             "prompt_file": prompt_name,
+            "response_file": response_name,
             "interstitial_file": interstitial_file,
             "interstitial_sha256": interstitial_sha256,
             "direction_file": direction_name,
@@ -826,6 +845,7 @@ class CycleOrchestrator:
             "raw_file": raw_name,
             "stderr_file": stderr_name,
             "prompt_sha256": prompt_hash,
+            "response_sha256": response_hash,
             "output_sha256": output_hash,
             "raw_sha256": raw_hash,
             "stderr_sha256": stderr_hash,
@@ -1253,6 +1273,12 @@ class CycleOrchestrator:
             state["status"] = "paused"
             state["pending_human_decision"] = "provider_invocation_failed"
             state["errors"].append(f"{stage.id}:exit:{result.exit_code}")
+            # A quota/network failure must not silently fall back to the route
+            # default on Retry. Keep the exact explicit model/effort/profile
+            # the operator chose until a successful turn consumes it or they
+            # deliberately replace it at the retry gate.
+            if override:
+                state["next_turn_override"] = override
             self._save(run_id, state)
             return state
         if not result.session_id:
@@ -1465,6 +1491,100 @@ class CycleOrchestrator:
             ],
         }
 
+    def _steer_availability(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Describe whether Steer can truthfully continue the current artifact."""
+        if state.get("status") != "paused":
+            return {"available": False, "reason": "run is not paused"}
+        if state.get("inflight") or state.get("validation_inflight"):
+            return {"available": False, "reason": "an operation is already active"}
+        pending_controls = (
+            "pending_validation",
+            "pending_completion",
+            "pending_commit",
+            "pending_round_extension",
+            "pending_baseline_acceptance",
+        )
+        if any(state.get(key) for key in pending_controls):
+            return {
+                "available": False,
+                "reason": "finish the pending deterministic decision before revising a provider artifact",
+            }
+        pending_reason = state.get("pending_human_decision")
+        if pending_reason not in {"operator_step", "provider_requested_human"}:
+            return {
+                "available": False,
+                "reason": f"resolve {pending_reason or 'the current control gate'} before revising a provider artifact",
+            }
+        stage_id = state.get("current_stage")
+        if not stage_id:
+            return {"available": False, "reason": "run has no current stage"}
+        workflow = self._workflow(state)
+        stage = workflow.stages.get(str(stage_id))
+        if stage is None:
+            return {"available": False, "reason": f"current stage is unknown: {stage_id}"}
+        slot = self._cycle(state).get("sessions", {}).get(stage.session_slot)
+        if not isinstance(slot, dict) or not slot.get("active_session_id"):
+            return {
+                "available": False,
+                "reason": f"current stage {stage.id} has no active {stage.session_slot} provider session",
+                "stage": stage.id,
+            }
+        latest = next(
+            (
+                turn
+                for turn in reversed(state.get("turns", []))
+                if turn.get("stage") == stage.id
+                and turn.get("session_slot") == stage.session_slot
+                and not turn.get("correction")
+            ),
+            None,
+        )
+        if latest is None:
+            return {
+                "available": False,
+                "reason": f"current stage {stage.id} has no artifact to replace",
+                "stage": stage.id,
+            }
+        active_session_id = str(slot["active_session_id"])
+        if str(latest.get("session_id") or "") != active_session_id:
+            return {
+                "available": False,
+                "reason": "the latest current-stage artifact is not bound to the active provider session",
+                "stage": stage.id,
+                "turn_id": latest.get("id"),
+            }
+        if str(latest.get("provider") or "") != str(slot.get("provider") or ""):
+            return {
+                "available": False,
+                "reason": "the current-stage artifact provider does not match the active session",
+                "stage": stage.id,
+                "turn_id": latest.get("id"),
+            }
+        if str(latest.get("permission") or "") != "read-only":
+            return {
+                "available": False,
+                "reason": "Steer is limited to read-only artifacts; use the workflow repair path for workspace changes",
+                "stage": stage.id,
+                "turn_id": latest.get("id"),
+            }
+        return {
+            "available": True,
+            "reason": None,
+            "stage": stage.id,
+            "stage_title": stage.title,
+            "turn_id": latest.get("id"),
+            "turn_title": latest.get("title") or stage.title,
+            "provider": latest.get("provider"),
+            "model": latest.get("configured_model"),
+            "effort": latest.get("configured_reasoning"),
+            "session_slot": stage.session_slot,
+            "session_label": latest.get("session_label") or slot.get("label"),
+            "session_id": active_session_id,
+        }
+
+    def steer_availability(self, run_id: str) -> dict[str, Any]:
+        return self._steer_availability(self.state(run_id))
+
     def next_turn_preview(self, run_id: str) -> dict[str, Any]:
         """Read-only contract describing exactly what the next provider turn will do.
 
@@ -1473,18 +1593,19 @@ class CycleOrchestrator:
         show the truth instead of a generic question.
         """
         state = self.state(run_id)
+        steer = self._steer_availability(state) if state.get("schema_version") == "toledo_orchestrator.run.v2" else {"available": False, "reason": "legacy run schema"}
         if state.get("schema_version") != "toledo_orchestrator.run.v2":
-            return {"available": False, "reason": "legacy run schema"}
+            return {"available": False, "reason": "legacy run schema", "steer": steer}
         stage_id = state.get("current_stage")
         pending = state.get("pending_human_decision")
         if not stage_id or state.get("inflight") or state.get("status") in {"complete", "cancelled", "failed", "stopped"}:
-            return {"available": False, "reason": pending or state.get("status")}
+            return {"available": False, "reason": pending or state.get("status"), "steer": steer}
         if pending in {"validation_execution_approval", "validation_receipt_required", "unknown_validation_execution"}:
-            return {"available": False, "reason": pending}
+            return {"available": False, "reason": pending, "steer": steer}
         workflow = self._workflow(state)
         stage = workflow.stages.get(str(stage_id))
         if stage is None:
-            return {"available": False, "reason": f"unknown stage {stage_id}"}
+            return {"available": False, "reason": f"unknown stage {stage_id}", "steer": steer}
         override = state.get("next_turn_override")
         override_applies = isinstance(override, dict) and override.get("target_stage") == stage.id
         active_override = override if override_applies else None
@@ -1508,12 +1629,15 @@ class CycleOrchestrator:
         session_label = slot.get("label") or _session_label(workflow, int(state["cycle"]), stage.session_slot)
         generation = int(slot.get("active_generation") or 0)
         direction_text = self._compose_direction_text(state, stage)
+        stance_override = active_override.get("stance") if active_override else None
+        stance_text = CURATED_STANCES.get(str(stance_override)) if stance_override else None
         prompt_text: str | None = None
         prompt_error: str | None = None
         try:
             prompt_text = self._prompt(
                 state, stage, profile, action, str(session_label),
                 direction_text=direction_text or None,
+                stance_text=stance_text,
             ).decode("utf-8")
         except (OSError, ValueError) as error:
             prompt_error = f"{type(error).__name__}: {error}"
@@ -1569,6 +1693,12 @@ class CycleOrchestrator:
                 "policy": stage.session_policy,
                 "generation": generation,
                 "overridden": bool(action_override),
+                "has_active_session": bool(slot.get("active_session_id")),
+                "active_provider": slot.get("provider"),
+            },
+            "override": {
+                "active": bool(active_override),
+                "stance": stance_override,
             },
             "inputs": inputs,
             "rounds": rounds,
@@ -1579,6 +1709,7 @@ class CycleOrchestrator:
             "direction_preview": direction_text or None,
             "prompt": prompt_text,
             "prompt_error": prompt_error,
+            "steer": steer,
         }
 
     @_locked
@@ -2369,44 +2500,308 @@ class CycleOrchestrator:
     def artifact(self, run_id: str, relative: str) -> bytes:
         return self._artifact_bytes(self.state(run_id), relative)
 
-    def export_run(self, run_id: str, *, plain_text: bool = False) -> bytes:
-        """Create a local, chronological evidence export without raw envelopes."""
-        state = self.state(run_id)
-        run_dir = self._run_dir(run_id)
-        lines = [
-            f"# Toledo run {state['run_id']}", "",
-            f"- Project: {state.get('project', '')}",
-            f"- Workflow: {state.get('workflow', '')}",
-            f"- Revision: {state.get('working_revision') or state.get('source_revision') or ''}",
-            f"- Status: {state.get('status', '')}", "",
-            "This is local evidence. Raw provider stdout/stderr envelopes are excluded.", "",
-        ]
-        for turn in state.get("turns", []):
-            lines.extend([
-                f"## {turn.get('id', 'turn')} — {turn.get('title') or turn.get('stage') or turn.get('route', '')}",
-                f"Provider: {turn.get('provider', '')} | model: {turn.get('observed_model') or turn.get('configured_model') or ''} | effort: {turn.get('observed_reasoning') or turn.get('configured_reasoning') or ''}",
-            ])
-            usage = turn.get("usage") or {}
-            if isinstance(usage, dict) and usage.get("total_cost_usd") is not None:
-                lines.append(f"Observed cost: ${usage['total_cost_usd']}")
-            for label, key in (("Direction", "direction_file"), ("Output", "output_file")):
-                name = turn.get(key)
-                if not name:
-                    continue
-                try:
-                    text = (run_dir / "turns" / str(name)).read_text(encoding="utf-8")
-                except OSError:
-                    continue
-                lines.extend([f"### {label}", work_product_text(text).strip(), ""])
-        for decision in state.get("decisions", []):
-            lines.append(f"## Decision: {decision.get('choice', '')}")
-            if decision.get("reason"):
-                lines.append(f"Reason: {decision['reason']}")
-        lines.extend(["## Validation summary", json.dumps(state.get("validations", {}), ensure_ascii=False, indent=2, sort_keys=True), ""])
-        text = "\n".join(lines)
+    @staticmethod
+    def _export_heading(lines: list[str], title: str, level: int, plain_text: bool) -> None:
         if plain_text:
-            text = text.replace("# ", "").replace("## ", "").replace("### ", "")
-        return text.encode("utf-8")
+            lines.extend([title, ("=" if level <= 2 else "-") * max(12, min(len(title), 88))])
+        else:
+            lines.append(f"{'#' * level} {title}")
+
+    def _export_artifact_text(self, state: dict[str, Any], relative: str) -> str:
+        """Read registered evidence without the prompt transport size limit."""
+        try:
+            data = self._artifact_bytes(state, relative)
+        except ValueError as error:
+            # Early v2/manual fixtures did not register every derivative file.
+            # Preserve export compatibility, but retain the same containment
+            # boundary and never silently bypass a recorded hash mismatch.
+            if "not registered in the run manifest" not in str(error):
+                return f"[Evidence unavailable: {type(error).__name__}: {error}]"
+            run_dir = self._run_dir(state["run_id"]).resolve()
+            path = (run_dir / str(relative).replace("\\", "/")).resolve()
+            if path != run_dir and run_dir not in path.parents:
+                return "[Evidence unavailable: artifact path escapes run directory]"
+            try:
+                data = path.read_bytes()
+            except OSError as read_error:
+                return f"[Evidence unavailable: {type(read_error).__name__}: {read_error}]"
+        except OSError as error:
+            return f"[Evidence unavailable: {type(error).__name__}: {error}]"
+        try:
+            return decode_text_artifact(data, relative)
+        except ValueError:
+            return data.decode("utf-8", errors="replace")
+
+    def _export_redacted_value(self, state: dict[str, Any], value: Any) -> Any:
+        """Redact state-only secrets and host paths; conversation bytes stay exact."""
+        secret_fragments = ("secret", "token", "password", "credential", "authorization", "api_key", "apikey")
+        if isinstance(value, dict):
+            redacted: dict[str, Any] = {}
+            for key, child in value.items():
+                lowered = str(key).lower()
+                if lowered == "absolute_path":
+                    continue
+                if any(fragment in lowered for fragment in secret_fragments):
+                    redacted[str(key)] = "[redacted]"
+                else:
+                    redacted[str(key)] = self._export_redacted_value(state, child)
+            return redacted
+        if isinstance(value, list):
+            return [self._export_redacted_value(state, child) for child in value]
+        if isinstance(value, str):
+            rendered = value
+            roots = (
+                (str(state.get("execution_worktree") or ""), "<worktree>"),
+                (str(state.get("project_root") or ""), "<project>"),
+                (str(self.runtime_dir), "<runtime>"),
+                (str(Path.home()), "<home>"),
+            )
+            for root, replacement in roots:
+                if root:
+                    rendered = rendered.replace(root, replacement)
+            return rendered
+        return value
+
+    def _export_turn_response(self, state: dict[str, Any], turn: dict[str, Any]) -> tuple[str, str]:
+        response_file = turn.get("response_file")
+        if response_file:
+            return self._export_artifact_text(state, f"turns/{response_file}"), "exact stored provider response"
+
+        # Compatibility for runs sealed before response.md became a first-class
+        # artifact. Reparse the hash-bound provider envelope; never substitute a
+        # caption or preview for the conversation.
+        raw_file = turn.get("raw_file")
+        if raw_file:
+            try:
+                raw = self._artifact_bytes(state, f"turns/{raw_file}")
+                stderr = (
+                    self._artifact_bytes(state, f"turns/{turn['stderr_file']}")
+                    if turn.get("stderr_file")
+                    else b""
+                )
+                provider = str(turn.get("provider") or "")
+                if provider == "codex":
+                    parsed = parse_codex_result(str(turn.get("stage") or "export"), raw, stderr)
+                elif provider == "claude":
+                    parsed = parse_claude_result(str(turn.get("stage") or "export"), raw, stderr)
+                else:
+                    parsed = ProviderResult(provider, "export", raw, stderr)
+                response = result_text(parsed)
+                if response:
+                    return response, "exact response reconstructed from the sealed provider envelope"
+                # Fixture/custom adapters may seal their response directly in
+                # stdout rather than a provider JSON envelope.
+                decoded = raw.decode("utf-8", errors="replace")
+                if decoded.strip() and not decoded.lstrip().startswith(("{", "[")):
+                    return decoded, "exact response reconstructed from sealed stdout"
+            except (OSError, ValueError, KeyError):
+                pass
+        output_file = turn.get("output_file")
+        if output_file:
+            return (
+                work_product_text(self._export_artifact_text(state, f"turns/{output_file}")),
+                "legacy derivative work product; exact provider response was not sealed",
+            )
+        return "[No provider response artifact was recorded.]", "response unavailable"
+
+    def _export_validation_set(
+        self,
+        lines: list[str],
+        state: dict[str, Any],
+        title: str,
+        values: dict[str, Any],
+        plain_text: bool,
+        include_diagnostics: bool,
+    ) -> None:
+        if not values:
+            return
+        self._export_heading(lines, title, 2, plain_text)
+        lines.append("")
+        for validation_id, raw_record in values.items():
+            record = raw_record if isinstance(raw_record, dict) else {"value": raw_record}
+            self._export_heading(lines, f"Validation — {validation_id}", 3, plain_text)
+            metadata = {key: value for key, value in record.items() if key not in {"stdout", "stderr"}}
+            lines.extend([
+                json.dumps(self._export_redacted_value(state, metadata), ensure_ascii=False, indent=2, sort_keys=True),
+                "",
+            ])
+            if not include_diagnostics:
+                continue
+            for stream in ("stdout", "stderr"):
+                stream_record = record.get(stream)
+                if not isinstance(stream_record, dict) or not stream_record.get("path"):
+                    continue
+                text = self._export_artifact_text(state, str(stream_record["path"]))
+                self._export_heading(lines, f"{stream} (exact sealed text)", 4, plain_text)
+                lines.extend([text, ""])
+
+    def export_run(
+        self,
+        run_id: str,
+        *,
+        plain_text: bool = False,
+        include_prompts: bool = True,
+        include_diagnostics: bool = False,
+    ) -> bytes:
+        """Export the complete readable transcript from hash-bound evidence.
+
+        Raw provider envelopes stay excluded, but the exact readable provider
+        response extracted from each envelope is included. ``prompts=0`` omits
+        only transport prompts; requests, provider responses, directions, and
+        decisions remain present. Raw operational diagnostics require an
+        explicit opt-in because arbitrary stream text cannot be made safe by
+        key-name redaction.
+        """
+        state = self.state(run_id)
+        lines: list[str] = []
+        self._export_heading(lines, f"Toledo complete transcript — {state['run_id']}", 1, plain_text)
+        lines.extend([
+            "",
+            f"Project: {state.get('project', '')}",
+            f"Workflow: {state.get('workflow', '')}",
+            f"Source revision: {state.get('source_revision') or ''}",
+            f"Working revision: {state.get('working_revision') or ''}",
+            f"Status: {state.get('status', '')}",
+            f"Transport prompts: {'included' if include_prompts else 'intentionally omitted by prompts=0'}",
+            f"Diagnostics: {'included by explicit request; may contain sensitive raw text' if include_diagnostics else 'excluded (request diagnostics=1 explicitly to include raw operational evidence)'}",
+            "",
+            "Local conversation export. Exact readable prompts/responses and operator input are included. Raw provider envelopes are excluded. Diagnostic streams and event payloads are excluded unless explicitly requested because arbitrary stream text may contain secrets.",
+            "",
+        ])
+
+        turns = list(state.get("turns", []))
+        decisions = list(state.get("decisions", []))
+        cycles = list(state.get("cycles", [])) or [{"number": 1, "request_file": None}]
+        for cycle in cycles:
+            number = int(cycle.get("number") or 1)
+            self._export_heading(lines, f"Cycle {number}", 2, plain_text)
+            lines.append("")
+            request_file = cycle.get("request_file")
+            self._export_heading(lines, "Cycle request (exact)", 3, plain_text)
+            lines.extend([
+                self._export_artifact_text(state, str(request_file)) if request_file else "[Cycle request was not recorded.]",
+                "",
+            ])
+
+            items: list[tuple[int, int, int, str, dict[str, Any]]] = []
+            for index, turn in enumerate(turns):
+                if int(turn.get("cycle") or 1) == number:
+                    turn_number = int(str(turn.get("id") or "0").split(".")[-1])
+                    items.append((turn_number, 0, index, "turn", turn))
+            for index, decision in enumerate(decisions):
+                if int(decision.get("cycle") or 1) == number:
+                    items.append((int(decision.get("after_turn") or 0), 1, index, "decision", decision))
+
+            for _, _, index, kind, item in sorted(items):
+                if kind == "decision":
+                    title = str(item.get("title") or f"Human: {item.get('choice', 'decision')}")
+                    self._export_heading(lines, f"{title} — decision {index + 1}", 3, plain_text)
+                    lines.extend([
+                        f"Choice: {item.get('choice', '')} | Gate: {item.get('reason', '')} | After turn: {item.get('after_turn', 0)}",
+                        "",
+                        self._export_artifact_text(state, str(item.get("file"))) if item.get("file") else "[Decision body was not recorded.]",
+                        "",
+                    ])
+                    continue
+
+                turn = item
+                self._export_heading(
+                    lines,
+                    f"{turn.get('id', 'turn')} — {turn.get('title') or turn.get('stage') or turn.get('route', '')}",
+                    3,
+                    plain_text,
+                )
+                observed_model = turn.get("observed_model") or turn.get("configured_model") or ""
+                observed_effort = turn.get("observed_reasoning") or turn.get("configured_reasoning") or ""
+                lines.extend([
+                    f"Provider: {turn.get('provider', '')} | model: {observed_model} | effort: {observed_effort} | session: {turn.get('session_action', '')} {turn.get('session_label', '')}",
+                    f"Exit: {turn.get('exit_code', '')} | provider error: {turn.get('provider_error') or 'none'} | elapsed: {turn.get('elapsed_ms', 0)} ms",
+                ])
+                usage = turn.get("usage") or {}
+                if isinstance(usage, dict) and usage.get("total_cost_usd") is not None:
+                    lines.append(f"Observed cost: ${usage['total_cost_usd']}")
+                lines.append("")
+                for label, key in (
+                    ("One-turn route direction (exact)", "direction_file"),
+                    ("Operator steer note (exact)", "steer_note_file"),
+                    ("One-turn stance override (exact)", "stance_override_file"),
+                ):
+                    if turn.get(key):
+                        self._export_heading(lines, label, 4, plain_text)
+                        lines.extend([self._export_artifact_text(state, f"turns/{turn[key]}"), ""])
+                if include_prompts and turn.get("prompt_file"):
+                    self._export_heading(lines, "Transport prompt (exact)", 4, plain_text)
+                    lines.extend([self._export_artifact_text(state, f"turns/{turn['prompt_file']}"), ""])
+                response, provenance = self._export_turn_response(state, turn)
+                self._export_heading(lines, f"Provider response ({provenance})", 4, plain_text)
+                lines.extend([response, ""])
+                if include_diagnostics and turn.get("stderr_file"):
+                    stderr = self._export_artifact_text(state, f"turns/{turn['stderr_file']}")
+                    if stderr:
+                        self._export_heading(lines, "Provider stderr (exact sealed text)", 4, plain_text)
+                        lines.extend([stderr, ""])
+
+        if include_diagnostics:
+            baseline = state.get("baseline_validations") or {}
+            baseline_values = baseline.get("results", {}) if isinstance(baseline, dict) else {}
+            self._export_validation_set(lines, state, "Clean-base validation", baseline_values, plain_text, True)
+            self._export_validation_set(lines, state, "Implementation validation", state.get("validations") or {}, plain_text, True)
+
+        closure_artifacts = [
+            (path, record)
+            for path, record in state.get("artifacts", {}).items()
+            if isinstance(record, dict) and record.get("type") in {"completion-receipt", "baseline-debt"}
+        ]
+        if include_diagnostics and closure_artifacts:
+            self._export_heading(lines, "Closure evidence", 2, plain_text)
+            lines.append("")
+            for path, record in sorted(closure_artifacts, key=lambda value: (int(value[1].get("cycle") or 0), value[0])):
+                self._export_heading(lines, f"{record.get('type')} — {path}", 3, plain_text)
+                raw = self._export_artifact_text(state, path)
+                try:
+                    rendered: Any = json.loads(raw)
+                except json.JSONDecodeError:
+                    rendered = raw
+                if not isinstance(rendered, str):
+                    rendered = json.dumps(self._export_redacted_value(state, rendered), ensure_ascii=False, indent=2, sort_keys=True)
+                lines.extend([rendered, ""])
+
+        if include_diagnostics and state.get("events"):
+            self._export_heading(lines, "Lifecycle event log (chronological)", 2, plain_text)
+            lines.append("")
+            for event in state["events"]:
+                event_id = str(event.get("id") or "")
+                raw = self._export_artifact_text(state, f"events/{event_id}.json")
+                try:
+                    value: Any = json.loads(raw)
+                except json.JSONDecodeError:
+                    value = {"id": event_id, "kind": event.get("kind"), "title": event.get("title"), "evidence": raw}
+                lines.append(json.dumps(self._export_redacted_value(state, value), ensure_ascii=False, sort_keys=True))
+            lines.append("")
+
+        self._export_heading(lines, "Final run state (redacted summary)", 2, plain_text)
+        final_summary = {
+            "status": state.get("status"),
+            "cycle": state.get("cycle"),
+            "current_turn": state.get("current_turn"),
+            "current_stage": state.get("current_stage"),
+            "pending_human_decision": state.get("pending_human_decision"),
+            "degraded": bool(state.get("degraded")),
+            "error_count": len(state.get("errors") or []),
+            "cycles": [
+                {
+                    key: cycle.get(key)
+                    for key in ("id", "number", "status", "start_turn", "end_turn", "completion_receipt")
+                }
+                for cycle in cycles
+            ],
+        }
+        lines.extend([
+            "",
+            json.dumps(self._export_redacted_value(state, final_summary), ensure_ascii=False, indent=2, sort_keys=True),
+            "",
+        ])
+        return "\n".join(lines).encode("utf-8")
 
     @_locked
     def attach_receipt(self, run_id: str, receipt_path: Path) -> dict[str, Any]:
@@ -2593,21 +2988,34 @@ class CycleOrchestrator:
     def steer(self, run_id: str, note: str) -> dict[str, Any]:
         """Continue a paused physical session with a replacement artifact."""
         state = self.state(run_id)
-        if state.get("status") != "paused" or state.get("inflight"):
-            raise ValueError("Steer is available only while the run is paused with no provider call active")
         note = note.strip()
         if not note:
             raise ValueError("a Steer note is required")
-        if not state.get("current_stage"):
-            raise ValueError("the run has no active stage to steer")
-        stage = self._workflow(state).stages[str(state["current_stage"])]
-        profile = self._profile(state, stage.profile)
+        availability = self._steer_availability(state)
+        if not availability.get("available"):
+            raise ValueError(f"Steer is unavailable: {availability.get('reason') or 'no active current-stage artifact'}")
+        stage = self._workflow(state).stages[str(availability["stage"])]
+        latest = next(
+            (turn for turn in state.get("turns", []) if turn.get("id") == availability.get("turn_id")),
+            None,
+        )
+        if latest is None:
+            raise ValueError("Steer is unavailable: the selected artifact is no longer present")
+        base_profile = self._profile(state, stage.profile)
+        profile = ProfileDefinition(
+            id=str(latest.get("profile") or base_profile.id),
+            label=str(latest.get("profile_label") or base_profile.label),
+            provider=str(latest.get("provider") or base_profile.provider),
+            model=str(latest.get("configured_model") or base_profile.model),
+            effort=str(latest.get("configured_reasoning") or base_profile.effort),
+            permission=str(latest.get("permission") or base_profile.permission),
+            color=base_profile.color,
+            timeout_seconds=base_profile.timeout_seconds,
+            custom=bool(base_profile.custom or latest.get("configured_model") != base_profile.model),
+        )
         slot, _, session_id = self._session(state, stage, profile, "continue")
         if not session_id:
             raise ValueError("Steer requires an active provider session")
-        latest = next((turn for turn in reversed(state.get("turns", [])) if turn.get("session_slot") == stage.session_slot and not turn.get("correction")), None)
-        if latest is None:
-            raise ValueError("Steer requires a prior artifact in the active logical session")
         latest_text = self._artifact_text(state, f"turns/{latest['output_file']}")
         prompt = (
             "Continue the existing physical provider session. Produce a complete replacement artifact, "
@@ -2624,9 +3032,21 @@ class CycleOrchestrator:
         )
         state = self.state(run_id)
         state["inflight"] = None
+        post_provider_identity_error = self._worktree_identity_error(state)
         directive = extract_directive(result_text(result)) if result.exit_code == 0 else None
         replacement = self._store_turn(state, stage, profile, slot, "continue", result, prompt, directive, steer_of=str(latest["id"]), steer_note=note)
-        if result.exit_code != 0 or result.session_id != session_id or not work_product_text(result_text(result)):
+        if post_provider_identity_error:
+            state["status"] = "paused"
+            state["pending_human_decision"] = "provider_changed_worktree_identity"
+            state["errors"].append(post_provider_identity_error)
+        elif (
+            result.exit_code != 0
+            or result.session_id != session_id
+            or not work_product_text(result_text(result))
+            or directive is None
+            or directive.conflict
+            or directive.valid_block_count != 1
+        ):
             state["status"] = "paused"
             state["pending_human_decision"] = "provider_invocation_failed"
             state["errors"].append("steer replacement was not trustworthy")
@@ -2653,20 +3073,18 @@ class CycleOrchestrator:
         if state["status"] not in {"created", "paused", "running"} or state.get("inflight"):
             raise ValueError("the next turn cannot be changed while a provider call is active or the run is terminal")
         workflow = self._workflow(state)
-        configured_workflow = self.workflows.get(str(state["workflow"]), workflow)
         if not state.get("current_stage"):
             raise ValueError("the run has no next stage")
         stage = workflow.stages[state["current_stage"]]
         if stance is not None and stance not in stage.stance_overrides:
             raise ValueError("stance override is not enabled for this workflow stage")
         selected_profile = profile or stage.profile
-        if selected_profile not in configured_workflow.profiles:
+        if selected_profile not in workflow.profiles:
             raise ValueError(f"unknown profile: {selected_profile}")
-        target_profile = (
-            configured_workflow.profiles[selected_profile]
-            if profile is not None
-            else self._profile(state, selected_profile)
-        )
+        # A run is bound to its launch-time workflow snapshot. Selecting a
+        # profile must never import later provider, permission, timeout, or
+        # label changes from mutable route defaults.
+        target_profile = self._profile(state, selected_profile)
         expected_provider = self._profile(state, stage.profile).provider
         provider_switch = target_profile.provider != expected_provider
         if provider_switch and (not stage.provider_switchable or session_action != "new"):
@@ -2676,6 +3094,12 @@ class CycleOrchestrator:
             raise ValueError("workspace-write profiles are allowed only for implementation stages")
         if session_action is not None and session_action not in {"new", "continue"}:
             raise ValueError("session action must be new or continue")
+        if session_action == "continue":
+            slot = self._cycle(state).get("sessions", {}).get(stage.session_slot) or {}
+            if not slot.get("active_session_id"):
+                raise ValueError(f"session slot {stage.session_slot} has no active session to continue")
+            if str(slot.get("provider") or "") != target_profile.provider:
+                raise ValueError("the active session provider does not match the selected profile")
         if model is not None and not model.strip():
             raise ValueError("model override cannot be empty")
         if effort is not None and not effort.strip():
@@ -2685,6 +3109,8 @@ class CycleOrchestrator:
             profile_value["model"] = model.strip()
         if effort is not None:
             profile_value["effort"] = effort.strip()
+        if model is not None or effort is not None:
+            profile_value["custom"] = bool(custom)
         # A populated catalog is authoritative for the ordinary picker path.
         # Discovery failure/staleness remains a warning rather than a run
         # blocker, and the deliberate custom escape hatch records its status.
@@ -2702,7 +3128,7 @@ class CycleOrchestrator:
             "profile_value": profile_value,
             "session_action": session_action,
             "target_stage": stage.id,
-            "custom": custom,
+            "custom": bool(profile_value.get("custom")),
             "provider_switch": provider_switch,
             "stance": stance,
         }

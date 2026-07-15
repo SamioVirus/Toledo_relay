@@ -16,6 +16,7 @@ from toledo_orchestrator.catalog import CATALOG_SCHEMA
 from toledo_orchestrator.configuration import load_configured_workflows
 from toledo_orchestrator.cycle import CycleOrchestrator
 from toledo_orchestrator.project import ProjectDefinition, ValidationDefinition
+from toledo_orchestrator.stance import CURATED_STANCES
 from toledo_orchestrator.workflow import WorkflowDefinition, load_workflows
 
 
@@ -838,6 +839,49 @@ def test_run_profiles_are_snapshotted_and_explicit_override_is_recorded(tmp_path
     assert codex_override.invocations[0]["reasoning"] == "medium"
 
 
+def test_next_turn_override_uses_run_snapshot_and_rejects_missing_continue_session(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [("planning-propose", response("human", "Plan"))])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    with pytest.raises(ValueError, match="no active session to continue"):
+        app.set_next_turn_override(run_id, session_action="continue")
+    assert codex.invocations == []
+
+    launch_profile = app.state(run_id)["workflow_snapshot"]["profiles"]["codex-planning"]
+    app.workflows["continuous-development"].profiles["codex-planning"] = replace(
+        app.workflows["continuous-development"].profiles["codex-planning"],
+        label="Changed after launch",
+        provider="claude",
+        permission="workspace-write",
+        timeout_seconds=9,
+    )
+    saved = app.set_next_turn_override(run_id, profile="codex-planning", session_action="new")
+    applied = saved["next_turn_override"]["profile_value"]
+    for key in ("label", "provider", "permission", "timeout_seconds"):
+        assert applied[key] == launch_profile[key]
+
+
+def test_custom_next_turn_selection_stays_visibly_unverified_on_preview_and_turn(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [("planning-propose", response("human", "Custom plan"))])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    saved = app.set_next_turn_override(
+        run_id,
+        model="gpt-owner-experiment",
+        effort="owner-effort",
+        session_action="new",
+        custom=True,
+    )
+    assert saved["next_turn_override"]["profile_value"]["custom"] is True
+    assert app.next_turn_preview(run_id)["profile"]["custom"] is True
+    result = app.run_to_stop(run_id)
+    assert result["turns"][-1]["custom_selection"] is True
+
+
 def test_steer_continues_same_session_and_preserves_round_accounting(tmp_path: Path, writable_project: ProjectDefinition):
     codex = SessionAdapter("codex", [
         ("planning-propose", response("human", "Initial artifact")),
@@ -847,6 +891,25 @@ def test_steer_continues_same_session_and_preserves_round_accounting(tmp_path: P
     run_id = app.create_run(b"Task", "test")
     paused = app.run_to_stop(run_id)
     before_rounds = json.loads(json.dumps(paused["cycles"][0].get("rounds", {})))
+    for pending_key in (
+        "pending_validation",
+        "pending_completion",
+        "pending_commit",
+        "pending_round_extension",
+        "pending_baseline_acceptance",
+    ):
+        guarded = app.state(run_id)
+        guarded[pending_key] = {"reason": "test"}
+        app._save(run_id, guarded)
+        assert app.steer_availability(run_id)["available"] is False
+        guarded[pending_key] = None
+        app._save(run_id, guarded)
+    guarded = app.state(run_id)
+    guarded["turns"][-1]["permission"] = "workspace-write"
+    app._save(run_id, guarded)
+    assert "read-only" in app.steer_availability(run_id)["reason"]
+    guarded["turns"][-1]["permission"] = "read-only"
+    app._save(run_id, guarded)
     result = app.steer(run_id, "Address the missing acceptance criterion.")
     replacement = result["turns"][-1]
     assert codex.invocations[-1]["session_action"] == "continue"
@@ -887,10 +950,18 @@ def test_curated_stance_override_is_opt_in_and_recorded_as_sidecar(tmp_path: Pat
     app._save(run_id, state)
     saved = app.set_next_turn_override(run_id, stance="ideas")
     assert saved["next_turn_override"]["stance"] == "ideas"
+    state_path = app._run_dir(run_id) / "run.json"
+    before_preview = state_path.read_bytes()
+    preview = app.next_turn_preview(run_id)
+    assert state_path.read_bytes() == before_preview
+    assert "# Explicit one-turn stance override" in preview["prompt"]
+    assert CURATED_STANCES["ideas"] in preview["prompt"]
+    assert preview["override"] == {"active": True, "stance": "ideas"}
     result = app.run_to_stop(run_id)
     turn = result["turns"][-1]
     assert turn["stance_override"] == "ideas" and turn["stance_override_file"]
     assert b"Explicit one-turn stance override" in codex.invocations[-1]["prompt"]
+    assert preview["prompt"].encode("utf-8") == codex.invocations[-1]["prompt"]
 
 
 def test_caption_backfill_is_opt_in_bounded_and_sidecar_only(tmp_path: Path, writable_project: ProjectDefinition):
@@ -968,6 +1039,41 @@ def test_provider_failure_retry_preserves_the_selected_profile_model_and_effort(
     assert retried["turns"][-1]["profile"] == "claude-implementation-review"
     assert retried["turns"][-1]["configured_model"] == "claude-opus-4-8"
     assert retried["turns"][-1]["configured_reasoning"] == "max"
+    assert retried["next_turn_override"] is None
+
+
+def test_failed_explicit_turn_keeps_the_same_override_visible_for_retry(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [("planning-propose", response("continue", "Initial plan"))])
+    claude = FailedOnceThenSessionAdapter(
+        "claude", [("planning-review", response("human", "Review completed"))]
+    )
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Task", "test", run_mode="step")
+    app.run_to_stop(run_id)
+    app.set_next_turn_override(
+        run_id,
+        profile="claude-implementation-review",
+        model="claude-opus-4-8",
+        effort="low",
+        session_action="new",
+    )
+
+    failed = app.continue_step(run_id)
+
+    assert failed["pending_human_decision"] == "provider_invocation_failed"
+    retained = failed["next_turn_override"]
+    assert retained["profile"] == "claude-implementation-review"
+    assert retained["profile_value"]["model"] == "claude-opus-4-8"
+    assert retained["profile_value"]["effort"] == "low"
+    preview = app.next_turn_preview(run_id)
+    assert preview["profile"]["model"] == "claude-opus-4-8"
+    assert preview["profile"]["effort"] == "low"
+
+    retried = app.decide(run_id, "yes")
+    assert claude.invocations[-1]["model"] == "claude-opus-4-8"
+    assert claude.invocations[-1]["reasoning"] == "low"
     assert retried["next_turn_override"] is None
 
 

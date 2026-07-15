@@ -305,7 +305,7 @@ def test_export_is_chronological_and_excludes_raw_envelopes(tmp_path: Path):
     })
     exported = engine.export_run(run_id).decode("utf-8")
     assert "Useful work" in exported and "Observed cost: $0.12" in exported
-    assert "orchestrator" not in exported and "stderr" in exported
+    assert "orchestrator" not in exported and "Diagnostics: excluded" in exported
 
 
 def test_background_worker_failure_is_persisted_in_run_state(tmp_path: Path):
@@ -364,6 +364,117 @@ def test_local_web_continue_forwards_optional_owner_direction(tmp_path: Path):
         while not received and time.monotonic() < deadline:
             time.sleep(0.01)
         assert received == [("run_20260712T120000Z_1234abcd", b"How about now?\r\n")]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("endpoint", ["continue", "decision"])
+def test_gate_action_persists_displayed_override_before_scheduling(
+    tmp_path: Path,
+    endpoint: str,
+):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    events: list[tuple[str, object]] = []
+
+    def set_next_turn_override(run_id: str, **values: object) -> dict[str, object]:
+        events.append(("override", {"run_id": run_id, **values}))
+        return {"run_id": run_id}
+
+    def continue_step(run_id: str, direction: bytes = b"") -> dict[str, object]:
+        events.append(("continue", direction))
+        return {"run_id": run_id}
+
+    def decide(run_id: str, choice: str, text: bytes = b"") -> dict[str, object]:
+        events.append(("decision", (choice, text)))
+        return {"run_id": run_id}
+
+    engine.set_next_turn_override = set_next_turn_override  # type: ignore[method-assign]
+    engine.continue_step = continue_step  # type: ignore[method-assign]
+    engine.decide = decide  # type: ignore[method-assign]
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    run_id = "run_20260712T120000Z_1234abcd"
+    value: dict[str, object] = {
+        "next_turn_override": {
+            "profile": "claude-planning-review",
+            "model": "claude-opus-4-8",
+            "effort": "low",
+            "session_action": "new",
+            "custom": False,
+        },
+    }
+    value.update(
+        {"direction": "Run with these settings."}
+        if endpoint == "continue"
+        else {"choice": "yes", "text": ""}
+    )
+    try:
+        status, _ = request_json(
+            base + f"/api/runs/{run_id}/{endpoint}",
+            method="POST",
+            nonce="test-nonce",
+            value=value,
+        )
+        assert status == 202
+        deadline = time.monotonic() + 5
+        while len(events) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert [event[0] for event in events] == ["override", endpoint]
+        persisted = events[0][1]
+        assert isinstance(persisted, dict)
+        assert persisted["model"] == "claude-opus-4-8"
+        assert persisted["effort"] == "low"
+        assert persisted["session_action"] == "new"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_gate_action_override_failure_schedules_no_operation(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    continued: list[str] = []
+
+    def reject_override(run_id: str, **values: object) -> dict[str, object]:
+        raise ValueError("selected effort is unavailable")
+
+    def continue_step(run_id: str, direction: bytes = b"") -> dict[str, object]:
+        continued.append(run_id)
+        return {"run_id": run_id}
+
+    engine.set_next_turn_override = reject_override  # type: ignore[method-assign]
+    engine.continue_step = continue_step  # type: ignore[method-assign]
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    run_id = "run_20260712T120000Z_1234abcd"
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as rejected:
+            request_json(
+                base + f"/api/runs/{run_id}/continue",
+                method="POST",
+                nonce="test-nonce",
+                value={
+                    "direction": "Must not run.",
+                    "next_turn_override": {
+                        "profile": "claude-planning-review",
+                        "model": "claude-opus-4-8",
+                        "effort": "not-supported",
+                        "session_action": "new",
+                    },
+                },
+            )
+        assert rejected.value.code == 400
+        assert "selected effort is unavailable" in rejected.value.read().decode("utf-8")
+        assert continued == []
+        assert workers.status(run_id) == {"active": False, "error": None}
     finally:
         server.shutdown()
         server.server_close()

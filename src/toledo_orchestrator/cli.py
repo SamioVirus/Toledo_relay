@@ -43,6 +43,22 @@ def _validation_value(raw: str) -> dict[str, str]:
     return {"id": parts[0], "environment": parts[1], "command": parts[2]}
 
 
+def _pong_case_value(raw: str) -> tuple[str, str, str]:
+    parts = tuple(part.strip() for part in raw.split(":", 2))
+    if len(parts) != 3 or not all(parts):
+        raise argparse.ArgumentTypeError("pong case must be PROVIDER:MODEL:EFFORT")
+    if parts[0] not in {"codex", "claude"}:
+        raise argparse.ArgumentTypeError("pong provider must be codex or claude")
+    return parts
+
+
+def _positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="orchestrator")
     parser.add_argument("--runtime-dir", type=Path)
@@ -97,6 +113,18 @@ def build_parser() -> argparse.ArgumentParser:
     profile_set.add_argument("--label")
     commands.add_parser("projects")
     commands.add_parser("catalog-research")
+    pong = commands.add_parser("pong")
+    pong.add_argument("--live", action="store_true")
+    pong.add_argument(
+        "--case", action="append", type=_pong_case_value, default=[],
+        metavar="PROVIDER:MODEL:EFFORT",
+        help="explicit live case; repeat for each provider call (there is no all-models default)",
+    )
+    pong.add_argument("--provider", action="append", choices=("codex", "claude"), help="keep only cases for this provider")
+    pong.add_argument("--exclude-model", action="append", default=[], help="skip an exact model id")
+    pong.add_argument("--allow-fable", action="store_true", help="allow an explicitly named Fable case; denied by default")
+    pong.add_argument("--max-calls", type=_positive_int, default=10)
+    pong.add_argument("--resume-probe", action="store_true", help="add bounded same-session model-switch probes")
     backfill = commands.add_parser("backfill-captions")
     backfill.add_argument("run_id")
     backfill.add_argument("--opt-in", action="store_true")
@@ -119,6 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
     export = commands.add_parser("export")
     export.add_argument("run_id")
     export.add_argument("--format", choices=("markdown", "text"), default="markdown")
+    export.add_argument(
+        "--include-diagnostics",
+        action="store_true",
+        help="include raw stderr, validation, closure, and event evidence; may contain sensitive text",
+    )
     cleanup = commands.add_parser("cleanup")
     cleanup.add_argument("run_id")
     cleanup.add_argument("--force", action="store_true")
@@ -170,7 +203,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "export":
             if not isinstance(engine, CycleOrchestrator):
                 raise ValueError("export currently requires a v2 run")
-            sys.stdout.buffer.write(engine.export_run(args.run_id, plain_text=args.format == "text"))
+            sys.stdout.buffer.write(
+                engine.export_run(
+                    args.run_id,
+                    plain_text=args.format == "text",
+                    include_diagnostics=args.include_diagnostics,
+                )
+            )
             return 0
         if args.command == "cleanup":
             if not isinstance(engine, CycleOrchestrator):
@@ -224,6 +263,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "catalog-research":
         from .catalog import research_catalog
         _emit(research_catalog(cycle.runtime_dir))
+        return 0
+    if args.command == "pong":
+        from .catalog import refresh_catalog, run_pong_matrix
+        matrix = [case for case in args.case if not args.provider or case[0] in set(args.provider)]
+        excluded_models = set(args.exclude_model)
+        if not args.allow_fable:
+            excluded_models.update(
+                model for provider, model, _ in matrix
+                if provider == "claude" and "fable" in model.lower()
+            )
+        report = run_pong_matrix(
+            cycle.runtime_dir, cycle.adapters,
+            live=args.live,
+            matrix=matrix,
+            excluded_models=excluded_models,
+            max_calls=args.max_calls,
+            include_resume_probe=args.resume_probe,
+        )
+        refresh_catalog(cycle.runtime_dir)
+        _emit(report)
         return 0
     if args.command == "backfill-captions":
         _emit(cycle.backfill_semantic_captions(args.run_id, opt_in=args.opt_in, limit=args.limit))

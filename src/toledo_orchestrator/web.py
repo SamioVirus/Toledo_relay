@@ -36,12 +36,18 @@ class RunWorkers:
         run_id: str,
         operation: Callable[[], object],
         on_error: Callable[[Exception], object] | None = None,
+        before_start: Callable[[], object] | None = None,
     ) -> None:
         with self._lock:
             active = self._threads.get(run_id)
             if active and active.is_alive():
                 raise ValueError("this run already has an active operation")
             self._errors.pop(run_id, None)
+            # Gate actions use this synchronous hook to validate and persist
+            # their displayed override after the worker slot is reserved but
+            # before a provider-capable thread can exist.
+            if before_start is not None:
+                before_start()
 
             def target() -> None:
                 try:
@@ -67,6 +73,38 @@ class RunWorkers:
 
 def _json_bytes(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _persist_submitted_next_turn_override(
+    engine: CycleOrchestrator,
+    run_id: str,
+    value: dict[str, Any],
+) -> None:
+    """Validate and persist a gate selection before its action is scheduled.
+
+    Run/Retry submit the displayed picker state with the action request.  This
+    synchronous boundary is deliberate: an invalid selection returns 400 and
+    no background worker (and therefore no provider invocation) is started.
+    """
+
+    override = value.get("next_turn_override")
+    if override is None:
+        return
+    if not isinstance(override, dict):
+        raise ValueError("next_turn_override must be an object")
+    engine.set_next_turn_override(
+        run_id,
+        profile=str(override["profile"]) if override.get("profile") else None,
+        model=str(override["model"]) if override.get("model") else None,
+        effort=str(override["effort"]) if override.get("effort") else None,
+        session_action=(
+            str(override["session_action"])
+            if override.get("session_action")
+            else None
+        ),
+        custom=bool(override.get("custom")),
+        stance=str(override["stance"]) if override.get("stance") else None,
+    )
 
 
 def _run_summaries(engine: CycleOrchestrator, workers: RunWorkers) -> list[dict[str, object]]:
@@ -232,6 +270,11 @@ def make_handler(
                     run_id = parts[2]
                     state = _timeline_compatible(engine.state(run_id))
                     state["state_caption"] = state_caption(state)
+                    state["steer"] = (
+                        engine.steer_availability(run_id)
+                        if state.get("schema_version") == "toledo_orchestrator.run.v2"
+                        else {"available": False, "reason": "legacy run schema"}
+                    )
                     run_dir = engine._run_dir(run_id)
                     for turn in state.get("turns", []):
                         try:
@@ -250,8 +293,16 @@ def make_handler(
                     self.wfile.write(data)
                     return
                 if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "export":
-                    plain_text = urllib.parse.parse_qs(parsed.query).get("format", ["markdown"])[0] == "text"
-                    data = engine.export_run(parts[2], plain_text=plain_text)
+                    query = urllib.parse.parse_qs(parsed.query)
+                    plain_text = query.get("format", ["markdown"])[0] == "text"
+                    include_prompts = query.get("prompts", ["1"])[0] != "0"
+                    include_diagnostics = query.get("diagnostics", ["0"])[0] == "1"
+                    data = engine.export_run(
+                        parts[2],
+                        plain_text=plain_text,
+                        include_prompts=include_prompts,
+                        include_diagnostics=include_diagnostics,
+                    )
                     self._headers("text/plain; charset=utf-8", len(data))
                     self.wfile.write(data)
                     return
@@ -317,6 +368,9 @@ def make_handler(
                         run_id,
                         lambda: engine.decide(run_id, choice, text),
                         lambda error: engine.record_background_failure(run_id, error),
+                        before_start=lambda: _persist_submitted_next_turn_override(
+                            engine, run_id, value
+                        ),
                     )
                     self._send({"run_id": run_id, "worker": workers.status(run_id)}, HTTPStatus.ACCEPTED)
                     return
@@ -327,6 +381,9 @@ def make_handler(
                         run_id,
                         lambda: engine.continue_step(run_id, direction),
                         lambda error: engine.record_background_failure(run_id, error),
+                        before_start=lambda: _persist_submitted_next_turn_override(
+                            engine, run_id, value
+                        ),
                     )
                     self._send({"run_id": run_id, "worker": workers.status(run_id)}, HTTPStatus.ACCEPTED)
                     return

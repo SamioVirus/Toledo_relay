@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from toledo_orchestrator.core import write_text
 from toledo_orchestrator.project import ProjectDefinition, ValidationDefinition
 from toledo_orchestrator.validation import failure_signature
 
@@ -86,6 +87,12 @@ def test_unchanged_baseline_failure_pauses_for_closure_and_accepts_with_debt(
     receipt = json.loads((app.runs_dir / run_id / debt[0]).read_text(encoding="utf-8"))
     assert receipt["classification"]["overall"] == "unchanged_baseline"
     assert receipt["patch_sha256"]
+    transcript = app.export_run(run_id, plain_text=True, include_diagnostics=True).decode("utf-8")
+    assert "Clean-base validation" in transcript
+    assert "Implementation validation" in transcript
+    assert "FAILED tests/test_math.py::test_fixture" in transcript
+    assert "toledo_orchestrator.baseline_debt.v1" in transcript
+    assert "toledo_orchestrator.completion.v1" in transcript
 
 
 def test_new_regression_still_routes_to_repair_and_round_cap(
@@ -199,3 +206,92 @@ def test_create_run_profile_overrides_bind_to_snapshot_only(
     assert app.workflows["continuous-development"].profiles["codex-planning"].model == "gpt-5.6-sol"
     with pytest.raises(ValueError, match="unknown profile override"):
         app.create_run(b"x", "test", profile_overrides={"nope": {"model": "a", "effort": "b"}})
+
+
+def test_export_is_a_complete_exact_chronological_transcript(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [("planning-propose", response("ready", "# Exact plan heading\nExportable plan body"))])
+    claude = SessionAdapter("claude", [
+        ("planning-review", response("human", "Review needs owner input")),
+        ("planning-review", response("human", "Replacement review body")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Export me fully", "test", run_mode="step")
+    first_pause = app.run_to_stop(run_id)
+    assert first_pause["pending_human_decision"] == "operator_step"
+    # The current stage has not run yet, so offering Steer here would be a dead
+    # control even though the run contains a prior planner turn.
+    unavailable = app.steer_availability(run_id)
+    assert unavailable["available"] is False and "no active reviewer provider session" in unavailable["reason"]
+    with pytest.raises(ValueError, match="Steer is unavailable"):
+        app.steer(run_id, "This must not target the previous stage.")
+
+    review_pause = app.continue_step(run_id, b"Owner one-turn direction, verbatim.")
+    assert review_pause["pending_human_decision"] == "provider_requested_human"
+    available = app.steer_availability(run_id)
+    assert available["available"] is True
+    assert available["turn_id"] == review_pause["turns"][-1]["id"]
+    assert available["stage"] == "planning-review"
+    blocked = app.state(run_id)
+    blocked["pending_validation"] = {"commands": ["pytest"], "stage": "planning-review"}
+    blocked["pending_human_decision"] = "validation_execution_approval"
+    app._save(run_id, blocked)
+    unavailable_during_validation = app.steer_availability(run_id)
+    assert unavailable_during_validation["available"] is False
+    assert "pending deterministic decision" in unavailable_during_validation["reason"]
+    blocked["pending_validation"] = None
+    blocked["pending_human_decision"] = "provider_requested_human"
+    app._save(run_id, blocked)
+    app.steer(run_id, "Operator steer note, verbatim.")
+    app.stop_run(run_id, b"Final operator stop note, verbatim.")
+
+    diagnostic_secret = "Bearer TEST_DIAGNOSTIC_SECRET"
+    with_diagnostic = app.state(run_id)
+    first_turn = with_diagnostic["turns"][0]
+    first_stderr = app._run_dir(run_id) / "turns" / first_turn["stderr_file"]
+    first_turn["stderr_sha256"] = write_text(first_stderr, diagnostic_secret)
+    app._save(run_id, with_diagnostic)
+
+    full = app.export_run(run_id).decode("utf-8")
+    assert "### Cycle request (exact)" in full
+    assert "#### Transport prompt (exact)" in full
+    assert "#### Provider response (exact stored provider response)" in full
+    assert "Export me fully" in full
+    assert "Exportable plan body" in full
+    # Exact provider responses retain the process-control fence; the old export
+    # silently reduced them to derivative work products.
+    assert '{"next":"ready"}' in full
+    assert "Owner one-turn direction, verbatim." in full
+    assert "Operator steer note, verbatim." in full
+    assert "Replacement review body" in full
+    assert "Final operator stop note, verbatim." in full
+    assert full.index("Export me fully") < full.index("Exportable plan body")
+    assert full.index("Owner one-turn direction, verbatim.") < full.index("Review needs owner input")
+    assert full.index("Operator steer note, verbatim.") < full.index("Replacement review body")
+    assert diagnostic_secret not in full
+    assert "Provider stderr (exact sealed text)" not in full
+    assert "Lifecycle event log (chronological)" not in full
+    assert "Diagnostics: excluded" in full
+    assert "Final run state (redacted summary)" in full
+
+    diagnostics = app.export_run(run_id, include_diagnostics=True).decode("utf-8")
+    assert diagnostic_secret in diagnostics
+    assert "Provider stderr (exact sealed text)" in diagnostics
+    assert "Lifecycle event log (chronological)" in diagnostics
+    assert "may contain sensitive raw text" in diagnostics
+
+    without = app.export_run(run_id, include_prompts=False).decode("utf-8")
+    assert "Transport prompt (exact)" not in without
+    assert "Transport prompts: intentionally omitted by prompts=0" in without
+    assert "Export me fully" in without  # explicit cycle request remains
+    assert "Exportable plan body" in without
+    assert "Owner one-turn direction, verbatim." in without
+    assert "Final operator stop note, verbatim." in without
+
+    plain = app.export_run(run_id, plain_text=True).decode("utf-8")
+    assert "Toledo complete transcript" in plain
+    # Wrapper headings are plain text without mutating hashes/headings inside
+    # exact provider content.
+    assert "# Exact plan heading" in plain
+    assert "#Exact plan heading" not in plain

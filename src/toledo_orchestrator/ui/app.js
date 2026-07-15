@@ -3,6 +3,12 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
+const previewText = (value) => String(value ?? "")
+  .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+  .replace(/(^|\s)#{1,6}\s+/g, "$1")
+  .replace(/[*_~`]+/g, "")
+  .replace(/\s+/g, " ")
+  .trim();
 let bootstrap = null;
 let currentRunId = null;
 let currentState = null;
@@ -36,6 +42,48 @@ async function api(path, options = {}, retriedNonce = false) {
   }
   if (!response.ok) throw new Error(value.error || value || `${response.status}`);
   return value;
+}
+
+async function copyPlainText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      // Some embedded Chromium shells expose writeText but leave its promise
+      // pending forever. Bound that path so the visible control cannot hang.
+      const copied = await Promise.race([
+        navigator.clipboard.writeText(text).then(() => true),
+        new Promise((resolve) => setTimeout(() => resolve(false), 1200)),
+      ]);
+      if (copied) return;
+    } catch {
+      // Local HTTP deployments and embedded browsers may deny the modern API.
+      // Fall through to the selection-based copy path instead of losing Copy.
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("This browser did not allow clipboard access.");
+}
+
+async function plainTextRunExport() {
+  return api(`/api/runs/${encodeURIComponent(currentRunId)}/export?format=text`);
+}
+
+function downloadPlainText(filename, text) {
+  const url = URL.createObjectURL(new Blob([text], {type: "text/plain;charset=utf-8"}));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function sessionColorClass(label) {
@@ -122,6 +170,7 @@ function stateSignature(state) {
     events: state.events,
     worker: state.worker,
     override: state.next_turn_override,
+    steer: state.steer,
   });
 }
 
@@ -181,7 +230,7 @@ function renderRun() {
   const terminalHeadings = {
     complete: "Run complete",
     cancelled: "Run cancelled",
-    stopped: "Run finished by operator",
+    stopped: "Stopped by operator — work may be incomplete",
     failed: "Run failed",
   };
   const heading = canRecover
@@ -189,10 +238,10 @@ function renderRun() {
     : state.worker?.active
       ? `${state.inflight?.title || stageTitle(state.current_stage)} is running…`
       : terminalHeadings[state.status] || stageTitle(state.current_stage);
-  const retryReasons = new Set(["operator_step", "provider_requested_human", "provider_invocation_failed", "provider_session_id_missing", "provider_session_missing", "provider_session_not_new", "provider_session_changed_unexpectedly", "missing_substantive_output", "malformed_directive", "unsupported_stage_directive", "invalid_next_turn_profile", "profile_permission_exceeds_stage", "background_operation_failed"]);
-  const canOverride = state.schema_version === "toledo_orchestrator.run.v2" && state.current_stage && !state.inflight && (state.status === "created" || state.status === "running" || retryReasons.has(state.pending_human_decision));
-  const canSteer = state.schema_version === "toledo_orchestrator.run.v2" && state.status === "paused" && !state.inflight && Boolean(state.turns?.length);
-  const workflow = bootstrap.workflows[state.workflow];
+  // A run is bound to its launch-time route snapshot. Saved defaults may
+  // change while it is paused, but the status strip must advertise what this
+  // run will actually invoke, not the mutable bootstrap default.
+  const workflow = state.workflow_snapshot || bootstrap.workflows[state.workflow];
   const stage = workflow?.stages?.[state.current_stage] || {};
   const override = state.next_turn_override;
   const overrideValue = override?.target_stage === state.current_stage ? override?.profile_value : null;
@@ -201,29 +250,81 @@ function renderRun() {
   const strip = $("#run-status-strip");
   strip.hidden = false;
   strip.innerHTML = `<span>${escapeHtml(state.status)}</span><span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
-  $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(state.run_id)} · ${escapeHtml(state.status.toUpperCase())}</p><h2>${escapeHtml(heading || "Run complete")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">cycle ${state.cycle || 1}</span><span class="fact">${state.current_turn || 0} turns</span><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span>${state.execution_branch ? `<span class="fact">${escapeHtml(state.execution_branch)}</span>` : ''}${canOverride ? '<button class="quiet-button" id="next-turn-control">Override next turn ↗</button>' : ''}${canRecover ? '<button class="accept-button" id="recover-run">Recover run</button>' : ''}</div>`;
-  $("#next-turn-control")?.addEventListener("click", openNextTurnControl);
-  if (canSteer) {
-    const button = document.createElement("button");
-    button.className = "quiet-button";
-    button.id = "steer-control";
-    button.textContent = "Steer latest artifact";
-    $("#run-facts").append(button);
-    button.addEventListener("click", openSteerControl);
-  }
+  $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(state.run_id)} · ${escapeHtml(state.status.toUpperCase())}</p><h2>${escapeHtml(heading || "Run complete")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">cycle ${state.cycle || 1}</span><span class="fact">${state.current_turn || 0} turns</span><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span>${state.execution_branch ? `<span class="fact">${escapeHtml(state.execution_branch)}</span>` : ''}<button class="quiet-button run-action" id="export-run" title="Download the full conversation and transport prompts as plain text">Export plain text</button><button class="quiet-button run-action" id="copy-run" title="Copy the same full plain-text conversation">Copy all</button>${canRecover ? '<button class="accept-button run-action" id="recover-run">Recover run</button>' : ''}</div>`;
+  $("#export-run")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "Preparing…";
+    try {
+      const text = await plainTextRunExport();
+      downloadPlainText(`${String(currentRunId).replace(/[^a-zA-Z0-9._-]/g, "-")}.txt`, text);
+      button.textContent = "Exported";
+    } catch (error) {
+      button.textContent = "Export failed";
+      alert(`Export failed: ${error.message}`);
+    } finally {
+      setTimeout(() => { button.textContent = "Export plain text"; button.disabled = false; }, 2200);
+    }
+  });
+  $("#copy-run")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "Copying…";
+    try {
+      const text = await plainTextRunExport();
+      await copyPlainText(text);
+      button.textContent = `Copied ${(text.length / 1000).toFixed(0)}k chars`;
+    } catch (error) {
+      button.textContent = "Copy failed";
+      alert(`Copy failed: ${error.message}`);
+    } finally {
+      setTimeout(() => { button.textContent = "Copy all"; button.disabled = false; }, 2500);
+    }
+  });
   $("#recover-run")?.addEventListener("click", recoverCurrentRun);
   renderFilters(state);
   renderTimeline(state);
   if (state.worker?.error) showBanner(state.worker.error, "error");
 }
 
-async function openSteerControl() {
-  const note = window.prompt("Steer the active provider session. It will produce a complete replacement artifact.");
-  if (note == null || !note.trim()) return;
-  try {
-    await api(`/api/runs/${encodeURIComponent(currentRunId)}/steer`, {method:"POST", body:JSON.stringify({note:note.trim()})});
-    await refreshCurrent();
-  } catch (error) { alert(error.message); }
+function steerTargetForState(state) {
+  // The controller validates stage, active physical session, provider, and
+  // exact replacement target. Never infer steerability from a same-slot turn:
+  // a slot can span stages while only the current-stage artifact is legal.
+  if (!state?.steer?.available || !state.steer.turn_id) return null;
+  return (state.turns || []).find((turn) => turn.id === state.steer.turn_id) || null;
+}
+
+function openSteerControl(latest = steerTargetForState(currentState)) {
+  if (!latest) {
+    alert(currentState?.steer?.reason || "There is no current-stage artifact in the active provider session to reply to.");
+    return;
+  }
+  const requestedModel = latest.configured_model || latest.model || "model unknown";
+  const requestedEffort = latest.configured_reasoning || "effort unknown";
+  const observedModel = latest.observed_model || "not reported";
+  const observedEffort = latest.observed_reasoning || "not reported";
+  const observation = observedModel !== requestedModel || observedEffort !== requestedEffort
+    ? ` The last response reported ${observedModel} · ${observedEffort}; that evidence is shown separately and is not what this control resends.`
+    : ` The last response reported the same model and effort.`;
+  const excerpt = previewText(latest.preview || "Output preview unavailable. Open the artifact from the timeline to inspect it.").slice(0, 700);
+  const dialog = document.createElement("dialog");
+  dialog.className = "modal";
+  dialog.innerHTML = `<form method="dialog"><div class="modal-head"><div><p class="eyebrow">REPLY IN THE ACTIVE SESSION</p><h2>Revise ${escapeHtml(latest.title || "the current artifact")}</h2></div><button value="cancel" aria-label="Close">×</button></div><p class="settings-hint">This resumes ${escapeHtml(sessionDisplay(latest))} with the requested route ${escapeHtml(latest.provider || "provider")} · ${escapeHtml(requestedModel)} · ${escapeHtml(requestedEffort)}.${escapeHtml(observation)} It cannot switch model or session. The response replaces this artifact without consuming a workflow review round; both versions remain sealed.</p><section class="steer-context" aria-label="Artifact being revised"><strong>Artifact being revised</strong><p>${escapeHtml(excerpt)}</p></section><label>Your follow-up<textarea id="steer-note" rows="6" placeholder="What should change, be reconsidered, or be answered?"></textarea></label><div class="modal-actions"><button value="cancel" class="ghost-button">Cancel</button><button type="button" class="primary-button" id="steer-send">Send and replace artifact</button></div></form>`;
+  document.body.append(dialog);
+  $("#steer-send", dialog).addEventListener("click", async (event) => {
+    const note = $("#steer-note", dialog).value.trim();
+    if (!note) { $("#steer-note", dialog).focus(); return; }
+    event.target.disabled = true;
+    try {
+      await api(`/api/runs/${encodeURIComponent(currentRunId)}/steer`, {method:"POST", body:JSON.stringify({note})});
+      dialog.close();
+      dialog.remove();
+      await refreshCurrent();
+    } catch (error) { alert(error.message); event.target.disabled = false; }
+  });
+  dialog.addEventListener("close", () => dialog.remove(), {once: true});
+  dialog.showModal();
 }
 
 async function recoverCurrentRun() {
@@ -266,6 +367,7 @@ function visibleTurn(turn) {
 function renderTimeline(state) {
   const root = $("#timeline");
   root.innerHTML = "";
+  const steerTarget = steerTargetForState(state);
   for (const cycle of state.cycles || [{number:1,id:"cycle.0001"}]) {
     const block = document.createElement("section");
     block.className = "cycle-block";
@@ -291,7 +393,7 @@ function renderTimeline(state) {
         block.append(milestone("Implementation accepted", cycle.completion_receipt, true));
         completionShown = true;
       }
-      block.append(turnRow(turn));
+      block.append(turnRow(turn, {canSteer: steerTarget?.id === turn.id}));
       for (const [index, decision] of decisions.entries()) {
         if (Number(decision.after_turn) === Number(String(turn.id || "").split(".").at(-1))) {
           block.append(humanDecisionNode(decision, index));
@@ -320,30 +422,62 @@ function renderTimeline(state) {
     root.append(block);
   }
   const activeGate = $("#active-gate", root);
-  if (activeGate && state.pending_human_decision) populateGateUpnext(activeGate, state);
+  if (activeGate && state.pending_human_decision) {
+    // A fast click must still wait for the next-turn controls to hydrate. Once
+    // visible, their current values travel in the same Run/Retry request.
+    activeGate.gatePickerReady = populateGateUpnext(activeGate, state);
+  }
   hydratePromptPreviews();
   hydrateDecisionPreviews();
 }
 
-function turnRow(turn) {
+function turnEvidence(turn) {
+  const configuredModel = turn.configured_model || turn.model || "model unknown";
+  const configuredEffort = turn.configured_reasoning || turn.effort || "effort unknown";
+  const hasObserved = Boolean(turn.observed_model || turn.observed_reasoning);
+  const observedModel = turn.observed_model || "model not reported";
+  const observedEffort = turn.observed_reasoning || "effort not reported";
+  const comparableModel = !["", "provider-default", "model unknown"].includes(configuredModel);
+  const comparableEffort = !["", "provider-default", "default", "effort unknown"].includes(configuredEffort);
+  const mismatch = (turn.observed_model && comparableModel && turn.observed_model !== configuredModel)
+    || (turn.observed_reasoning && comparableEffort && turn.observed_reasoning !== configuredEffort);
+  return {
+    configured: `${configuredModel} · ${configuredEffort}`,
+    observed: hasObserved ? `${observedModel} · ${observedEffort}` : `Not reported${turn.observation_error ? ` · ${turn.observation_error}` : ""}`,
+    mismatch: Boolean(mismatch),
+  };
+}
+
+function turnRow(turn, {canSteer = false} = {}) {
   const row = document.createElement("div");
   row.className = "timeline-row";
   row.dataset.phase = turn.phase;
   row.dataset.session = turn.session_label;
   const colorClass = sessionColorClass(turn.session_label);
-  const preview = (turnPreview(turn) || "Open the stored artifact.").replace(/\s+/g, " ").slice(0, 280);
+  const preview = previewText(turn.preview || "Output preview unavailable — open the stored artifact.").slice(0, 520);
+  const evidence = turnEvidence(turn);
   const interstitialFile = turn.direction_file || turn.interstitial_file || turn.prompt_file;
   const tooltipId = `direction-${String(turn.id || "turn").replaceAll(".", "-")}`;
-  row.innerHTML = `<button class="prompt-node" data-interstitial-path="${escapeHtml(turnArtifactPath(interstitialFile))}" aria-describedby="${escapeHtml(tooltipId)}" aria-label="Open ${escapeHtml(turn.prompt_label || turn.title)} direction"><span class="prompt-label">${escapeHtml(turn.prompt_label || promptShort(turn.prompt_kind))}</span><span class="prompt-tooltip" id="${escapeHtml(tooltipId)}" role="tooltip">Loading exact direction…</span></button><article class="turn-card ${escapeHtml(turn.provider)} ${colorClass}" tabindex="0" role="button" aria-label="Open ${escapeHtml(turn.title)} output"><div class="turn-card-head"><div class="actor"><span class="session-token">${escapeHtml(sessionDisplay(turn))}</span><div><h3>${escapeHtml(turn.title)}</h3><span class="route">${escapeHtml(turn.provider)} · ${escapeHtml(turn.role)}</span></div></div><span class="turn-number">${escapeHtml(turn.id)}</span></div><p class="turn-preview">${escapeHtml(preview)}</p><div class="chips"><span class="chip ${escapeHtml(turn.session_action)}">${escapeHtml(turn.session_action)} session</span><span class="chip">${escapeHtml(turn.profile_label || turn.profile)}</span><span class="chip">${escapeHtml(turn.permission)}</span><span class="chip">${Math.round((turn.elapsed_ms || 0)/1000)}s</span></div></article>`;
+  row.innerHTML = `<button class="prompt-node" data-interstitial-path="${escapeHtml(turnArtifactPath(interstitialFile))}" aria-describedby="${escapeHtml(tooltipId)}" aria-label="Open ${escapeHtml(turn.prompt_label || turn.title)} direction"><span class="prompt-label">${escapeHtml(turn.prompt_label || promptShort(turn.prompt_kind))}</span><span class="prompt-tooltip" id="${escapeHtml(tooltipId)}" role="tooltip">Loading exact direction…</span></button><article class="turn-card ${escapeHtml(turn.provider)} ${colorClass}"><div class="turn-card-head"><div class="actor"><span class="session-token">${escapeHtml(sessionDisplay(turn))}</span><div><h3>${escapeHtml(turn.title)}</h3><span class="route">${escapeHtml(turn.provider)} · ${escapeHtml(turn.role)}</span></div></div><span class="turn-number">${escapeHtml(turn.id)}</span></div><div class="turn-preview"><span class="turn-preview-tag">Output excerpt</span><p>${escapeHtml(preview)}</p><div class="turn-preview-actions"><button type="button" data-open-output>Open full output</button><button type="button" data-copy-output>Copy output</button>${canSteer ? '<button type="button" data-steer-output>Reply / revise</button>' : ""}</div></div><div class="turn-evidence ${evidence.mismatch ? "mismatch" : ""}"><span><b>Configured</b> ${escapeHtml(evidence.configured)}</span><span><b>Observed</b> ${escapeHtml(evidence.observed)}</span>${evidence.mismatch ? '<strong>Mismatch</strong>' : ""}</div><div class="chips"><span class="chip ${escapeHtml(turn.session_action)}">${escapeHtml(turn.session_action)} session</span><span class="chip">${escapeHtml(turn.permission)}</span><span class="chip">${Math.round((turn.elapsed_ms || 0)/1000)}s</span></div></article>`;
   const card = $(".turn-card", row);
   const prompt = $(".prompt-node", row);
-  card.addEventListener("click", () => openTurn(turn, "output"));
-  card.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      openTurn(turn, "output");
+  $("[data-open-output]", card).addEventListener("click", () => openTurn(turn, "output"));
+  $("[data-copy-output]", card).addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "Copying…";
+    try {
+      const output = await artifactText(turnArtifactPath(turn.output_file));
+      await copyPlainText(output);
+      button.textContent = "Copied";
+    } catch (error) {
+      button.textContent = "Copy failed";
+      alert(`Copy failed: ${error.message}`);
+    } finally {
+      setTimeout(() => { button.textContent = "Copy output"; button.disabled = false; }, 1800);
     }
   });
+  $("[data-steer-output]", card)?.addEventListener("click", () => openSteerControl(turn));
   prompt.addEventListener("click", () => openTurn(turn, turn.direction_file ? "direction" : "stance"));
   return row;
 }
@@ -351,10 +485,6 @@ function turnRow(turn) {
 function promptShort(kind) {
   const names = {ideate:"Ideas",skeptic:"Skeptic",adjudicate:"Judge","implementation-kickoff":"Build","implementation-audit":"Audit",correction:"Correct","next-step":"Next","human-other":"Redirect"};
   return names[kind] || kind?.slice(0,8) || "Prompt";
-}
-
-function turnPreview(turn) {
-  return turn.preview || `${turn.artifact_type?.replaceAll("-", " ") || "work product"} · ${turn.directive?.next || "no directive"}`;
 }
 
 function milestone(label, path, accepted) {
@@ -424,10 +554,8 @@ async function openTurn(turn, tab = "output") {
   setDirectionTabLabel("Situational");
   $("#inspector-kicker").textContent = `${sessionDisplay(turn)} · ${turn.profile_label || turn.profile}`;
   $("#inspector-title").textContent = turn.title;
-  const observed = turn.observed_model || turn.observed_reasoning
-    ? `<span class="chip observed">observed ${escapeHtml(turn.observed_model || "model unknown")} · ${escapeHtml(turn.observed_reasoning || "effort unknown")}</span>`
-    : `<span class="chip muted">observation unavailable${turn.observation_error ? ` · ${escapeHtml(turn.observation_error)}` : ""}</span>`;
-  $("#inspector-meta").innerHTML = `<span class="chip ${escapeHtml(turn.session_action)}">${escapeHtml(turn.session_action)}</span><span class="chip">logical ${escapeHtml(sessionDisplay(turn))}</span><span class="chip">${escapeHtml(sessionIdSuffix(turn.session_id))}</span><span class="chip">configured ${escapeHtml(turn.configured_model)} · ${escapeHtml(turn.configured_reasoning)}</span>${observed}<span class="chip">${escapeHtml(turn.permission)}</span>`;
+  const evidence = turnEvidence(turn);
+  $("#inspector-meta").innerHTML = `<dl class="inspector-evidence ${evidence.mismatch ? "mismatch" : ""}"><div><dt>Configured</dt><dd>${escapeHtml(evidence.configured)}</dd></div><div><dt>Observed</dt><dd>${escapeHtml(evidence.observed)}</dd></div><div><dt>Session</dt><dd>${escapeHtml(sessionDisplay(turn))} · ${escapeHtml(turn.session_action)} · ${escapeHtml(sessionIdSuffix(turn.session_id))}</dd></div><div><dt>Access</dt><dd>${escapeHtml(turn.permission)}</dd></div></dl>`;
   openInspector(tab);
 }
 
@@ -502,18 +630,40 @@ function bindGate(fragment) {
     const choice = button.dataset.choice;
     if (choice === "other" && !textarea.value.trim()) { textarea.focus(); return; }
     button.disabled = true;
+    const submitDisplayedOverride = choice !== "no" && ["operator_step", "provider_invocation_failed"].includes(gate.dataset.reason);
+    let actionAccepted = false;
     try {
+      if (submitDisplayedOverride && gate.gatePickerReady) await gate.gatePickerReady;
+      const nextTurnOverride = submitDisplayedOverride && gate.collectNextTurnOverride
+        ? gate.collectNextTurnOverride()
+        : null;
       if (gate.dataset.reason === "operator_step") {
-        await api(`/api/runs/${encodeURIComponent(currentRunId)}/continue`, {method:"POST", body:JSON.stringify({direction:textarea.value})});
+        await api(`/api/runs/${encodeURIComponent(currentRunId)}/continue`, {method:"POST", body:JSON.stringify({
+          direction: textarea.value,
+          next_turn_override: nextTurnOverride,
+        })});
       } else {
-        await api(`/api/runs/${encodeURIComponent(currentRunId)}/decision`, {method:"POST", body:JSON.stringify({choice, text:choice === "other" ? textarea.value : ""})});
+        await api(`/api/runs/${encodeURIComponent(currentRunId)}/decision`, {method:"POST", body:JSON.stringify({
+          choice,
+          text: choice === "other" ? textarea.value : "",
+          next_turn_override: nextTurnOverride,
+        })});
       }
+      actionAccepted = true;
       gateDrafts.delete(gate.dataset.draftKey);
       await refreshCurrent();
-    } catch (error) { alert(error.message); button.disabled = false; }
+    } catch (error) {
+      const prefix = actionAccepted
+        ? "The action was accepted, but this page could not refresh. Reload before trying again. "
+        : submitDisplayedOverride
+          ? "Displayed settings were rejected before any provider operation was scheduled. "
+          : "The action was not accepted. ";
+      alert(prefix + error.message);
+      button.disabled = false;
+    }
   }));
   $("[data-gate-stop]", gate)?.addEventListener("click", async (event) => {
-    if (!window.confirm("Finish this run here? It is recorded as finished by you — nothing is committed and nothing further runs.")) return;
+    if (!window.confirm("Stop this run here? It is recorded as stopped by you — nothing is committed, and the work may be incomplete.")) return;
     event.target.disabled = true;
     try {
       await api(`/api/runs/${encodeURIComponent(currentRunId)}/stop`, {method:"POST", body:JSON.stringify({note:textarea.value})});
@@ -522,6 +672,14 @@ function bindGate(fragment) {
       await refreshRuns();
     } catch (error) { alert(error.message); event.target.disabled = false; }
   });
+}
+
+function gateProfileOptions(workflow, preview) {
+  const writeAllowed = preview.stage?.phase === "implementation" && preview.stage?.role === "implementer";
+  return Object.entries(workflow?.profiles || {})
+    .map(([id, value]) => ({id, ...value}))
+    .filter((candidate) => writeAllowed || candidate.permission !== "workspace-write")
+    .filter((candidate) => preview.stage?.provider_switchable || candidate.provider === preview.profile?.provider);
 }
 
 async function populateGateUpnext(gate, state) {
@@ -538,7 +696,9 @@ async function populateGateUpnext(gate, state) {
   const receives = (preview.inputs || []).map((input) => `${input.title}${input.empty ? " (none yet)" : ` (${input.chars >= 1000 ? `${(input.chars / 1000).toFixed(1)}k` : input.chars} chars)`}`).join(", ") || "nothing beyond the session";
   const afterward = (preview.afterward || []).map((item) => `${item.directive} → ${item.description}`);
   const dedupedAfterward = [...new Set(afterward)];
-  panel.innerHTML = `<div class="gate-upnext-line"><strong>${escapeHtml(profile.model || "provider default")}</strong><span>·</span><span>${escapeHtml(profile.effort || "default effort")}</span><span>·</span><span>${escapeHtml(profile.provider || "")}</span><span>·</span><span>${escapeHtml(profile.permission || "")}</span>${profile.overridden || session.overridden ? '<span class="override-chip">one-turn override active</span>' : ""}${profile.custom ? '<span class="warn-chip">custom — unverified</span>' : ""}</div>
+  const workflow = state.workflow_snapshot || bootstrap?.workflows?.[state.workflow] || {};
+  const candidateProfiles = gateProfileOptions(workflow, preview);
+  panel.innerHTML = `<div class="gate-upnext-line"><span class="gate-applied-label">Applied</span><strong>${escapeHtml(profile.model || "provider default")}</strong><span>·</span><span>${escapeHtml(profile.effort || "default effort")}</span><span>·</span><span>${escapeHtml(profile.provider || "")}</span><span>·</span><span>${escapeHtml(profile.permission || "")}</span>${preview.override?.active ? '<span class="override-chip">one-turn override active</span>' : ""}${profile.custom ? '<span class="warn-chip">custom — unverified</span>' : ""}</div>
     <dl>
       <div><dt>Actor</dt><dd>${escapeHtml(session.label || "?")} (${escapeHtml(preview.stage?.role || "agent")}) · ${escapeHtml(session.action || "?")} session</dd></div>
       <div><dt>Receives</dt><dd>${escapeHtml(receives)}</dd></div>
@@ -546,7 +706,115 @@ async function populateGateUpnext(gate, state) {
       <div><dt>Afterward</dt><dd>${dedupedAfterward.map((line) => escapeHtml(line)).join("<br>")}</dd></div>
       ${preview.rounds ? `<div><dt>Rounds</dt><dd>${preview.rounds.used} of ${preview.rounds.cap} used</dd></div>` : ""}
       ${preview.direction_preview ? `<div><dt>Direction</dt><dd>${escapeHtml(preview.direction_preview.replace(/\s+/g, " ").slice(0, 220))}</dd></div>` : ""}
-    </dl>`;
+    </dl>
+    <div class="gate-picker">
+      <label>Provider<select data-gate-provider aria-label="Next turn provider"></select></label>
+      <label title="The provider, access, and timeout preset. Model and effort can be overridden below.">Route preset<select data-gate-profile aria-label="Next turn route preset"></select></label>
+      <label>Model<select data-field="model" aria-label="Next turn model"></select></label>
+      <label data-gate-effort>Effort<select data-field="effort" aria-label="Next turn reasoning effort"></select></label>
+      <label>Session<select data-field="session" aria-label="Next turn session action"><option value="">As planned (${escapeHtml(session.action || "?")})</option><option value="continue">Continue current session</option><option value="new">Start a new session</option></select></label>
+      <button type="button" class="quiet-button" data-gate-apply title="Save this one-turn setup and refresh the exact prompt without running it">Save without running</button>
+    </div>
+    <div data-catalog-custom hidden><label>Exact model ID<input data-field="custom-model" autocomplete="off"></label><label>Exact reasoning effort<input data-field="custom-effort" autocomplete="off"></label></div>
+    <p class="catalog-detail" data-catalog-detail hidden></p>
+    <p class="gate-session-rule" data-gate-session-rule></p>`;
+  const providerSelect = $("[data-gate-provider]", panel);
+  const profileSelect = $("[data-gate-profile]", panel);
+  const sessionSelect = $('[data-field="session"]', panel);
+  const providers = [...new Set(candidateProfiles.map((candidate) => candidate.provider))];
+  providerSelect.innerHTML = providers.map((providerName) => `<option value="${escapeHtml(providerName)}">${escapeHtml(providerName)}</option>`).join("");
+  providerSelect.value = providers.includes(profile.provider) ? profile.provider : (providers[0] || profile.provider || "");
+  providerSelect.disabled = providers.length < 2;
+  providerSelect.title = providers.length < 2 && !preview.stage?.provider_switchable
+    ? "This workflow stage locks the provider. Model and effort can still change."
+    : "";
+  const fillProfiles = (preferredId = null) => {
+    const matching = candidateProfiles.filter((candidate) => candidate.provider === providerSelect.value);
+    profileSelect.innerHTML = matching.map((candidate) => `<option value="${escapeHtml(candidate.id)}">${escapeHtml(candidate.label || candidate.id)}</option>`).join("");
+    profileSelect.value = matching.some((candidate) => candidate.id === preferredId) ? preferredId : (matching[0]?.id || "");
+  };
+  const selectedProfile = () => candidateProfiles.find((candidate) => candidate.id === profileSelect.value) || candidateProfiles[0] || profile;
+  const updateSessionRule = () => {
+    const selected = selectedProfile();
+    const selection = catalogSelection(panel);
+    const providerChanged = selected.provider !== profile.provider;
+    const modelChanged = selection.model !== profile.model;
+    const effortChanged = selection.effort !== profile.effort;
+    const planned = $("option[value='']", sessionSelect);
+    const continuing = $("option[value='continue']", sessionSelect);
+    const canContinue = Boolean(
+      session.has_active_session
+      && session.active_provider === selected.provider
+      && !providerChanged
+    );
+    planned.disabled = providerChanged;
+    continuing.disabled = !canContinue;
+    if (providerChanged) sessionSelect.value = "new";
+    else if (!canContinue && sessionSelect.value === "continue") sessionSelect.value = "";
+    const resolvedAction = sessionSelect.value || session.action;
+    const selectedCatalogModel = catalogModels(selected.provider).find((item) => item.selection_token === selection.model);
+    const resumeObserved = selectedCatalogModel?.live_verified?.resume_switch_observed;
+    const resumeEvidence = resumeObserved
+      ? `Live-tested on this host${selectedCatalogModel.live_verified?.at ? ` (${new Date(selectedCatalogModel.live_verified.at).toLocaleDateString()})` : ""}; the result will still show configured versus observed model.`
+      : "Current CLI behavior permits this, but this target has not been live-tested on this host; the result will show configured versus observed model.";
+    let rule;
+    if (providerChanged) {
+      rule = "A provider change requires a new physical session; prior session context will not carry over. The next prompt includes the sealed workflow inputs.";
+    } else if (!canContinue) {
+      rule = `No active ${selected.provider} session exists in this stage's session slot. The next turn will start a new physical session.`;
+    } else if (modelChanged && resolvedAction === "continue") {
+      rule = `This same-provider model switch will continue the active session. ${resumeEvidence}`;
+    } else if (modelChanged) {
+      rule = "This model switch will start a new physical session. The next prompt includes the sealed workflow inputs instead of relying on prior session context.";
+    } else if (effortChanged && resolvedAction === "continue") {
+      rule = "This effort change will continue the active session. CLI acceptance is not proof of effective effort; observed evidence will be shown when the provider reports it.";
+    } else {
+      rule = preview.stage?.provider_switchable
+        ? "Provider changes require a new physical session. Same-provider model or effort changes may continue the active session."
+        : "This stage keeps its provider. Same-provider model or effort changes may continue the active session.";
+    }
+    $("[data-gate-session-rule]", panel).textContent = rule;
+  };
+  const installSelectedProfile = (usePreviewValues = false) => {
+    const selected = selectedProfile();
+    installCatalogPicker(
+      panel,
+      selected.provider,
+      usePreviewValues ? profile.model : selected.model,
+      usePreviewValues ? profile.effort : selected.effort,
+      updateSessionRule,
+    );
+    updateSessionRule();
+  };
+  fillProfiles(profile.id);
+  installSelectedProfile(true);
+  sessionSelect.value = session.overridden ? session.action : "";
+  updateSessionRule();
+  providerSelect.addEventListener("change", () => {
+    fillProfiles();
+    installSelectedProfile();
+  });
+  profileSelect.addEventListener("change", () => installSelectedProfile());
+  sessionSelect.addEventListener("change", updateSessionRule);
+  gate.collectNextTurnOverride = () => {
+    const selection = catalogSelection(panel);
+    if (!selection.model || !selection.effort) throw new Error("Model and reasoning effort are required.");
+    return {
+      profile: profileSelect.value || preview.profile?.id || null,
+      ...selection,
+      session_action: sessionSelect.value || null,
+    };
+  };
+  $("[data-gate-apply]", panel).addEventListener("click", async (event) => {
+    event.target.disabled = true;
+    try {
+      await api(`/api/runs/${encodeURIComponent(currentRunId)}/override`, {
+        method: "POST",
+        body: JSON.stringify(gate.collectNextTurnOverride()),
+      });
+      await refreshCurrent(true);
+    } catch (error) { alert(error.message); event.target.disabled = false; }
+  });
   panel.hidden = false;
   tools.hidden = false;
   $("[data-gate-prompt]", gate).onclick = () => {
@@ -557,10 +825,9 @@ async function populateGateUpnext(gate, state) {
     setDirectionTabLabel("Situational");
     $("#inspector-kicker").textContent = "EXACT NEXT PROMPT · PREVIEW";
     $("#inspector-title").textContent = preview.stage?.title || "Next turn";
-    $("#inspector-meta").innerHTML = `<span class="chip">${escapeHtml(profile.provider || "")}</span><span class="chip">${escapeHtml(profile.model || "")} · ${escapeHtml(profile.effort || "")}</span><span class="chip ${escapeHtml(session.action || "")}">${escapeHtml(session.action || "")} session</span><span class="chip">${escapeHtml(profile.permission || "")}</span>`;
+    $("#inspector-meta").innerHTML = `<dl class="inspector-evidence"><div><dt>Planned</dt><dd>${escapeHtml(profile.provider || "")} · ${escapeHtml(profile.model || "provider default")} · ${escapeHtml(profile.effort || "default effort")}</dd></div><div><dt>Session</dt><dd>${escapeHtml(session.label || "?")} · ${escapeHtml(session.action || "?")}</dd></div><div><dt>Access</dt><dd>${escapeHtml(profile.permission || "")}</dd></div></dl>`;
     openInspector("transport");
   };
-  $("[data-gate-adjust]", gate).onclick = () => openNextTurnControl();
 }
 
 function configureGate(fragment, state) {
@@ -582,7 +849,7 @@ function configureGate(fragment, state) {
     validation_execution_approval: ["Run the validation commands?", "These commands execute on the host against the isolated implementation worktree. Review the pending commands before approving.", "Yes — run validation", "No — cancel run", "Other — send to repair", "Explain what the implementation session must change before validation"],
     validation_receipt_required: ["Validation receipt required", `Attach the patch-bound receipt from a terminal with: python -m toledo_orchestrator validate ${state.run_id} --receipt-file "C:\\path\\to\\receipt.json"`, "", "No — cancel run", "Other — add direction", "Add receipt or validation guidance"],
     unknown_validation_execution: ["Validation completion is unknown", "The controller stopped after host validation started but before a trustworthy completion record was sealed. It will not rerun the commands automatically. Route the work to repair/inspection, cancel, or add exact recovery direction.", "Yes — inspect and repair", "No — cancel run", "Other — direct recovery", "Tell the implementation session what evidence to inspect before any rerun"],
-    provider_invocation_failed: ["Provider invocation failed", "No successful model response was accepted (quota, network, or CLI failure). Use “Change model · effort · session” below to switch to a model with headroom, then retry — the override applies to the retried turn.", "Retry with displayed settings", "Cancel run", "Retry with direction", "Optional direction for the retried turn"],
+    provider_invocation_failed: ["Provider invocation failed", "No successful model response was accepted (quota, network, or CLI failure). Use the provider, model, effort, and session controls below to choose capacity with headroom, then retry — the override applies to the retried turn.", "Retry with displayed settings", "Cancel run", "Retry with direction", "Optional direction for the retried turn"],
     planning_round_cap_reached: ["Planning round cap reached", "The planning loop used its configured rounds without agreement. Extend it, stop, or redirect the next revision.", "Yes — extend one round", "No — cancel run", "Other — extend with direction", "Tell the planning sessions what must change"],
     implementation_round_cap_reached: ["Implementation round cap reached", "The implementation loop used its configured repair rounds. Extend it, stop, or direct one more repair.", "Yes — extend one round", "No — cancel run", "Other — extend with direction", "Tell the implementation sessions what must change"],
     validation_failed_at_repair_cap: ["Validation still fails", "Required validation failed after the configured repair rounds, and the failure does not match the clean baseline. Extend repair, stop, or give a specific recovery direction.", "Yes — extend repair", "No — cancel run", "Other — direct repair", "Describe the evidence or repair you require"],
@@ -677,6 +944,103 @@ function effectiveProfile(workflow, profileId) {
   return draft ? {...base, ...draft, overridden: true} : {...base, overridden: false};
 }
 
+function concreteTarget(target) {
+  const value = String(target);
+  if (value.startsWith("@seal:") || value.startsWith("@complete:")) return value.split(":").at(-1);
+  return value.startsWith("@") ? null : value;
+}
+
+function graphStageGroups(stages) {
+  // Strongly connected stages are real review/repair loops. This discovers
+  // their membership without projecting the whole backend graph as a card wall.
+  const edges = new Map(stages.map((stage) => [stage.id, []]));
+  for (const stage of stages) {
+    for (const target of Object.values(stage.transitions || {})) {
+      const next = concreteTarget(target);
+      if (next && edges.has(next) && next !== stage.id) edges.get(stage.id).push(next);
+    }
+  }
+  const reachableFrom = (start) => {
+    const seen = new Set([start]);
+    const stack = [start];
+    while (stack.length) {
+      for (const next of edges.get(stack.pop()) || []) {
+        if (!seen.has(next)) { seen.add(next); stack.push(next); }
+      }
+    }
+    return seen;
+  };
+  const reach = new Map(stages.map((stage) => [stage.id, reachableFrom(stage.id)]));
+  const assigned = new Set();
+  const groups = [];
+  for (const stage of stages) {
+    if (assigned.has(stage.id)) continue;
+    const members = stages.filter((other) => !assigned.has(other.id)
+      && reach.get(stage.id).has(other.id) && reach.get(other.id).has(stage.id));
+    members.forEach((member) => assigned.add(member.id));
+    const roundStage = members.find((member) => member.round);
+    groups.push({
+      stages: members,
+      loop: members.length > 1 && roundStage ? roundStage.round : null,
+    });
+  }
+  return groups;
+}
+
+function reachableWorkflowStages(workflow) {
+  const stages = workflow.stages || {};
+  const ordered = [];
+  const visited = new Set();
+  const visit = (stageId) => {
+    if (!stageId || visited.has(stageId) || !stages[stageId]) return;
+    visited.add(stageId);
+    const stage = stages[stageId];
+    ordered.push(stage);
+    for (const target of Object.values(stage.transitions || {})) visit(concreteTarget(target));
+  };
+  visit(workflow.start_stage);
+  return ordered;
+}
+
+function semanticPreflightGroups(workflow) {
+  // The revision stage is entered by the human gate's redirect choice, not by
+  // a provider directive. Treat it as conditional even if a future snapshot
+  // happens to expose an edge to it; otherwise the preview lies about a step
+  // every run will execute. Some test workflows deliberately reuse the same
+  // stage for proposal and revision, so only split distinct stage IDs.
+  const branchOnlyIds = new Set();
+  if (workflow.next_task_revision_stage && workflow.next_task_revision_stage !== workflow.next_task_stage) {
+    branchOnlyIds.add(workflow.next_task_revision_stage);
+  }
+  for (const stageId of workflow.conditional_stages || []) branchOnlyIds.add(stageId);
+  const main = reachableWorkflowStages(workflow).filter((stage) => !branchOnlyIds.has(stage.id));
+  const connected = graphStageGroups(main);
+  const planningLoop = connected.find((group) => group.loop?.counter === "planning")?.stages || [];
+  const planningLoopIds = new Set(planningLoop.map((stage) => stage.id));
+  const build = main.filter((stage) => String(stage.phase || "").startsWith("implementation"));
+  const buildIds = new Set(build.map((stage) => stage.id));
+  const closure = main.filter((stage) => String(stage.phase || "").startsWith("next-task") || stage.id === workflow.next_task_stage);
+  const closureIds = new Set(closure.map((stage) => stage.id));
+  const plan = main.filter((stage) => !planningLoopIds.has(stage.id) && !buildIds.has(stage.id) && !closureIds.has(stage.id));
+  const mainIds = new Set(main.map((stage) => stage.id));
+  const conditional = Object.values(workflow.stages || {}).filter((stage) => branchOnlyIds.has(stage.id) || !mainIds.has(stage.id));
+  const groups = [];
+  if (plan.length) groups.push({id: "plan", title: "Plan", description: "Frame the request and produce the first plan.", stages: plan});
+  if (planningLoop.length) {
+    const policy = planningLoop.find((stage) => stage.round)?.round;
+    groups.push({id: "plan-review", title: "Plan review loop", description: "Challenge the plan, adjudicate findings, and seal the approved handoff.", stages: planningLoop, loop: policy});
+  }
+  if (build.length) {
+    const policy = build.find((stage) => stage.round)?.round;
+    groups.push({id: "build-audit", title: "Build / audit loop", description: "Implement the handoff, audit the evidence, and repair verified findings.", stages: build, loop: policy});
+  }
+  if (closure.length || conditional.length) {
+    groups.push({id: "closure", title: "Closure", description: "Validate and accept the change, then decide whether another cycle should start.", stages: closure, conditional});
+  }
+  if (!groups.length && main.length) groups.push({id: "route", title: "Route", description: "Configured workflow actions.", stages: main, conditional});
+  return groups;
+}
+
 function renderNewRunPreflight() {
   const workflowId = $("#new-workflow").value;
   const workflow = bootstrap?.workflows?.[workflowId];
@@ -687,30 +1051,63 @@ function renderNewRunPreflight() {
     $("#route-warnings").hidden = true;
     return;
   }
-  const stages = orderedWorkflowStages(workflow);
+  const groups = semanticPreflightGroups(workflow);
+  const scheduled = groups.reduce((count, group) => count + group.stages.length, 0);
+  const conditional = groups.reduce((count, group) => count + (group.conditional?.length || 0), 0);
   const verified = bootstrap?.catalog?.verified_at ? new Date(bootstrap.catalog.verified_at).toLocaleDateString() : "never";
-  $("#route-preflight-summary").textContent = `${stages.length} stages · catalog verified ${verified}${bootstrap?.catalog?.stale ? " (stale)" : ""}`;
+  $("#route-preflight-summary").textContent = `${groups.length} phases · ${scheduled} scheduled actions${conditional ? ` · ${conditional} conditional` : ""} · catalog ${verified}${bootstrap?.catalog?.stale ? " (stale)" : ""}`;
   root.innerHTML = "";
-  for (const [index, stage] of stages.entries()) root.append(routeStepRow(workflowId, workflow, stage, index));
-  renderRouteWarnings(workflow, stages);
+  for (const group of groups) root.append(routeGroupRow(workflowId, workflow, group));
+  renderRouteWarnings(workflow, Object.values(workflow.stages || {}));
 }
 
-function routeStepRow(workflowId, workflow, stage, index) {
-  const row = document.createElement("li");
-  row.className = "route-step";
+function routeProfileRow(workflow, stage, groupStages) {
+  const row = document.createElement("div");
+  row.className = "route-profile-row";
   const profile = effectiveProfile(workflow, stage.profile);
+  const profileStages = Object.values(workflow.stages || {}).filter((other) => other.profile === stage.profile);
+  const visibleProfileStages = groupStages.filter((other) => other.profile === stage.profile);
+  const actors = [...new Set(visibleProfileStages.map((item) => `${item.session_slot} (${item.role})`))];
+  const policies = [...new Set(visibleProfileStages.map((item) => item.session_policy))];
   const inCatalog = catalogModels(profile.provider).some((entry) => entry.selection_token === profile.model);
-  const sharedWith = Object.values(workflow.stages || {}).filter((other) => other.profile === stage.profile && other.id !== stage.id).map((other) => other.title);
-  const round = stage.round;
-  row.innerHTML = `<span class="route-step-marker">${index + 1}</span>
-    <div class="route-step-head"><span class="route-step-kind">${escapeHtml(stage.prompt_label || promptShort(stage.prompt_kind))}</span><h4>${escapeHtml(stage.title)}</h4>${round ? `<span class="route-step-loop">up to ${round.cap} rounds</span>` : ""}</div>
-    <p class="route-step-who">${escapeHtml(stage.session_slot)}<span class="dot">·</span>${escapeHtml(profile.provider)}<span class="dot">·</span><strong>${escapeHtml(profile.model || "provider default")}</strong><span class="dot">·</span>${escapeHtml(profile.effort || "default")}<span class="dot">·</span>${escapeHtml(profile.permission || "read-only")}<span class="dot">·</span>${escapeHtml(stage.session_policy)} session${profile.overridden ? '<span class="override-chip">this run only</span>' : ""}${!inCatalog && catalogModels(profile.provider).length ? '<span class="unverified-chip">not in catalog</span>' : ""}</p>
-    <p class="route-step-then">Produces ${escapeHtml(String(stage.artifact_type || "").replaceAll("-", " "))}. ${escapeHtml(transitionLines(workflow, stage).join(" · "))}</p>
-    <div class="route-step-actions"><button type="button" class="quiet-button" data-step-instruction>View instruction</button><button type="button" class="quiet-button" data-step-adjust>Change model · effort</button></div>
-    <div class="route-step-detail" data-step-detail hidden></div>
-    <div class="route-step-editor" data-step-editor hidden></div>`;
+  const sharedWith = profileStages.filter((other) => other.id !== stage.id).map((other) => other.title);
+  row.innerHTML = `<div><strong>${escapeHtml(actors.join(" / "))}</strong><span>${escapeHtml(profile.provider)} · ${escapeHtml(profile.model || "provider default")} · ${escapeHtml(profile.effort || "default")} · ${escapeHtml(profile.permission || "read-only")} · ${escapeHtml(policies.join(" / "))} session</span></div><div class="route-profile-actions">${profile.overridden ? '<span class="text-status success">This run only</span>' : ""}${!inCatalog && catalogModels(profile.provider).length ? '<span class="text-status warning">Not in catalog</span>' : ""}<button type="button" class="quiet-button" data-profile-adjust>Change for this run</button></div><div class="route-step-editor" data-step-editor hidden></div>`;
+  $("[data-profile-adjust]", row).addEventListener("click", () => toggleStageEditor(row, workflow, stage, sharedWith));
+  return row;
+}
+
+function routeActionRow(workflowId, workflow, stage) {
+  const row = document.createElement("li");
+  row.className = "route-action-row";
+  row.innerHTML = `<div class="route-action-copy"><span>${escapeHtml(stage.session_slot)} · ${escapeHtml(stage.role)}</span><strong>${escapeHtml(stage.title)}</strong><p>Produces ${escapeHtml(String(stage.artifact_type || "").replaceAll("-", " "))}. ${escapeHtml(transitionLines(workflow, stage).join(" · "))}</p></div><button type="button" class="quiet-button" data-step-instruction>View instruction</button><div class="route-step-detail" data-step-detail hidden></div>`;
   $("[data-step-instruction]", row).addEventListener("click", () => toggleStageInstruction(row, workflowId, stage));
-  $("[data-step-adjust]", row).addEventListener("click", () => toggleStageEditor(row, workflow, stage, sharedWith));
+  return row;
+}
+
+function routeGroupRow(workflowId, workflow, group) {
+  const row = document.createElement("li");
+  row.className = `route-group route-group-${group.id}`;
+  row.innerHTML = `<header class="route-group-head"><div><h4>${escapeHtml(group.title)}</h4><p>${escapeHtml(group.description)}</p></div>${group.loop ? `<span class="route-group-loop">Up to ${group.loop.cap} ${escapeHtml(group.loop.counter)} rounds, then pause</span>` : ""}</header><div class="route-group-profiles"></div><ul class="route-action-list"></ul>${group.conditional?.length ? '<section class="route-conditional"><strong>If you redirect or request changes</strong><ul></ul></section>' : ""}`;
+  const profilesRoot = $(".route-group-profiles", row);
+  const represented = new Set();
+  const groupStages = [...group.stages, ...(group.conditional || [])];
+  for (const stage of group.stages) {
+    if (!represented.has(stage.profile)) {
+      represented.add(stage.profile);
+      profilesRoot.append(routeProfileRow(workflow, stage, groupStages));
+    }
+    $(".route-action-list", row).append(routeActionRow(workflowId, workflow, stage));
+  }
+  if (group.conditional?.length) {
+    const conditionalRoot = $(".route-conditional ul", row);
+    for (const stage of group.conditional) {
+      if (!represented.has(stage.profile)) {
+        represented.add(stage.profile);
+        profilesRoot.append(routeProfileRow(workflow, stage, groupStages));
+      }
+      conditionalRoot.append(routeActionRow(workflowId, workflow, stage));
+    }
+  }
   return row;
 }
 
@@ -779,26 +1176,6 @@ function renderRouteWarnings(workflow, stages) {
   root.innerHTML = lines.map((line) => `<span>${escapeHtml(line)}</span>`).join("");
 }
 
-function orderedWorkflowStages(workflow) {
-  const stages = workflow.stages || {};
-  const ordered = [];
-  const visited = new Set();
-  const visit = (stageId) => {
-    if (!stageId || visited.has(stageId) || !stages[stageId]) return;
-    visited.add(stageId);
-    const stage = stages[stageId];
-    ordered.push(stage);
-    for (const target of Object.values(stage.transitions || {})) {
-      const value = String(target);
-      const next = value.startsWith("@seal:") || value.startsWith("@complete:") ? value.split(":").at(-1) : value.startsWith("@") ? null : value;
-      visit(next);
-    }
-  };
-  visit(workflow.start_stage);
-  for (const stageId of Object.keys(stages)) visit(stageId);
-  return ordered;
-}
-
 function catalogModels(provider) {
   return (bootstrap?.catalog?.models || []).filter((model) => model.provider === provider);
 }
@@ -808,15 +1185,31 @@ function renderCatalogStatus() {
   if (!root) return;
   const catalog = bootstrap?.catalog || {};
   const refreshInfo = catalog.last_refresh;
-  const verified = catalog.verified_at ? new Date(catalog.verified_at).toLocaleString() : "never";
-  root.innerHTML = `<div class="catalog-meta"><span>${(catalog.models || []).length} selectable models</span><span>verified ${escapeHtml(verified)}</span>${catalog.stale ? '<span class="warn">stale — refresh recommended</span>' : ""}${refreshInfo && !refreshInfo.succeeded ? `<span class="warn">last refresh failed ${escapeHtml(new Date(refreshInfo.at).toLocaleString())}</span>` : ""}<button type="button" class="quiet-button" id="catalog-refresh">Refresh from installed CLIs</button></div>` +
+  const checked = catalog.verified_at ? new Date(catalog.verified_at).toLocaleString() : "never";
+  root.innerHTML = `<div class="catalog-meta"><span>${(catalog.models || []).length} selectable models</span><span>catalog checked ${escapeHtml(checked)}</span>${catalog.stale ? '<span class="warn">stale — refresh recommended</span>' : ""}${refreshInfo && !refreshInfo.succeeded ? `<span class="warn">last refresh failed ${escapeHtml(new Date(refreshInfo.at).toLocaleString())}</span>` : ""}<button type="button" class="quiet-button" id="catalog-refresh">Refresh from installed CLIs</button></div>` +
     [["codex", "Codex CLI"], ["claude", "Claude Code"]].map(([provider, providerLabel]) => {
       const source = catalog.sources?.[provider] || refreshInfo?.sources?.[provider] || {};
       const models = catalogModels(provider);
-      const rows = models.map((model) => `<li><strong>${escapeHtml(model.display_name || model.selection_token)}</strong><code>${escapeHtml(model.selection_token)}</code><span>${escapeHtml((model.supported_efforts || []).join(" · "))}</span>${model.special_modes?.length ? `<em>${escapeHtml(model.special_modes.join(", "))}</em>` : ""}</li>`).join("");
+      const rows = models.map((model) => {
+        const efforts = (model.supported_efforts || []).length ? model.supported_efforts.join(" · ") : "default only";
+        const evidence = model.live_verified;
+        const observedEfforts = evidence?.observed_efforts || evidence?.efforts || [];
+        const acceptedEfforts = (evidence?.accepted_efforts || []).filter((value) => !observedEfforts.includes(value));
+        const checkedAt = evidence?.at ? ` · ${new Date(evidence.at).toLocaleString()}` : "";
+        const evidenceScope = evidence?.latest_run_observed ? "Latest matrix" : "Historical proof";
+        const live = evidence
+          ? `<span class="evidence-status model-observed" title="A live invocation returned the requested model${escapeHtml(checkedAt)}">${evidenceScope} · model observed${observedEfforts.length ? ` · effort observed: ${escapeHtml(observedEfforts.join("/"))}` : " · effort not observable"}${acceptedEfforts.length ? ` · CLI accepted: ${escapeHtml(acceptedEfforts.join("/"))}` : ""}${escapeHtml(checkedAt)}</span>`
+          : '<span class="evidence-status not-tested">Not live-tested</span>';
+        const latestAttempt = model.last_live_attempt;
+        const latestFailure = latestAttempt && !latestAttempt.ok
+          ? `<span class="evidence-status latest-failed">Latest matrix blocked · ${latestAttempt.error === "claude_api_error_429" ? "Claude session limit (429)" : escapeHtml(latestAttempt.error || "provider error")}${latestAttempt.at ? ` · ${escapeHtml(new Date(latestAttempt.at).toLocaleString())}` : ""}</span>`
+          : "";
+        return `<li><strong>${escapeHtml(model.display_name || model.selection_token)}</strong><code>${escapeHtml(model.selection_token)}</code><span>Advertised efforts: ${escapeHtml(efforts)}</span>${model.special_modes?.length ? `<em>${escapeHtml(model.special_modes.join(", "))}</em>` : ""}${live}${latestFailure}</li>`;
+      }).join("");
+      const listing = source.listing || (provider === "codex" ? "installed CLI discovery" : "curated official manifest + installed CLI capability check");
       const footnote = provider === "codex"
-        ? "Discovered from the installed CLI (codex debug models) — reflects this account and build."
-        : "Curated official manifest; the installed CLI is verified for --model/--effort support. Pass full model IDs — family aliases are unreliable headless.";
+        ? `Catalog source: ${listing}. Availability reflects this installed account and CLI build; live evidence is labeled separately.`
+        : `Catalog source: ${listing}. Full model IDs are used headlessly; model observation and effort acceptance/observation are labeled separately.`;
       return `<article class="catalog-provider"><header><strong>${providerLabel}</strong><span>${escapeHtml(source.cli_version || "version unknown")}</span></header>${source.error ? `<p class="catalog-error">Discovery failed: ${escapeHtml(source.error)}</p>` : ""}${rows ? `<ul>${rows}</ul>` : '<p class="settings-hint">No selectable models recorded. Refresh to query the installed CLI.</p>'}<p class="catalog-footnote">${footnote}</p></article>`;
     }).join("");
   $("#catalog-refresh")?.addEventListener("click", async (event) => {
@@ -834,7 +1227,7 @@ function renderCatalogStatus() {
   });
 }
 
-function installCatalogPicker(root, provider, model, effort) {
+function installCatalogPicker(root, provider, model, effort, onSelectionChange = null) {
   const modelSelect = $('[data-field="model"]', root);
   const effortSelect = $('[data-field="effort"]', root);
   const customBox = $('[data-catalog-custom]', root);
@@ -847,11 +1240,16 @@ function installCatalogPicker(root, provider, model, effort) {
   modelSelect.value = entry ? entry.selection_token : "__custom__";
   customModel.value = entry ? "" : (model || "");
   customEffort.value = entry ? "" : (effort || "");
-  const sync = () => {
+  let desiredEffort = effort || "";
+  const sync = ({initial = false} = {}) => {
+    // Capture the choice before rebuilding <option>s. Setting innerHTML makes
+    // the browser select option zero, which previously downgraded xhigh/max to
+    // the first advertised effort without the operator touching the control.
+    const previousEffort = initial ? desiredEffort : effortSelect.value;
     const selected = entries.find((candidate) => candidate.selection_token === modelSelect.value);
     const custom = !selected;
     customBox.hidden = !custom;
-    effortSelect.closest("label").hidden = custom;
+    (effortSelect.closest("label") || effortSelect).hidden = custom;
     // The catalog provenance lives once in Settings → Models; per-card text
     // appears only for the deliberate custom escape hatch.
     if (custom) {
@@ -861,14 +1259,24 @@ function installCatalogPicker(root, provider, model, effort) {
     }
     detail.hidden = true;
     detail.textContent = "";
-    const efforts = selected.supported_efforts || [];
+    // Models with no documented effort ladder (Haiku 4.5) expose only the
+    // provider default; the adapter then omits the effort flag.
+    const efforts = selected.supported_efforts?.length ? selected.supported_efforts : ["default"];
     effortSelect.innerHTML = efforts.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
-    effortSelect.value = efforts.includes(effortSelect.value) ? effortSelect.value : (efforts.includes(effort) ? effort : (efforts[0] || ""));
+    const advertisedDefault = selected.default_effort;
+    desiredEffort = efforts.includes(previousEffort)
+      ? previousEffort
+      : efforts.includes(advertisedDefault)
+        ? advertisedDefault
+        : (efforts[0] || "");
+    effortSelect.value = desiredEffort;
   };
-  effortSelect.value = effort || "";
-  modelSelect.addEventListener("change", sync);
-  customModel.addEventListener("input", sync);
-  sync();
+  modelSelect.onchange = () => { sync(); onSelectionChange?.(); };
+  effortSelect.onchange = () => onSelectionChange?.();
+  customModel.oninput = () => onSelectionChange?.();
+  customEffort.oninput = () => onSelectionChange?.();
+  sync({initial: true});
+  return sync;
 }
 
 function catalogSelection(root) {
@@ -890,27 +1298,43 @@ function renderSettings() {
   const workflow = workflows[settingsWorkflowId];
   const root = $("#profile-settings");
   root.innerHTML = "";
+  // A compact table, one row per route profile; the only free text lives in
+  // the explicit Custom… branch inside the cells.
+  const table = document.createElement("table");
+  table.className = "defaults-table";
+  table.innerHTML = `<thead><tr><th>Used for</th><th>Provider</th><th>Model</th><th>Effort</th><th></th></tr></thead><tbody></tbody>`;
+  const body = $("tbody", table);
   for (const [profileId, profile] of Object.entries(workflow?.profiles || {})) {
-    const card = document.createElement("article");
-    card.className = "profile-editor";
-    // Replace the legacy free-text controls with catalog-backed selects. The
-    // only text entry lives inside the explicit Custom… branch.
-    card.innerHTML = `<header><strong>${escapeHtml(profile.label)}</strong><span>${escapeHtml(profile.id || profileId)} / ${escapeHtml(profile.provider)}</span></header><div class="profile-grid"><label>Model<select data-field="model" aria-label="${escapeHtml(profile.label)} model"></select></label><label>Reasoning effort<select data-field="effort" aria-label="${escapeHtml(profile.label)} reasoning effort"></select></label><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} profile">Save</button></div><div data-catalog-custom hidden><label>Custom model<input data-field="custom-model" autocomplete="off"></label><label>Custom reasoning effort<input data-field="custom-effort" autocomplete="off"></label></div><p class="catalog-detail" data-catalog-detail></p>`;
-    installCatalogPicker(card, profile.provider, profile.model, profile.effort);
-    $("button", card).addEventListener("click", async () => {
-      const selection = catalogSelection(card);
+    const usedFor = Object.values(workflow.stages || {})
+      .filter((stage) => stage.profile === (profile.id || profileId))
+      .map((stage) => stage.title);
+    const row = document.createElement("tr");
+    row.innerHTML = `<td data-label="Used for"><strong>${escapeHtml(usedFor.join(", ") || profile.label)}</strong><span class="defaults-profile-id">${escapeHtml(profile.id || profileId)}</span></td><td data-label="Provider">${escapeHtml(profile.provider)}</td><td data-label="Model"><select data-field="model" aria-label="${escapeHtml(profile.label)} model"></select><div data-catalog-custom hidden><input data-field="custom-model" autocomplete="off" placeholder="exact model ID"></div></td><td data-label="Effort"><select data-field="effort" aria-label="${escapeHtml(profile.label)} reasoning effort"></select><div data-catalog-custom-effort hidden><input data-field="custom-effort" autocomplete="off" placeholder="exact effort"></div><p class="catalog-detail" data-catalog-detail hidden></p></td><td data-label="Action"><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} default">Save</button></td>`;
+    // installCatalogPicker expects one custom container; bridge the split cells.
+    const customEffortBox = $("[data-catalog-custom-effort]", row);
+    const customBox = $("[data-catalog-custom]", row);
+    const syncCustomVisibility = () => { customEffortBox.hidden = customBox.hidden; };
+    installCatalogPicker(row, profile.provider, profile.model, profile.effort);
+    new MutationObserver(syncCustomVisibility).observe(customBox, {attributes: true, attributeFilter: ["hidden"]});
+    syncCustomVisibility();
+    $("button", row).addEventListener("click", async (event) => {
+      const selection = catalogSelection(row);
       if (!selection.model || !selection.effort) { alert("Custom model and reasoning effort are required."); return; }
-      const payload = {workflow:workflow.id, profile:profile.id || profileId, ...selection};
+      event.target.disabled = true;
       try {
-        const saved = await api("/api/profile", {method:"POST",body:JSON.stringify(payload)});
-        $('[data-field="model"]',card).value = saved.model;
-        $('[data-field="effort"]',card).value = saved.effort;
-        $("strong", card).textContent = saved.label;
+        await api("/api/profile", {method:"POST",body:JSON.stringify({workflow:workflow.id, profile:profile.id || profileId, ...selection})});
         await loadBootstrap();
-      } catch(error) { alert(`Not saved: ${error.message}. Reload to discard this draft.`); }
+      } catch(error) {
+        alert(`Not saved: ${error.message}. Reload to discard this draft.`);
+        event.target.disabled = false;
+      }
     });
-    root.append(card);
+    body.append(row);
   }
+  const tableWrap = document.createElement("div");
+  tableWrap.className = "defaults-table-wrap";
+  tableWrap.append(table);
+  root.append(tableWrap);
   const projects = $("#project-settings");
   projects.innerHTML = Object.entries(bootstrap.projects).map(([id, value]) => `<article class="project-card"><strong>${escapeHtml(id)}</strong><code>${escapeHtml(value.root)}</code><p>${value.implementation_enabled ? "Isolated implementation enabled" : "Read-only"} · ${escapeHtml(value.branch || "detached")} · ${value.dirty ? "source has local changes" : "source clean"} · ${escapeHtml((value.source_revision || "").slice(0,8))}</p></article>`).join("");
 }
@@ -932,64 +1356,6 @@ function showProjectForm() {
     catch(error){ alert(error.message); }
   });
   $("#project-settings").append(form);
-}
-
-function openNextTurnControl() {
-  const workflow = bootstrap.workflows[currentState.workflow];
-  const stage = workflow.stages[currentState.current_stage];
-  const defaultProfile = workflow.profiles[stage.profile];
-  const writeAllowed = stage.phase === "implementation" && stage.role === "implementer";
-  const profiles = Object.values(workflow.profiles).filter((profile) => profile.provider === defaultProfile.provider && (writeAllowed || profile.permission !== "workspace-write"));
-  const retryingFailure = currentState.pending_human_decision === "provider_invocation_failed";
-  const overrideNote = retryingFailure
-    ? "Apply saves this override. Then choose Retry on the failure gate to launch the displayed next provider turn."
-    : "The override is recorded in the run and applies only to the displayed next provider turn.";
-  const dialog = document.createElement("dialog");
-  dialog.className = "modal";
-  dialog.innerHTML = `<form method="dialog"><div class="modal-head"><div><p class="eyebrow">NEXT TURN</p><h2>${escapeHtml(stage.title)}</h2></div><button value="cancel" aria-label="Close override">×</button></div><label>Profile<select id="override-profile">${profiles.map((profile)=>`<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.label)}</option>`).join("")}</select></label><div class="override-fields"><label>Model<select data-field="model"></select></label><label>Reasoning effort<select data-field="effort"></select></label></div><div data-catalog-custom hidden><label>Custom model<input data-field="custom-model" autocomplete="off"></label><label>Custom reasoning effort<input data-field="custom-effort" autocomplete="off"></label></div><p class="catalog-detail" data-catalog-detail></p><input id="override-model" type="hidden"><input id="override-effort" type="hidden"><label>Session action<select id="override-session"><option value="">Workflow default</option><option value="continue">Continue current session</option><option value="new">Start a new session</option></select></label><div class="override-preview" id="override-preview" aria-live="polite"></div><p class="override-note">${escapeHtml(overrideNote)}</p><div class="modal-actions"><button value="cancel" class="ghost-button">Cancel</button><button type="button" class="primary-button" id="save-override">Apply override</button></div></form>`;
-  document.body.append(dialog);
-  $("#override-profile",dialog).value = currentState.next_turn_override?.profile || stage.profile;
-  $("#override-session",dialog).value = currentState.next_turn_override?.session_action || "";
-  const selectedProfile = () => workflow.profiles[$("#override-profile", dialog).value];
-  const refreshOverridePreview = ({resetValues = false} = {}) => {
-    const profile = selectedProfile();
-    if (resetValues) {
-      $("#override-model", dialog).value = profile.model || "";
-      $("#override-effort", dialog).value = profile.effort || "";
-    }
-    const session = $("#override-session", dialog).value || stage.session_policy;
-    $("#override-preview", dialog).innerHTML = `<span>${escapeHtml(profile.provider)}</span><strong>${escapeHtml($("#override-model", dialog).value || "provider default")}</strong><span>${escapeHtml($("#override-effort", dialog).value || "default effort")}</span><span>${escapeHtml(profile.permission)}</span><span>${escapeHtml(session)}</span>`;
-  };
-  $("#override-model",dialog).value = currentState.next_turn_override?.profile_value?.model || selectedProfile().model || "";
-  $("#override-effort",dialog).value = currentState.next_turn_override?.profile_value?.effort || selectedProfile().effort || "";
-  const syncCatalogOverride = () => {
-    const selection = catalogSelection(dialog);
-    $("#override-model", dialog).value = selection.model;
-    $("#override-effort", dialog).value = selection.effort;
-  };
-  const installOverridePicker = () => {
-    installCatalogPicker(dialog, selectedProfile().provider, $("#override-model", dialog).value, $("#override-effort", dialog).value);
-    $$("[data-field]", dialog).forEach((input) => input.addEventListener("input", () => { syncCatalogOverride(); refreshOverridePreview(); }));
-    $$("select[data-field]", dialog).forEach((input) => input.addEventListener("change", () => { syncCatalogOverride(); refreshOverridePreview(); }));
-  };
-  installOverridePicker();
-  $("#override-profile",dialog).addEventListener("change", () => refreshOverridePreview({resetValues:true}));
-  $("#override-model",dialog).addEventListener("input", () => refreshOverridePreview());
-  $("#override-effort",dialog).addEventListener("input", () => refreshOverridePreview());
-  $("#override-session",dialog).addEventListener("change", () => refreshOverridePreview());
-  $("#override-profile",dialog).addEventListener("change", () => { installOverridePicker(); syncCatalogOverride(); refreshOverridePreview(); });
-  refreshOverridePreview();
-  $("#save-override",dialog).addEventListener("click", async () => {
-    try {
-      syncCatalogOverride();
-      const selection = catalogSelection(dialog);
-      if (!selection.model || !selection.effort) throw new Error("Custom model and reasoning effort are required.");
-      await api(`/api/runs/${encodeURIComponent(currentRunId)}/override`, {method:"POST",body:JSON.stringify({profile:$("#override-profile",dialog).value,...selection,session_action:$("#override-session",dialog).value || null})});
-      dialog.close();dialog.remove();await refreshCurrent();
-    } catch(error){alert(error.message);}
-  });
-  dialog.addEventListener("close",()=>dialog.remove(),{once:true});
-  dialog.showModal();
 }
 
 async function createRun() {
@@ -1095,13 +1461,20 @@ function bindStaticEvents() {
   $("#zoom-slider").addEventListener("input", (event) => applyTimelineDensity(event.target.value));
   $("#phase-filter").addEventListener("change", () => currentState && renderTimeline(currentState));
   $("#session-filter").addEventListener("change", () => currentState && renderTimeline(currentState));
-  $("#jump-active").addEventListener("click", () => ($("#active-node") || $("#active-gate"))?.scrollIntoView({behavior:"smooth",block:"center"}));
+  $("#jump-active").addEventListener("click", () => ($("#active-node") || $("#active-gate"))?.scrollIntoView({behavior:"smooth",block:"start"}));
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
     if ($("#inspector").getAttribute("aria-hidden") === "false") closeInspector();
     else if (document.body.classList.contains("mobile-rail-open")) closeRunRail();
   });
   applyTimelineDensity($("#zoom-slider").value);
+  // Deep links so dialogs are directly addressable (and screenshotable).
+  if (location.hash === "#new") openNew();
+  if (location.hash.startsWith("#settings")) {
+    $("#settings-dialog").showModal();
+    const tab = location.hash.split("-")[1];
+    if (tab) $(`[data-settings-tab="${tab}"]`)?.click();
+  }
 }
 
 bindStaticEvents();
