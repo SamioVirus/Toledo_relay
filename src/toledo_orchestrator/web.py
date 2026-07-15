@@ -17,6 +17,7 @@ from .configuration import (
     load_configured_projects,
     load_configured_workflows,
     save_project_value,
+    save_workflow_variant,
     update_profile,
 )
 from .catalog import load_catalog, refresh_catalog, research_catalog, validate_selection
@@ -346,12 +347,20 @@ def make_handler(
                     overrides = value.get("profile_overrides")
                     if overrides is not None and not isinstance(overrides, dict):
                         raise ValueError("profile_overrides must be an object")
+                    round_overrides = value.get("round_overrides")
+                    if round_overrides is not None and not isinstance(round_overrides, dict):
+                        raise ValueError("round_overrides must be an object")
+                    prompt_overrides = value.get("prompt_overrides")
+                    if prompt_overrides is not None and not isinstance(prompt_overrides, dict):
+                        raise ValueError("prompt_overrides must be an object")
                     run_id = engine.create_run(
                         request,
                         str(value.get("project", "toledo")),
                         str(value.get("workflow", "continuous-development")),
                         run_mode=str(value.get("run_mode", "auto")),
                         profile_overrides=overrides,
+                        round_overrides=round_overrides,
+                        prompt_overrides=prompt_overrides,
                     )
                     workers.start(
                         run_id,
@@ -453,6 +462,26 @@ def make_handler(
                     engine.workflows = load_configured_workflows(engine.runtime_dir)
                     saved = workflow.public_summary()["profiles"][profile_id]
                     self._send(saved)
+                    return
+                if parsed.path == "/api/workflows/save-as":
+                    catalog = load_catalog(engine.runtime_dir, refresh=False)
+                    validate_profile = (
+                        (lambda **kwargs: validate_selection(catalog, **kwargs))
+                        if catalog.get("models")
+                        else None
+                    )
+                    workflow = save_workflow_variant(
+                        engine.runtime_dir,
+                        str(value.get("base_workflow", "")),
+                        str(value.get("id", "")),
+                        str(value.get("label", "")),
+                        profile_overrides=value.get("profile_overrides") or None,
+                        round_overrides=value.get("round_overrides") or None,
+                        prompt_overrides=value.get("prompt_overrides") or None,
+                        validate_profile=validate_profile,
+                    )
+                    engine.workflows = load_configured_workflows(engine.runtime_dir)
+                    self._send(workflow.public_summary())
                     return
                 if parsed.path == "/api/catalog/refresh":
                     self._send(refresh_catalog(engine.runtime_dir))

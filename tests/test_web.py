@@ -512,3 +512,48 @@ def test_local_web_exposes_inactive_run_recovery(tmp_path: Path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_save_workflow_variant_api_creates_selectable_workflow(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status, saved = request_json(base + "/api/workflows/save-as", method="POST", nonce="test-nonce", value={
+            "base_workflow": "continuous-development",
+            "id": "abc-budget",
+            "label": "A/B/C · Budget",
+            "profile_overrides": {"claude-planning-review": {"model": "claude-haiku-4-5-20251001", "effort": "default"}},
+            "round_overrides": {"planning": 5},
+            "prompt_overrides": {"planning-kickoff.md": "# Custom ideation\nBe brief.\n"},
+        })
+        assert status == 200
+        assert saved["id"] == "abc-budget"
+        assert saved["label"] == "A/B/C · Budget"
+        assert saved["profiles"]["claude-planning-review"]["model"] == "claude-haiku-4-5-20251001"
+        assert saved["stages"]["planning-review"]["round"]["cap"] == 5
+
+        # The variant is offered by bootstrap and its custom prompt resolves.
+        status, bootstrap = request_json(base + "/api/bootstrap")
+        assert status == 200 and "abc-budget" in bootstrap["workflows"]
+        status, prompt = request_json(base + "/api/workflows/abc-budget/stage-prompt?stage=planning-propose")
+        assert status == 200 and prompt["template"].startswith("# Custom ideation")
+        # The base workflow keeps its packaged instruction and caps.
+        status, base_prompt = request_json(base + "/api/workflows/continuous-development/stage-prompt?stage=planning-propose")
+        assert status == 200 and not base_prompt["template"].startswith("# Custom ideation")
+        assert bootstrap["workflows"]["continuous-development"]["stages"]["planning-review"]["round"]["cap"] == 3
+
+        # A second save under the same name is rejected instead of clobbering.
+        try:
+            request_json(base + "/api/workflows/save-as", method="POST", nonce="test-nonce", value={
+                "base_workflow": "continuous-development", "id": "abc-budget", "label": "Again",
+            })
+        except urllib.error.HTTPError as error:
+            assert error.code == 400
+        else:
+            raise AssertionError("duplicate workflow id accepted")
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=5)

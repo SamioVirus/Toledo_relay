@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Toledo Relay</title>
-  <link rel="stylesheet" href="/styles.css?v=rescue4">
+  <link rel="stylesheet" href="/styles.css?v=routectl1">
 </head>
 <body>
   <div class="app-shell">
@@ -71,8 +71,16 @@
         <div id="route-warnings" class="route-warnings" hidden></div>
         <ol id="new-run-preflight" class="route-steps"></ol>
         <p class="route-footnote">Adjustments here bind to this run only. Saved defaults live in Settings → Route defaults.</p>
+        <div class="route-saveas">
+          <button type="button" class="quiet-button" id="workflow-saveas-toggle">Save adjustments as new workflow…</button>
+          <div id="workflow-saveas-form" hidden>
+            <label>New workflow name<input id="workflow-saveas-name" autocomplete="off" placeholder="e.g. A/B/C · Budget models, 5 planning rounds"></label>
+            <button type="button" class="primary-button" id="workflow-saveas-confirm">Save workflow</button>
+          </div>
+        </div>
       </section>
       <label>Request<textarea id="new-request" rows="11" placeholder="Describe the outcome, why it matters, constraints, and evidence you want. The planning session will develop the implementation handoff."></textarea></label>
+      <p id="new-run-error" class="route-warnings" hidden></p>
       <div class="modal-actions"><button value="cancel" class="ghost-button">Cancel</button><button type="button" id="create-run" class="primary-button">Start planning</button></div>
     </form>
   </dialog>
@@ -117,6 +125,6 @@
     </article>
   </template>
 
-  <script src="/app.js?v=rescue4" defer></script>
+  <script src="/app.js?v=routectl1" defer></script>
 </body>
 </html>

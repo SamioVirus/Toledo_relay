@@ -227,6 +227,22 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .route-step-editor .editor-note { color:var(--faint); font-size:10px; margin:0; }
 .route-step-editor .editor-actions { display:flex; gap:6px; justify-content:flex-end; }
 .route-step-editor .editor-actions button { padding:5px 9px; font-size:10px; }
+.route-action-tools { display:flex; align-items:center; gap:8px; justify-self:end; }
+.route-action-tools button { padding:5px 8px; font-size:10px; }
+.route-group-loop input[type="number"] { width:52px; padding:4px 5px; color:var(--ink); background:#09131e; border:1px solid #4e4630; border-radius:7px; font:600 11px ui-monospace,Consolas,monospace; text-align:center; }
+.instruction-meta { margin:0 0 7px; color:var(--faint); font:9px/1.5 ui-monospace,Consolas,monospace; overflow-wrap:anywhere; }
+.route-step-detail textarea { width:100%; min-height:220px; resize:vertical; color:#c6d2e0; background:#0a141f; border:1px solid #26384c; border-radius:8px; padding:10px; font:10px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; }
+.route-step-detail .editor-actions { display:flex; gap:6px; justify-content:flex-end; margin-top:7px; }
+.route-step-detail .editor-actions button { padding:5px 9px; font-size:10px; }
+.route-step-detail .editor-note { color:var(--faint); font-size:10px; margin:6px 0 0; }
+.route-saveas { margin-top:10px; padding-top:10px; border-top:1px solid #1e2e40; }
+.route-saveas > button { font-size:10px; }
+#workflow-saveas-form { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:end; margin-top:8px; }
+#workflow-saveas-form label { margin:0; }
+#workflow-saveas-form input { padding:8px; font-size:11px; }
+#workflow-saveas-form button { padding:8px 12px; font-size:11px; }
+#new-run-error { margin:0 0 14px; border-color:#6b3940; background:#241014; color:#ffc0bd; }
+.defaults-used-for strong { display:block; font-size:11px; line-height:1.45; }
 .route-conditional { margin-top:10px; padding:10px 12px; border-left:2px solid #765f31; background:#181812; }
 .route-conditional > strong { color:#e1c88e; font:700 9px ui-monospace,monospace; text-transform:uppercase; letter-spacing:.06em; }
 .settings-tabs { display:flex; gap:2px; border-bottom:1px solid #233246; margin-bottom:16px; }
@@ -320,6 +336,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .route-profile-row,.route-action-row { grid-template-columns:1fr; }
   .route-profile-actions { justify-content:flex-start; }
   .route-action-row > button { justify-self:start; min-height:34px; }
+  .route-action-tools { justify-self:start; }
+  .route-action-tools button { min-height:34px; }
+  #workflow-saveas-form { grid-template-columns:1fr; }
   .defaults-table-wrap { overflow:visible; }
   .defaults-table,.defaults-table tbody,.defaults-table tr,.defaults-table td { display:block; width:100%; }
   .defaults-table thead { display:none; }

@@ -6,7 +6,12 @@ from typing import Any
 
 from .core import atomic_write
 from .project import ProjectDefinition, load_projects
-from .workflow import WorkflowDefinition, load_workflow_layers
+from .workflow import (
+    WorkflowDefinition,
+    apply_round_overrides,
+    load_workflow_layers,
+    validate_prompt_overrides,
+)
 
 
 def configuration_dir(runtime_dir: Path) -> Path:
@@ -60,6 +65,70 @@ def save_workflow_value(runtime_dir: Path, value: dict[str, Any]) -> WorkflowDef
         candidate.unlink(missing_ok=True)
     atomic_write(target, (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     return parsed
+
+
+def save_workflow_variant(
+    runtime_dir: Path,
+    base_workflow_id: str,
+    new_id: str,
+    label: str,
+    *,
+    profile_overrides: dict[str, Any] | None = None,
+    round_overrides: dict[str, Any] | None = None,
+    prompt_overrides: dict[str, Any] | None = None,
+    validate_profile: Any = None,
+) -> WorkflowDefinition:
+    """Persist New-cycle adjustments as a named workflow the selector can offer.
+
+    The variant is a full standalone definition: the base snapshot with the
+    submitted model/effort, round-cap, and instruction edits applied. Edited
+    instructions are written under the new workflow's prompt namespace so the
+    packaged prompt files stay untouched.
+    """
+
+    workflows = load_configured_workflows(runtime_dir)
+    if base_workflow_id not in workflows:
+        raise ValueError(f"unknown base workflow: {base_workflow_id}")
+    new_id = str(new_id).strip()
+    if not new_id or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for character in new_id):
+        raise ValueError("workflow id must use lowercase letters, digits, hyphen, or underscore")
+    if new_id in workflows:
+        raise ValueError(f"a workflow named {new_id} already exists; choose a different name")
+    label = str(label).strip() or new_id
+    value = workflows[base_workflow_id].snapshot()
+    value["id"] = new_id
+    value["label"] = label
+    if profile_overrides:
+        if not isinstance(profile_overrides, dict):
+            raise ValueError("profile_overrides must be an object")
+        for profile_id, changes in profile_overrides.items():
+            if profile_id not in value["profiles"]:
+                raise ValueError(f"unknown profile override: {profile_id}")
+            if not isinstance(changes, dict):
+                raise ValueError(f"profile override for {profile_id} must be an object")
+            target = value["profiles"][profile_id]
+            model = str(changes.get("model") or target["model"]).strip()
+            effort = str(changes.get("effort") or target["effort"]).strip()
+            custom = bool(changes.get("custom"))
+            if not model or not effort:
+                raise ValueError(f"profile override for {profile_id} requires model and effort")
+            if validate_profile is not None:
+                validate_profile(provider=str(target["provider"]), model=model, effort=effort, custom=custom)
+            target.update({"model": model, "effort": effort, "custom": custom, "label": f"{model} · {effort}"})
+    if round_overrides:
+        apply_round_overrides(value, round_overrides)
+    stage_prompt_files = {
+        str(stage.get("prompt_file"))
+        for stage in value.get("stages", {}).values()
+        if stage.get("prompt_file")
+    }
+    override_bytes = validate_prompt_overrides(prompt_overrides, stage_prompt_files)
+    if override_bytes:
+        namespaces = [new_id, *[item for item in value.get("prompt_namespaces", []) if item != new_id]]
+        value["prompt_namespaces"] = namespaces
+        for name, data in override_bytes.items():
+            atomic_write(configuration_dir(runtime_dir) / "prompts" / new_id / name, data)
+    return save_workflow_value(runtime_dir, value)
 
 
 def update_profile(

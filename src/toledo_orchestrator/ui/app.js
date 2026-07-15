@@ -903,7 +903,35 @@ function populateNewRun() {
 }
 
 const launchOverrides = new Map();
+const launchRoundOverrides = new Map();
+const launchPromptOverrides = new Map();
 const stagePromptCache = new Map();
+
+function clearLaunchAdjustments() {
+  launchOverrides.clear();
+  launchRoundOverrides.clear();
+  launchPromptOverrides.clear();
+}
+
+function collectLaunchAdjustments(workflow) {
+  const profileOverrides = {};
+  for (const [profileId, selection] of launchOverrides) {
+    if (workflow.profiles?.[profileId]) profileOverrides[profileId] = selection;
+  }
+  const roundOverrides = Object.fromEntries(launchRoundOverrides);
+  const promptOverrides = Object.fromEntries(launchPromptOverrides);
+  return {
+    profile_overrides: Object.keys(profileOverrides).length ? profileOverrides : null,
+    round_overrides: Object.keys(roundOverrides).length ? roundOverrides : null,
+    prompt_overrides: Object.keys(promptOverrides).length ? promptOverrides : null,
+  };
+}
+
+function showNewRunError(message) {
+  const box = $("#new-run-error");
+  box.hidden = !message;
+  box.textContent = message || "";
+}
 
 function describeTransition(workflow, target) {
   const value = String(target);
@@ -1079,7 +1107,8 @@ function routeProfileRow(workflow, stage, groupStages) {
 function routeActionRow(workflowId, workflow, stage) {
   const row = document.createElement("li");
   row.className = "route-action-row";
-  row.innerHTML = `<div class="route-action-copy"><span>${escapeHtml(stage.session_slot)} · ${escapeHtml(stage.role)}</span><strong>${escapeHtml(stage.title)}</strong><p>Produces ${escapeHtml(String(stage.artifact_type || "").replaceAll("-", " "))}. ${escapeHtml(transitionLines(workflow, stage).join(" · "))}</p></div><button type="button" class="quiet-button" data-step-instruction>View instruction</button><div class="route-step-detail" data-step-detail hidden></div>`;
+  const edited = launchPromptOverrides.has(stage.prompt_file);
+  row.innerHTML = `<div class="route-action-copy"><span>${escapeHtml(stage.session_slot)} · ${escapeHtml(stage.role)}</span><strong>${escapeHtml(stage.title)}</strong><p>Produces ${escapeHtml(String(stage.artifact_type || "").replaceAll("-", " "))}. ${escapeHtml(transitionLines(workflow, stage).join(" · "))}</p></div><div class="route-action-tools">${edited ? '<span class="text-status success">Edited for this run</span>' : ""}<button type="button" class="quiet-button" data-step-instruction>Edit instruction</button></div><div class="route-step-detail" data-step-detail hidden></div>`;
   $("[data-step-instruction]", row).addEventListener("click", () => toggleStageInstruction(row, workflowId, stage));
   return row;
 }
@@ -1087,7 +1116,24 @@ function routeActionRow(workflowId, workflow, stage) {
 function routeGroupRow(workflowId, workflow, group) {
   const row = document.createElement("li");
   row.className = `route-group route-group-${group.id}`;
-  row.innerHTML = `<header class="route-group-head"><div><h4>${escapeHtml(group.title)}</h4><p>${escapeHtml(group.description)}</p></div>${group.loop ? `<span class="route-group-loop">Up to ${group.loop.cap} ${escapeHtml(group.loop.counter)} rounds, then pause</span>` : ""}</header><div class="route-group-profiles"></div><ul class="route-action-list"></ul>${group.conditional?.length ? '<section class="route-conditional"><strong>If you redirect or request changes</strong><ul></ul></section>' : ""}`;
+  let loopControl = "";
+  if (group.loop) {
+    const counter = String(group.loop.counter);
+    const baseCap = Number(group.loop.cap);
+    const shownCap = launchRoundOverrides.has(counter) ? launchRoundOverrides.get(counter) : baseCap;
+    loopControl = `<label class="route-group-loop">Up to <input type="number" data-loop-cap min="1" max="20" step="1" value="${shownCap}" aria-label="Maximum ${escapeHtml(counter)} rounds for this run"> ${escapeHtml(counter)} rounds, then pause${launchRoundOverrides.has(counter) ? ' <span class="text-status success">This run only</span>' : ""}</label>`;
+  }
+  row.innerHTML = `<header class="route-group-head"><div><h4>${escapeHtml(group.title)}</h4><p>${escapeHtml(group.description)}</p></div>${loopControl}</header><div class="route-group-profiles"></div><ul class="route-action-list"></ul>${group.conditional?.length ? '<section class="route-conditional"><strong>If you redirect or request changes</strong><ul></ul></section>' : ""}`;
+  if (group.loop) {
+    const counter = String(group.loop.counter);
+    const baseCap = Number(group.loop.cap);
+    $("[data-loop-cap]", row).addEventListener("change", (event) => {
+      const cap = Math.min(20, Math.max(1, Math.round(Number(event.target.value) || baseCap)));
+      if (cap === baseCap) launchRoundOverrides.delete(counter);
+      else launchRoundOverrides.set(counter, cap);
+      renderNewRunPreflight();
+    });
+  }
   const profilesRoot = $(".route-group-profiles", row);
   const represented = new Set();
   const groupStages = [...group.stages, ...(group.conditional || [])];
@@ -1124,10 +1170,21 @@ async function toggleStageInstruction(row, workflowId, stage) {
       stagePromptCache.set(key, value);
     }
     const contextLine = (value.context || []).length ? `Receives: ${value.context.join(", ")}` : "Receives: nothing beyond the session";
-    detail.innerHTML = "";
-    const pre = document.createElement("pre");
-    pre.textContent = `# ${value.prompt_file} — exact static instruction\n# ${contextLine}\n# The full transport prompt adds the orchestration law (new sessions), the listed context artifacts, and the strict contract.\n\n${value.template}`;
-    detail.append(pre);
+    const overridden = launchPromptOverrides.has(stage.prompt_file);
+    detail.innerHTML = `<p class="instruction-meta">${escapeHtml(value.prompt_file)} — exact static instruction · ${escapeHtml(contextLine)} · The full transport prompt adds the orchestration law (new sessions), the listed context artifacts, and the strict contract.</p><textarea data-instruction-text rows="13" spellcheck="false" aria-label="${escapeHtml(stage.title)} instruction"></textarea><div class="editor-actions"><button type="button" class="ghost-button" data-instruction-reset ${overridden ? "" : "hidden"}>Reset to saved instruction</button><button type="button" class="primary-button" data-instruction-apply>Apply to this run</button></div><p class="editor-note">Applies to this run only. Use “Save adjustments as new workflow” below to keep it.</p>`;
+    const textarea = $("[data-instruction-text]", detail);
+    textarea.value = overridden ? launchPromptOverrides.get(stage.prompt_file) : value.template;
+    $("[data-instruction-apply]", detail).addEventListener("click", () => {
+      const edited = textarea.value;
+      if (!edited.trim()) { textarea.focus(); return; }
+      if (edited === value.template) launchPromptOverrides.delete(stage.prompt_file);
+      else launchPromptOverrides.set(stage.prompt_file, edited);
+      renderNewRunPreflight();
+    });
+    $("[data-instruction-reset]", detail).addEventListener("click", () => {
+      launchPromptOverrides.delete(stage.prompt_file);
+      renderNewRunPreflight();
+    });
   } catch (error) {
     detail.innerHTML = `<pre>Instruction unavailable: ${escapeHtml(error.message)}</pre>`;
   }
@@ -1257,10 +1314,16 @@ function installCatalogPicker(root, provider, model, effort, onSelectionChange =
       detail.textContent = "Not in the local catalog — runs as an unverified custom selection, recorded as evidence.";
       return;
     }
-    detail.hidden = true;
-    detail.textContent = "";
     // Models with no documented effort ladder (Haiku 4.5) expose only the
-    // provider default; the adapter then omits the effort flag.
+    // provider default; the adapter then omits the effort flag. Say so instead
+    // of presenting a silently locked control.
+    if (selected.supported_efforts?.length) {
+      detail.hidden = true;
+      detail.textContent = "";
+    } else {
+      detail.hidden = false;
+      detail.textContent = `${selected.display_name || selected.selection_token} does not support the reasoning-effort parameter (provider effort docs), so requests always run at the provider default. Pick an effort-capable model to change effort.`;
+    }
     const efforts = selected.supported_efforts?.length ? selected.supported_efforts : ["default"];
     effortSelect.innerHTML = efforts.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
     const advertisedDefault = selected.default_effort;
@@ -1304,12 +1367,19 @@ function renderSettings() {
   table.className = "defaults-table";
   table.innerHTML = `<thead><tr><th>Used for</th><th>Provider</th><th>Model</th><th>Effort</th><th></th></tr></thead><tbody></tbody>`;
   const body = $("tbody", table);
+  // List stages in execution order so planning reads before closure work.
+  const orderedStages = workflow ? reachableWorkflowStages(workflow) : [];
+  const orderedIds = new Set(orderedStages.map((stage) => stage.id));
+  const remainingStages = Object.values(workflow?.stages || {}).filter((stage) => !orderedIds.has(stage.id));
   for (const [profileId, profile] of Object.entries(workflow?.profiles || {})) {
-    const usedFor = Object.values(workflow.stages || {})
+    const usedFor = [...orderedStages, ...remainingStages]
       .filter((stage) => stage.profile === (profile.id || profileId))
       .map((stage) => stage.title);
+    const usedForList = (usedFor.length ? usedFor : [profile.label])
+      .map((title) => `<strong>${escapeHtml(title)}</strong>`)
+      .join("");
     const row = document.createElement("tr");
-    row.innerHTML = `<td data-label="Used for"><strong>${escapeHtml(usedFor.join(", ") || profile.label)}</strong><span class="defaults-profile-id">${escapeHtml(profile.id || profileId)}</span></td><td data-label="Provider">${escapeHtml(profile.provider)}</td><td data-label="Model"><select data-field="model" aria-label="${escapeHtml(profile.label)} model"></select><div data-catalog-custom hidden><input data-field="custom-model" autocomplete="off" placeholder="exact model ID"></div></td><td data-label="Effort"><select data-field="effort" aria-label="${escapeHtml(profile.label)} reasoning effort"></select><div data-catalog-custom-effort hidden><input data-field="custom-effort" autocomplete="off" placeholder="exact effort"></div><p class="catalog-detail" data-catalog-detail hidden></p></td><td data-label="Action"><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} default">Save</button></td>`;
+    row.innerHTML = `<td data-label="Used for"><div class="defaults-used-for">${usedForList}</div><span class="defaults-profile-id">${escapeHtml(profile.id || profileId)}</span></td><td data-label="Provider">${escapeHtml(profile.provider)}</td><td data-label="Model"><select data-field="model" aria-label="${escapeHtml(profile.label)} model"></select><div data-catalog-custom hidden><input data-field="custom-model" autocomplete="off" placeholder="exact model ID"></div></td><td data-label="Effort"><select data-field="effort" aria-label="${escapeHtml(profile.label)} reasoning effort"></select><div data-catalog-custom-effort hidden><input data-field="custom-effort" autocomplete="off" placeholder="exact effort"></div><p class="catalog-detail" data-catalog-detail hidden></p></td><td data-label="Action"><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} default">Save</button></td>`;
     // installCatalogPicker expects one custom container; bridge the split cells.
     const customEffortBox = $("[data-catalog-custom-effort]", row);
     const customBox = $("[data-catalog-custom]", row);
@@ -1363,21 +1433,54 @@ async function createRun() {
   if (!request) { $("#new-request").focus(); return; }
   const button = $("#create-run");
   button.disabled = true;
+  showNewRunError("");
   try {
     const workflowId = $("#new-workflow").value;
     const workflow = bootstrap?.workflows?.[workflowId] || {};
-    const overrides = {};
-    for (const [profileId, selection] of launchOverrides) {
-      if (workflow.profiles?.[profileId]) overrides[profileId] = selection;
-    }
-    const result = await api("/api/runs", {method:"POST",body:JSON.stringify({project:$("#new-project").value,workflow:workflowId,run_mode:$("#new-run-mode").value,request,profile_overrides:Object.keys(overrides).length ? overrides : null})});
+    const adjustments = collectLaunchAdjustments(workflow);
+    const result = await api("/api/runs", {method:"POST",body:JSON.stringify({project:$("#new-project").value,workflow:workflowId,run_mode:$("#new-run-mode").value,request,...adjustments})});
     $("#new-run-dialog").close();
     $("#new-request").value = "";
-    launchOverrides.clear();
+    clearLaunchAdjustments();
     await refreshRuns();
     await selectRun(result.run_id);
-  } catch(error) { alert(error.message); }
+  } catch(error) { showNewRunError(`The run was not started. ${error.message}`); }
   finally { button.disabled = false; }
+}
+
+async function saveWorkflowAs() {
+  const nameInput = $("#workflow-saveas-name");
+  const label = nameInput.value.trim();
+  if (!label) { nameInput.focus(); return; }
+  const id = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+  const button = $("#workflow-saveas-confirm");
+  if (!id) { showNewRunError("Workflow names need at least one letter or digit."); return; }
+  button.disabled = true;
+  showNewRunError("");
+  try {
+    const base = $("#new-workflow").value;
+    const workflow = bootstrap?.workflows?.[base] || {};
+    const saved = await api("/api/workflows/save-as", {method:"POST", body:JSON.stringify({
+      base_workflow: base,
+      id,
+      label,
+      ...collectLaunchAdjustments(workflow),
+    })});
+    clearLaunchAdjustments();
+    stagePromptCache.clear();
+    await loadBootstrap();
+    $("#new-workflow").value = saved.id;
+    renderNewRunPreflight();
+    nameInput.value = "";
+    $("#workflow-saveas-form").hidden = true;
+    const toggle = $("#workflow-saveas-toggle");
+    toggle.textContent = `Saved “${saved.label}” — it is now the selected workflow`;
+    setTimeout(() => { toggle.textContent = "Save adjustments as new workflow…"; }, 4000);
+  } catch (error) {
+    showNewRunError(`Workflow not saved. ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function showBanner(message, kind) {
@@ -1445,7 +1548,13 @@ function bindStaticEvents() {
   window.addEventListener("resize", syncRunRail);
   syncRunRail();
   $("#add-project-button").addEventListener("click", showProjectForm);
-  $("#new-workflow").addEventListener("change", () => { launchOverrides.clear(); renderNewRunPreflight(); });
+  $("#new-workflow").addEventListener("change", () => { clearLaunchAdjustments(); showNewRunError(""); renderNewRunPreflight(); });
+  $("#workflow-saveas-toggle").addEventListener("click", () => {
+    const form = $("#workflow-saveas-form");
+    form.hidden = !form.hidden;
+    if (!form.hidden) $("#workflow-saveas-name").focus();
+  });
+  $("#workflow-saveas-confirm").addEventListener("click", saveWorkflowAs);
   $$("[data-settings-tab]").forEach((button) => button.addEventListener("click", () => {
     $$("[data-settings-tab]").forEach((other) => {
       const selected = other === button;

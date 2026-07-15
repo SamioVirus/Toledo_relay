@@ -432,6 +432,63 @@ class WorkflowDefinition:
         }
 
 
+ROUND_CAP_LIMIT = 20
+PROMPT_OVERRIDE_LIMIT = 200_000
+
+
+def apply_round_overrides(value: dict[str, Any], round_overrides: dict[str, Any]) -> None:
+    """Rewrite loop caps in a workflow value, keyed by round counter name."""
+
+    if not isinstance(round_overrides, dict):
+        raise ValueError("round_overrides must be an object of counter → cap")
+    counters: dict[str, list[dict[str, Any]]] = {}
+    for stage_value in value.get("stages", {}).values():
+        round_value = stage_value.get("round")
+        if isinstance(round_value, dict) and round_value.get("counter"):
+            counters.setdefault(str(round_value["counter"]), []).append(round_value)
+    for counter, cap in round_overrides.items():
+        counter = str(counter)
+        if counter not in counters:
+            raise ValueError(f"unknown round counter override: {counter}")
+        try:
+            cap_value = int(cap)
+        except (TypeError, ValueError):
+            raise ValueError(f"round cap override for {counter} must be an integer") from None
+        if not 1 <= cap_value <= ROUND_CAP_LIMIT:
+            raise ValueError(f"round cap override for {counter} must be between 1 and {ROUND_CAP_LIMIT}")
+        for round_value in counters[counter]:
+            round_value["cap"] = cap_value
+        # Keep the legacy top-level mirrors truthful for external readers.
+        if f"{counter}_round_cap" in value:
+            value[f"{counter}_round_cap"] = cap_value
+
+
+def validate_prompt_overrides(
+    prompt_overrides: dict[str, Any] | None,
+    allowed_files: set[str],
+) -> dict[str, bytes]:
+    """Check per-stage instruction edits and return them as UTF-8 bytes by file name."""
+
+    if not prompt_overrides:
+        return {}
+    if not isinstance(prompt_overrides, dict):
+        raise ValueError("prompt_overrides must be an object of prompt file → text")
+    values: dict[str, bytes] = {}
+    for name, text in prompt_overrides.items():
+        name = str(name)
+        if name not in allowed_files:
+            raise ValueError(
+                f"unknown prompt override: {name}; only stage instruction files can be edited"
+            )
+        text_value = str(text)
+        if not text_value.strip():
+            raise ValueError(f"prompt override for {name} cannot be empty")
+        if len(text_value) > PROMPT_OVERRIDE_LIMIT:
+            raise ValueError(f"prompt override for {name} exceeds {PROMPT_OVERRIDE_LIMIT} characters")
+        values[name] = text_value.encode("utf-8")
+    return values
+
+
 def merge_workflow_value(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Deep-merge a small workflow variant without duplicating its whole graph."""
 

@@ -138,8 +138,11 @@ class ProjectDefinition:
             errors="replace",
             timeout=15,
         )
+        # Untracked files never travel into the isolated execution worktree and
+        # the accepted commit lands on the run branch, so only tracked
+        # modifications make the source checkout untrustworthy as a baseline.
         status = subprocess.run(
-            ["git", "-C", str(self.root), "status", "--porcelain"],
+            ["git", "-C", str(self.root), "status", "--porcelain", "--untracked-files=no"],
             capture_output=True,
             text=True,
             encoding="utf-8",

@@ -47,7 +47,15 @@ from .validation import (
     required_local_validations_passed,
     run_project_validations,
 )
-from .workflow import IDENTIFIER, ProfileDefinition, StageDefinition, WorkflowDefinition, load_workflows
+from .workflow import (
+    IDENTIFIER,
+    ProfileDefinition,
+    StageDefinition,
+    WorkflowDefinition,
+    apply_round_overrides,
+    load_workflows,
+    validate_prompt_overrides,
+)
 from .worktree import (
     assert_allowed_changes,
     current_branch,
@@ -232,6 +240,8 @@ class CycleOrchestrator:
         *,
         run_mode: str = "auto",
         profile_overrides: dict[str, dict[str, Any]] | None = None,
+        round_overrides: dict[str, Any] | None = None,
+        prompt_overrides: dict[str, Any] | None = None,
     ) -> str:
         decode_text_artifact(request, "request")
         if run_mode not in {"auto", "step"}:
@@ -243,7 +253,11 @@ class CycleOrchestrator:
         project_definition = self.projects[project]
         project_check = project_definition.check()
         if project_check.get("dirty"):
-            raise ValueError("project source checkout must be clean before a continuous run starts")
+            raise ValueError(
+                "project source checkout must be clean before a continuous run starts: "
+                f"{project_definition.root} has uncommitted changes to tracked files — "
+                "commit or stash them first (untracked files are ignored)"
+            )
         if project_check.get("dirty") is None:
             raise ValueError("project source checkout status must be available before a continuous run starts")
         if not project_check["ready"]:
@@ -251,32 +265,29 @@ class CycleOrchestrator:
         if not project_definition.implementation_enabled:
             raise ValueError(f"project {project} is not enabled for isolated implementation")
         source_revision = str(project_check["source_revision"])
-        run_id = f"run_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
-        run_dir = self._run_dir(run_id)
-        request_path = run_dir / "cycles" / "cycle.0001" / "request.md"
-        request_hash = atomic_write(request_path, request)
-        execution_worktree = self.runtime_dir / "worktrees" / run_id
-        execution_branch = f"codex/orchestrator/{run_id}"
         workflow_definition = self.workflows[workflow]
-        if profile_overrides:
+        if profile_overrides or round_overrides:
             # Route overrides bind to this run's snapshot only; saved workflow
-            # defaults change exclusively through the explicit profile API.
+            # defaults change exclusively through the explicit workflow APIs.
             value = workflow_definition.snapshot()
-            catalog = load_catalog(self.runtime_dir, refresh=False)
-            for profile_id, changes in profile_overrides.items():
-                if profile_id not in value["profiles"]:
-                    raise ValueError(f"unknown profile override: {profile_id}")
-                if not isinstance(changes, dict):
-                    raise ValueError(f"profile override for {profile_id} must be an object")
-                target = value["profiles"][profile_id]
-                model = str(changes.get("model") or target["model"]).strip()
-                effort = str(changes.get("effort") or target["effort"]).strip()
-                custom = bool(changes.get("custom"))
-                if not model or not effort:
-                    raise ValueError(f"profile override for {profile_id} requires model and effort")
-                if catalog.get("models"):
-                    validate_selection(catalog, provider=str(target["provider"]), model=model, effort=effort, custom=custom)
-                target.update({"model": model, "effort": effort, "custom": custom, "label": f"{model} · {effort}"})
+            if profile_overrides:
+                catalog = load_catalog(self.runtime_dir, refresh=False)
+                for profile_id, changes in profile_overrides.items():
+                    if profile_id not in value["profiles"]:
+                        raise ValueError(f"unknown profile override: {profile_id}")
+                    if not isinstance(changes, dict):
+                        raise ValueError(f"profile override for {profile_id} must be an object")
+                    target = value["profiles"][profile_id]
+                    model = str(changes.get("model") or target["model"]).strip()
+                    effort = str(changes.get("effort") or target["effort"]).strip()
+                    custom = bool(changes.get("custom"))
+                    if not model or not effort:
+                        raise ValueError(f"profile override for {profile_id} requires model and effort")
+                    if catalog.get("models"):
+                        validate_selection(catalog, provider=str(target["provider"]), model=model, effort=effort, custom=custom)
+                    target.update({"model": model, "effort": effort, "custom": custom, "label": f"{model} · {effort}"})
+            if round_overrides:
+                apply_round_overrides(value, round_overrides)
             workflow_definition = WorkflowDefinition.from_value(value)
         prompt_names = {
             "orchestrator-law.md",
@@ -288,15 +299,33 @@ class CycleOrchestrator:
                 for fragment in stage.direction.values()
             ),
         }
+        stage_prompt_files = {stage.prompt_file for stage in workflow_definition.stages.values()}
+        override_bytes = validate_prompt_overrides(prompt_overrides, stage_prompt_files)
+        # Every override is validated above; only now does the run leave a trace
+        # on disk, so a rejected launch never creates a half-built run.
+        run_id = f"run_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
+        run_dir = self._run_dir(run_id)
+        request_path = run_dir / "cycles" / "cycle.0001" / "request.md"
+        request_hash = atomic_write(request_path, request)
+        execution_worktree = self.runtime_dir / "worktrees" / run_id
+        execution_branch = f"codex/orchestrator/{run_id}"
         prompt_library: dict[str, dict[str, str]] = {}
         for prompt_name in sorted(prompt_names):
-            source = self._prompt_source(workflow_definition, prompt_name)
+            if prompt_name in override_bytes:
+                # A per-run instruction edit is sealed into the run's own
+                # prompt library; the configured prompt files are untouched.
+                data = override_bytes[prompt_name]
+                source_label = "operator-override"
+            else:
+                source = self._prompt_source(workflow_definition, prompt_name)
+                data = source.read_bytes()
+                source_label = str(source.resolve())
             relative = Path("prompt-library") / prompt_name
-            digest = atomic_write(run_dir / relative, source.read_bytes())
+            digest = atomic_write(run_dir / relative, data)
             prompt_library[prompt_name] = {
                 "path": str(relative).replace("\\", "/"),
                 "sha256": digest,
-                "source": str(source.resolve()),
+                "source": source_label,
             }
         state: dict[str, Any] = {
             "schema_version": "toledo_orchestrator.run.v2",
@@ -360,6 +389,8 @@ class CycleOrchestrator:
             "execution_worktree": str(execution_worktree),
             "execution_branch": execution_branch,
             "profile_overrides": profile_overrides or None,
+            "round_overrides": round_overrides or None,
+            "prompt_overrides": sorted(override_bytes) or None,
         })
         self._save(run_id, state)
         return run_id

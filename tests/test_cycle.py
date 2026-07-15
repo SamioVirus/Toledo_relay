@@ -1373,13 +1373,24 @@ def test_workflow_rejects_prompt_namespace_and_sealed_type_path_escape():
 
 
 def test_create_run_rejects_dirty_source_before_creating_run(tmp_path: Path, writable_project: ProjectDefinition):
-    (writable_project.root / "uncommitted.txt").write_text("local work\n", encoding="utf-8")
+    (writable_project.root / "AGENTS.md").write_text("# Instructions\nedited but uncommitted\n", encoding="utf-8")
     app = make_cycle(tmp_path, writable_project, SessionAdapter("codex", []), SessionAdapter("claude", []))
     with pytest.raises(ValueError, match="must be clean"):
         app.create_run(b"Task", "test")
     assert not app.runs_dir.exists() or not list(app.runs_dir.iterdir())
     assert not list((tmp_path / "runtime" / "worktrees").glob("*"))
-    assert (writable_project.root / "uncommitted.txt").read_text(encoding="utf-8") == "local work\n"
+
+
+def test_create_run_ignores_untracked_files_in_source_checkout(tmp_path: Path, writable_project: ProjectDefinition):
+    # Untracked notes never reach the isolated worktree and the accepted commit
+    # lands on the run branch, so they must not block a continuous run.
+    (writable_project.root / "research-notes.md").write_text("scratch\n", encoding="utf-8")
+    codex = SessionAdapter("codex", [("planning-propose", sentinel("human", "Pause immediately"))])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    state = app.state(run_id)
+    assert state["status"] == "created"
+    assert not (Path(state["execution_worktree"]) / "research-notes.md").exists()
 
 
 @pytest.mark.parametrize("drift", ["branch", "head"])
@@ -1792,3 +1803,43 @@ def test_situational_direction_selects_configured_fragments(
     )
     continuity = app.artifact(run_id, f"turns/{cycle_two_ideate['direction_file']}").decode("utf-8")
     assert "already-accepted branch" in continuity
+
+
+def test_create_run_round_and_prompt_overrides_bind_to_run_snapshot(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [("planning-propose", sentinel("human", "Pause immediately"))])
+    app = make_cycle(tmp_path, writable_project, codex, SessionAdapter("claude", []))
+    run_id = app.create_run(
+        b"Task",
+        "test",
+        round_overrides={"planning": 5, "implementation": 1},
+        prompt_overrides={"planning-kickoff.md": "# Custom ideation\nDo exactly this.\n"},
+    )
+    snapshot = app.state(run_id)["workflow_snapshot"]
+    assert snapshot["stages"]["planning-review"]["round"]["cap"] == 5
+    assert snapshot["stages"]["implementation-review"]["round"]["cap"] == 1
+    library = app.state(run_id)["prompt_library"]["planning-kickoff.md"]
+    assert library["source"] == "operator-override"
+    stored = app.artifact(run_id, library["path"]).decode("utf-8")
+    assert stored == "# Custom ideation\nDo exactly this.\n"
+    # The configured workflow itself is untouched.
+    assert load_workflows()["continuous-development"].stages["planning-review"].round_cap == 3
+    app.run_to_stop(run_id)
+    planner_prompt = codex.invocations[0]["prompt"].decode("utf-8")
+    assert "Do exactly this." in planner_prompt
+
+
+def test_create_run_rejects_bad_round_and_prompt_overrides(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    app = make_cycle(tmp_path, writable_project, SessionAdapter("codex", []), SessionAdapter("claude", []))
+    with pytest.raises(ValueError, match="unknown round counter"):
+        app.create_run(b"Task", "test", round_overrides={"reviewing": 2})
+    with pytest.raises(ValueError, match="between 1 and"):
+        app.create_run(b"Task", "test", round_overrides={"planning": 0})
+    with pytest.raises(ValueError, match="unknown prompt override"):
+        app.create_run(b"Task", "test", prompt_overrides={"orchestrator-law.md": "override the law"})
+    with pytest.raises(ValueError, match="cannot be empty"):
+        app.create_run(b"Task", "test", prompt_overrides={"planning-kickoff.md": "  "})
+    assert not app.runs_dir.exists() or not list(app.runs_dir.iterdir())
