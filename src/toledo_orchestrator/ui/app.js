@@ -1151,7 +1151,7 @@ function routeGroupRow(workflowId, workflow, group) {
     const baseCap = Number(group.loop.cap);
     const shownCap = launchRoundOverrides.has(counter) ? launchRoundOverrides.get(counter) : baseCap;
     const roundLabel = counter === "planning" ? "review rounds" : `${counter} rounds`;
-    loopControl = `<label class="route-group-loop">Up to <input type="number" data-loop-cap min="1" max="20" step="1" value="${shownCap}" aria-label="Maximum ${escapeHtml(counter)} rounds for this run"> ${escapeHtml(roundLabel)}, then pause <span class="text-status success" data-loop-override ${launchRoundOverrides.has(counter) ? "" : "hidden"}>This run only</span></label>`;
+    loopControl = `<label class="route-group-loop">Up to <input type="number" data-loop-cap required min="1" max="20" step="1" value="${shownCap}" aria-label="Maximum ${escapeHtml(counter)} rounds for this run"> ${escapeHtml(roundLabel)}, then pause <span class="text-status success" data-loop-override ${launchRoundOverrides.has(counter) ? "" : "hidden"}>This run only</span></label>`;
   }
   row.innerHTML = `<header class="route-group-head"><div><h4>${escapeHtml(group.title)}</h4><p>${escapeHtml(group.description)}</p></div>${loopControl}</header><div class="route-group-profiles"></div><ul class="route-action-list"></ul>${group.conditional?.length ? '<section class="route-conditional"><strong>If you redirect or request changes</strong><ul></ul></section>' : ""}`;
   if (group.loop) {
