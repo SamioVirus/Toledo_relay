@@ -72,6 +72,12 @@ def collect_worktree_evidence(root: Path) -> WorktreeEvidence:
         if value:
             paths.append(value.replace("\\", "/"))
     patch = _git(root, "diff", "--binary", "HEAD", "--").stdout
+    # Evidence collection must be side-effect-free: drop the intent-to-add
+    # entries once the snapshot is taken. The per-worktree index lives under
+    # the project's shared .git directory, outside the sandboxed implementer's
+    # writable workspace, so an entry left behind here is one the implementer
+    # can see (`git status` reports "A") but can never remove itself.
+    _git(root, "reset", "-q")
     return WorktreeEvidence(
         revision=current_revision(root),
         changed_paths=tuple(sorted(set(paths))),
@@ -171,4 +177,19 @@ def remove_execution_worktree(project: ProjectDefinition, root: Path, *, force: 
     if force:
         arguments.append("--force")
     arguments.append(str(resolved))
-    _git(project.root, *arguments, timeout=120)
+    try:
+        _git(project.root, *arguments, timeout=120)
+    except ValueError as error:
+        if force and resolved.exists():
+            # Observed failure mode on Windows: directories created inside the
+            # worktree by the sandboxed provider are owned by a discarded
+            # sandbox SID and deny access even to the owning user, so git
+            # cannot delete them. Only an elevated shell can reclaim them.
+            raise ValueError(
+                f"{error}\n"
+                "If access was denied, the worktree may contain directories created "
+                "under a discarded provider-sandbox identity. From an elevated shell: "
+                f'takeown /f "{resolved}" /r /d y, then icacls "{resolved}" /reset /t, '
+                f'then remove the directory and run git worktree prune in {project.root}.'
+            ) from None
+        raise
