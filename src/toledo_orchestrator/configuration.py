@@ -127,36 +127,47 @@ def save_workflow_variant(
     if override_bytes:
         namespaces = [new_id, *[item for item in value.get("prompt_namespaces", []) if item != new_id]]
         value["prompt_namespaces"] = namespaces
+    # Validate the complete adjusted graph before writing prompt files. A
+    # rejected provider/session combination must not leave an orphan prompt
+    # namespace behind for a workflow that was never saved.
+    WorkflowDefinition.from_value(value)
+    if override_bytes:
         for name, data in override_bytes.items():
             atomic_write(configuration_dir(runtime_dir) / "prompts" / new_id / name, data)
     return save_workflow_value(runtime_dir, value)
 
 
-def update_profile(
+def update_profiles(
     runtime_dir: Path,
     workflow_id: str,
-    profile_id: str,
-    *,
-    provider: str | None = None,
-    model: str | None = None,
-    effort: str | None = None,
-    permission: str | None = None,
-    label: str | None = None,
-    custom: bool | None = None,
+    profile_overrides: dict[str, dict[str, Any]],
 ) -> WorkflowDefinition:
+    """Persist one or more profile defaults as one validated workflow write."""
+
+    if not isinstance(profile_overrides, dict) or not profile_overrides:
+        raise ValueError("profile_overrides must be a non-empty object")
     value = workflow_value(workflow_id, runtime_dir)
     profiles = value.get("profiles", {})
-    if profile_id not in profiles:
-        raise ValueError(f"unknown profile: {profile_id}")
-    changes = {"provider": provider, "model": model, "effort": effort, "permission": permission, "label": label, "custom": custom}
-    for key, selected in changes.items():
-        if selected is not None:
-            profiles[profile_id][key] = selected
-    # A label is presentation only.  When an operator changes selection fields
-    # without deliberately setting a custom label, keep the visible label
-    # truthful by deriving it from the persisted values.
-    if label is None and (provider is not None or model is not None or effort is not None):
-        profiles[profile_id]["label"] = f"{profiles[profile_id]['model']} · {profiles[profile_id]['effort']}"
+    allowed = {"provider", "model", "effort", "permission", "label", "custom"}
+    for profile_id, changes in profile_overrides.items():
+        if profile_id not in profiles:
+            raise ValueError(f"unknown profile: {profile_id}")
+        if not isinstance(changes, dict):
+            raise ValueError(f"profile override for {profile_id} must be an object")
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"unknown profile fields for {profile_id}: {', '.join(sorted(unknown))}")
+        for key, selected in changes.items():
+            if selected is not None:
+                profiles[profile_id][key] = selected
+        if not str(profiles[profile_id].get("model", "")).strip() or not str(
+            profiles[profile_id].get("effort", "")
+        ).strip():
+            raise ValueError(f"profile override for {profile_id} requires model and effort")
+        # A label is presentation only. Keep it truthful unless the caller
+        # deliberately supplied a custom label.
+        if "label" not in changes and {"provider", "model", "effort"}.intersection(changes):
+            profiles[profile_id]["label"] = f"{profiles[profile_id]['model']} · {profiles[profile_id]['effort']}"
     target = configuration_dir(runtime_dir) / "workflows" / f"{workflow_id}.json"
     previous = target.read_bytes() if target.is_file() else None
     parsed = save_workflow_value(runtime_dir, value)
@@ -173,6 +184,33 @@ def update_profile(
             atomic_write(target, previous)
         raise ValueError(f"not saved; this change breaks a dependent workflow: {error}")
     return parsed
+
+
+def update_profile(
+    runtime_dir: Path,
+    workflow_id: str,
+    profile_id: str,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    permission: str | None = None,
+    label: str | None = None,
+    custom: bool | None = None,
+) -> WorkflowDefinition:
+    changes = {
+        key: selected
+        for key, selected in {
+            "provider": provider,
+            "model": model,
+            "effort": effort,
+            "permission": permission,
+            "label": label,
+            "custom": custom,
+        }.items()
+        if selected is not None
+    }
+    return update_profiles(runtime_dir, workflow_id, {profile_id: changes})
 
 
 def save_project_value(runtime_dir: Path, value: dict[str, Any]) -> ProjectDefinition:

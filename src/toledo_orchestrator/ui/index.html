@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Toledo Relay</title>
-  <link rel="stylesheet" href="/styles.css?v=consolidate1">
+  <link rel="stylesheet" href="/styles.css?v=older-issue1">
 </head>
 <body>
   <div class="app-shell">
@@ -94,19 +94,42 @@
 
   <template id="human-gate-template">
     <article class="human-gate" id="active-gate">
-      <p class="eyebrow" data-gate-kicker>HUMAN GATE</p><h3 data-gate-title>Review required</h3>
-      <p data-gate-description>The run is paused and needs your decision before it can continue.</p>
-      <div class="gate-upnext" data-gate-upnext hidden></div>
-      <div class="gate-tools" data-gate-tools hidden>
-        <button type="button" class="quiet-button" data-gate-prompt>View applied exact prompt</button>
-      </div>
-      <label class="sr-only" data-gate-label for="human-gate-text">Optional direction</label>
-      <textarea id="human-gate-text" rows="4" data-gate-text placeholder="Add direction or explain another choice"></textarea>
+      <h3 data-gate-title>Review required</h3>
+      <p class="gate-summary" data-gate-summary></p>
+      <details class="gate-evidence" data-gate-evidence hidden>
+        <summary data-gate-evidence-label>Details</summary>
+        <pre data-gate-evidence-body></pre>
+      </details>
       <p class="gate-note" data-gate-note hidden></p>
-      <div><button data-choice="yes" class="accept-button">Yes — continue</button><button data-choice="no" class="stop-button">No — cancel</button><button data-choice="other" class="ghost-button">Other — add direction</button><button type="button" data-gate-stop class="ghost-button" hidden>Stop here — work may be incomplete</button></div>
+      <div class="gate-actions">
+        <button data-choice="yes" class="primary-button">Continue</button>
+        <button type="button" data-choice="yes" data-gate-follow-up class="primary-button" hidden></button>
+        <button data-choice="no" class="quiet-button">Cancel run</button>
+        <button type="button" class="link-button" data-gate-alt hidden></button>
+        <button type="button" data-gate-stop class="quiet-button" hidden>Stop here — work may be incomplete</button>
+      </div>
+      <details class="gate-more" data-gate-more hidden>
+        <summary>More options</summary>
+        <div class="gate-more-actions" data-gate-more-actions></div>
+      </details>
+      <div class="gate-direction" data-gate-direction hidden>
+        <label data-gate-label for="human-gate-text">Direction</label>
+        <textarea id="human-gate-text" rows="4" data-gate-text></textarea>
+        <div class="gate-direction-actions">
+          <button data-choice="other" class="primary-button" data-gate-send>Send direction</button>
+          <button type="button" class="quiet-button" data-gate-direction-cancel>Cancel</button>
+        </div>
+      </div>
+      <details class="gate-advanced" data-gate-advanced hidden>
+        <summary data-gate-advanced-summary>Agent setup</summary>
+        <div class="gate-upnext" data-gate-upnext></div>
+        <div class="gate-tools" data-gate-tools>
+          <button type="button" class="quiet-button" data-gate-prompt>View applied exact prompt</button>
+        </div>
+      </details>
     </article>
   </template>
 
-  <script src="/app.js?v=consolidate1" defer></script>
+  <script src="/app.js?v=older-issue1" defer></script>
 </body>
 </html>

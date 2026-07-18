@@ -1,5 +1,21 @@
 # Evidence log
 
+## 2026-07-18 — Human copy and older-issue carry-forward
+
+- Owner comprehension testing rejected `validation`, `clean baseline`, and `recorded debt` even after the first geometry reduction. The final baseline gate says `Your change is ready` / `It didn’t break anything. One older issue still needs fixing.`, leads with `Commit & fix it next`, keeps `Just commit` quiet, and moves stop/repair choices under `More options`.
+- `Commit & fix it next` is a real state transition: a typed `baseline_failure` follow-up is allowed only at the matching baseline and next-task states, resolves exact current-cycle sealed failure evidence, records the follow-up in the human decision, and places the failure IDs and lines in the next-task prompt. It is rejected when combined with free-form direction.
+- The owner had already committed live run `run_20260717T020530Z_8bde5d9c`. Its next-task provider stopped on a Claude session limit before choosing a task, so the current read-only UI correctly offers `Retry with older issue next` and `Retry` beneath `Your change is committed`; `More options` and relevant agent setup stay collapsed. No action/save endpoint was touched and no provider was invoked during QA.
+- Raw decision-protocol labels in the timeline were replaced with human labels, and the redundant resume box is hidden when the structured retry action exists. The default current gate remains one compact decision surface rather than another explanatory panel.
+- Verification: focused controller/API coverage `3 passed`; full suite `143 passed in 79.32s`; Python compile and JavaScript syntax passed; live desktop DOM/visual inspection passed with no run mutation.
+
+## 2026-07-18 — Consolidated workflow/provider backend audit
+
+- Audited commits `65ed425` and `6453920` from the UI through `/api/profile`, workflow persistence, launch snapshots, inheritance reload, shared physical-session validation, and save-as behavior. The consolidation itself is architecturally sound: repository, workflow, provider/model/effort, round caps, instruction edits, and launch now share one preflight surface; run-only overrides remain snapshot-bound.
+- Found and fixed one contract gap: the UI told operators to move routes sharing a session together, but `Save as default` persisted only one profile, so the backend correctly rejected the first half and the shared reviewer provider could never be saved. `/api/profile` now accepts an atomic profile set, validates every catalog selection, writes one workflow value, reload-validates dependent workflows, and rolls back on failure. The UI saves the complete session slot only after all draft providers agree.
+- Save-as now validates the complete adjusted workflow before writing custom prompt files, so a rejected mixed-provider slot cannot leave an orphan prompt namespace.
+- Browser verification on the served UI confirmed the Settings control is absent, the consolidated dialog exposes Repository → Workflow → Route → Request in one place, the inconsistent shared-session save stops before any write with actionable copy, and 390×844 geometry has no horizontal overflow. The real paused run and live workflow defaults were not mutated.
+- Verification: focused web `19 passed`; operator controls `7 passed`; full suite `143 passed in 77.75s`; Python compile, JavaScript syntax, and diff checks passed.
+
 ## 2026-07-17 — Quick-take audit hardening
 
 - An independent audit reproduced the live artifacts and full suite, then found three contained defects. Failed sidecars could not recover after Ollama returned; the watcher parsed every historical `run.json` twice per second; and text-mode reads normalized CRLF before the output-integrity hash.

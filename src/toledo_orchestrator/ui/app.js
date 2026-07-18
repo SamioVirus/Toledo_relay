@@ -425,7 +425,9 @@ function renderTimeline(state) {
     root.append(block);
   }
   const activeGate = $("#active-gate", root);
-  if (activeGate && state.pending_human_decision) {
+  if (activeGate && GATE_AGENT_SETUP_REASONS.includes(state.pending_human_decision)) {
+    // Agent setup is hydrated only for gates whose decision actually submits
+    // the displayed override; everywhere else the controls would be dead.
     // A fast click must still wait for the next-turn controls to hydrate. Once
     // visible, their current values travel in the same Run/Retry request.
     activeGate.gatePickerReady = populateGateUpnext(activeGate, state);
@@ -533,7 +535,8 @@ function humanDecisionNode(decision, index) {
   const button = document.createElement("button");
   button.className = "decision-node";
   button.dataset.decisionPath = decision.file;
-  button.innerHTML = `<span class="decision-choice">Human · ${escapeHtml(humanizeReason(decision.choice || "direction"))}</span><span class="decision-reason">${escapeHtml(humanizeReason(decision.reason))}</span><span class="decision-preview">Open stored direction</span>`;
+  const choices = {yes: "Continue", no: "Stop", other: "Direction", direction: "Direction"};
+  button.innerHTML = `<span class="decision-choice">You · ${escapeHtml(choices[decision.choice] || "Decision")}</span><span class="decision-reason">${escapeHtml(decisionReasonLabel(decision.reason))}</span><span class="decision-preview">Open stored direction</span>`;
   button.addEventListener("click", () => openDecision(decision, index));
   row.append(button);
   return row;
@@ -544,7 +547,9 @@ async function hydrateDecisionPreviews() {
     try {
       const text = await artifactText(node.dataset.decisionPath);
       const preview = text.replace(/\s+/g, " ").trim();
-      $(".decision-preview", node).textContent = preview || "Stored without additional text";
+      $(".decision-preview", node).textContent = ["yes", "no"].includes(preview.toLowerCase())
+        ? "No added direction"
+        : preview || "No added direction";
     } catch { $(".decision-preview", node).textContent = "Decision artifact unavailable"; }
   }
 }
@@ -602,7 +607,7 @@ async function openDecision(decision, index) {
   inspectorPayload = {direction:content, metadata:JSON.stringify(decision, null, 2)};
   setDirectionTabLabel("Owner direction");
   $("#inspector-kicker").textContent = `HUMAN DIRECTION · ${String(index + 1).padStart(2, "0")}`;
-  $("#inspector-title").textContent = humanizeReason(decision.reason);
+  $("#inspector-title").textContent = decisionReasonLabel(decision.reason);
   $("#inspector-meta").innerHTML = `<span class="chip">${escapeHtml(decision.choice)}</span><span class="chip">cycle ${escapeHtml(decision.cycle)}</span><span class="chip">after turn ${escapeHtml(decision.after_turn)}</span>`;
   openInspector("direction");
 }
@@ -654,12 +659,20 @@ function selectInspectorTab(tab) {
 function bindGate(fragment) {
   const gate = $(".human-gate", fragment);
   const textarea = $("textarea", gate);
+  const direction = $("[data-gate-direction]", gate);
+  const alt = $("[data-gate-alt]", gate);
   textarea.addEventListener("input", () => gateDrafts.set(gate.dataset.draftKey, textarea.value));
+  alt?.addEventListener("click", () => {
+    direction.hidden = !direction.hidden;
+    if (!direction.hidden) textarea.focus();
+  });
+  $("[data-gate-direction-cancel]", gate)?.addEventListener("click", () => { direction.hidden = true; });
   $$('[data-choice]', gate).forEach((button) => button.addEventListener("click", async () => {
     const choice = button.dataset.choice;
-    if (choice === "other" && !textarea.value.trim()) { textarea.focus(); return; }
+    const followUp = button.dataset.followUp || null;
+    if (choice === "other" && !followUp && !textarea.value.trim()) { textarea.focus(); return; }
     button.disabled = true;
-    const submitDisplayedOverride = choice !== "no" && ["operator_step", "provider_invocation_failed"].includes(gate.dataset.reason);
+    const submitDisplayedOverride = choice !== "no" && GATE_AGENT_SETUP_REASONS.includes(gate.dataset.reason);
     let actionAccepted = false;
     try {
       if (submitDisplayedOverride && gate.gatePickerReady) await gate.gatePickerReady;
@@ -674,7 +687,8 @@ function bindGate(fragment) {
       } else {
         await api(`/api/runs/${encodeURIComponent(currentRunId)}/decision`, {method:"POST", body:JSON.stringify({
           choice,
-          text: choice === "other" ? textarea.value : "",
+          text: choice === "other" && !followUp ? textarea.value : "",
+          follow_up: followUp,
           next_turn_override: nextTurnOverride,
         })});
       }
@@ -730,7 +744,7 @@ function gateProfileLabel(profile) {
 
 async function populateGateUpnext(gate, state) {
   const panel = $("[data-gate-upnext]", gate);
-  const tools = $("[data-gate-tools]", gate);
+  const advanced = $("[data-gate-advanced]", gate);
   if (!panel || state.schema_version !== "toledo_orchestrator.run.v2" || !state.current_stage || state.worker?.active) return;
   let preview;
   try {
@@ -744,8 +758,8 @@ async function populateGateUpnext(gate, state) {
   const dedupedAfterward = [...new Set(afterward)];
   const workflow = state.workflow_snapshot || bootstrap?.workflows?.[state.workflow] || {};
   const candidateProfiles = gateProfileOptions(workflow, preview);
-  panel.innerHTML = `<div class="gate-upnext-line"><span class="gate-applied-label">Applied</span><strong>${escapeHtml(profile.model || "provider default")}</strong><span>·</span><span>${escapeHtml(profile.effort || "default effort")}</span><span>·</span><span>${escapeHtml(profile.provider || "")}</span><span>·</span><span>${escapeHtml(profile.permission || "")}</span>${preview.override?.active ? '<span class="override-chip">one-turn override active</span>' : ""}${profile.custom ? '<span class="warn-chip">custom — unverified</span>' : ""}</div>
-    <dl>
+  $("[data-gate-advanced-summary]", gate).innerHTML = `Agent setup — <strong>${escapeHtml(profile.model || "provider default")}</strong> · ${escapeHtml(profile.effort || "default effort")} · ${escapeHtml(profile.permission || "")}${preview.override?.active ? ' <span class="override-chip">one-turn override</span>' : ""}${profile.custom ? ' <span class="warn-chip">custom — unverified</span>' : ""}`;
+  panel.innerHTML = `<dl>
       <div><dt>Actor</dt><dd>${escapeHtml(session.label || "?")} (${escapeHtml(preview.stage?.role || "agent")}) · ${escapeHtml(session.action || "?")} session</dd></div>
       <div><dt>Receives</dt><dd>${escapeHtml(receives)}</dd></div>
       <div><dt>Produces</dt><dd>${escapeHtml(String(preview.stage?.produces || "").replaceAll("-", " "))}</dd></div>
@@ -865,16 +879,16 @@ async function populateGateUpnext(gate, state) {
       await refreshCurrent(true);
     } catch (error) { alert(error.message); event.target.disabled = false; }
   });
-  panel.hidden = false;
-  tools.hidden = false;
+  advanced.hidden = false;
   const canResumeCutOff = preview.pending_human_decision === "provider_invocation_failed"
     && session.has_active_session
     && session.active_provider === profile.provider;
-  if (canResumeCutOff && !$("[data-gate-continue]", gate)) {
+  const structuredFollowUp = $("[data-gate-follow-up]", gate);
+  if (canResumeCutOff && structuredFollowUp?.hidden !== false && !$("[data-gate-continue]", gate)) {
     const quick = document.createElement("div");
     quick.className = "gate-quick-retry";
-    quick.innerHTML = `<button type="button" class="accept-button" data-gate-continue title="For cut-offs outside the relay's control — quota limits, lost connection, provider outage. Once capacity is back (for example after the limit resets), this resumes the same ${escapeHtml(profile.provider || "")} session with the same settings and tells it: we were cut off, please continue. The gate below closes.">We were cut off — resume &amp; continue</button><p>Same session, same settings. Use after the quota resets or the connection recovers; to switch provider or model instead, use the controls below.</p>`;
-    panel.before(quick);
+    quick.innerHTML = `<button type="button" class="accept-button" data-gate-continue title="For cut-offs outside the relay's control — quota limits, lost connection, provider outage. Once capacity is back (for example after the limit resets), this resumes the same ${escapeHtml(profile.provider || "")} session with the same settings and tells it: we were cut off, please continue. The gate below closes.">We were cut off — resume &amp; continue</button><p>Same session, same settings. Use after the quota resets or the connection recovers; to switch provider or model instead, open Agent setup below.</p>`;
+    advanced.before(quick);
     $("[data-gate-continue]", quick).addEventListener("click", async (event) => {
       event.target.disabled = true;
       try {
@@ -907,70 +921,242 @@ async function populateGateUpnext(gate, state) {
   };
 }
 
-function configureGate(fragment, state) {
+// Gates whose decision request actually submits the displayed agent-setup
+// override (see bindGate). Only these hydrate the setup panel.
+const GATE_AGENT_SETUP_REASONS = ["operator_step", "provider_invocation_failed"];
+
+// Deterministic presentation model: each pause reason maps to a plain-language
+// outcome, the decision's consequences as action labels, and (separately) any
+// evidence disclosure. Protocol vocabulary stays out of the default surface.
+function gatePresentation(state) {
   const reason = state.pending_human_decision || "human_decision";
-  const gate = $(".human-gate", fragment);
-  const title = $("[data-gate-title]", gate);
-  const description = $("[data-gate-description]", gate);
-  const textarea = $("[data-gate-text]", gate);
-  const label = $("[data-gate-label]", gate);
-  const note = $("[data-gate-note]", gate);
-  const stop = $("[data-gate-stop]", gate);
-  const yes = $('[data-choice="yes"]', gate);
-  const no = $('[data-choice="no"]', gate);
-  const other = $('[data-choice="other"]', gate);
   const nextTitle = stageTitle(state.current_stage) || "next turn";
-  const copy = {
-    operator_step: [`Up next: ${nextTitle}`, "", `Run: ${nextTitle}`, "", "", "One-turn guidance (optional)"],
-    next_task_approval: ["Is this the right next task?", "The proposal is preserved exactly. Accept it, finish the loop, or redirect the current strategic session.", "Yes — start planning", "No — finish here", "Other — revise proposal", "Tell the strategic session what to change"],
-    validation_execution_approval: ["Run the validation commands?", "These commands execute on the host against the isolated implementation worktree. Review the pending commands before approving.", "Yes — run validation", "No — cancel run", "Other — send to repair", "Explain what the implementation session must change before validation"],
-    validation_receipt_required: ["Validation receipt required", `Attach the patch-bound receipt from a terminal with: python -m toledo_orchestrator validate ${state.run_id} --receipt-file "C:\\path\\to\\receipt.json"`, "", "No — cancel run", "Other — add direction", "Add receipt or validation guidance"],
-    unknown_validation_execution: ["Validation completion is unknown", "The controller stopped after host validation started but before a trustworthy completion record was sealed. It will not rerun the commands automatically. Route the work to repair/inspection, cancel, or add exact recovery direction.", "Yes — inspect and repair", "No — cancel run", "Other — direct recovery", "Tell the implementation session what evidence to inspect before any rerun"],
-    provider_invocation_failed: ["Provider invocation failed", "No successful model response was accepted (quota, network, or CLI failure). If the cause was outside the relay's control, resume the interrupted session once capacity is back. Or use the provider, model, effort, and session controls below — provider switching is unlocked at this gate — then retry; the override applies to the retried turn.", "Retry with displayed settings", "Cancel run", "Retry with direction", "Optional direction for the retried turn"],
-    planning_round_cap_reached: ["Planning round cap reached", "The planning loop used its configured rounds without agreement. Extend it, stop, or redirect the next revision.", "Yes — extend one round", "No — cancel run", "Other — extend with direction", "Tell the planning sessions what must change"],
-    implementation_round_cap_reached: ["Implementation round cap reached", "The implementation loop used its configured repair rounds. Extend it, stop, or direct one more repair.", "Yes — extend one round", "No — cancel run", "Other — extend with direction", "Tell the implementation sessions what must change"],
-    validation_failed_at_repair_cap: ["Validation still fails", "Required validation failed after the configured repair rounds, and the failure does not match the clean baseline. Extend repair, stop, or give a specific recovery direction.", "Yes — extend repair", "No — cancel run", "Other — direct repair", "Describe the evidence or repair you require"],
-    validation_baseline_failure_decision: ["Only a pre-existing failure remains", "Required validation failed, but every failure matches the clean baseline at the same revision — this change did not introduce it. Accept and commit with the debt recorded, stop without committing, or send it to repair anyway.", "Yes — accept with recorded debt", "No — stop without commit", "Other — repair with direction", "Tell the implementation session what to change instead of accepting"],
-  }[reason];
-  if (copy) {
-    [title.textContent, description.textContent, yes.textContent, no.textContent, other.textContent, textarea.placeholder] = copy;
-  } else {
-    title.textContent = humanizeReason(reason);
-    description.textContent = `The run paused at ${stageTitle(state.current_stage) || "the current stage"}. Review the stored evidence, then continue, cancel, or add direction.`;
+  const presentations = {
+    operator_step: {
+      title: `Up next: ${nextTitle}`,
+      yes: `Run: ${nextTitle}`,
+      alt: "Add one-turn guidance",
+      directionLabel: "One-turn guidance (optional)",
+      guidanceOnly: true,
+      stop: true,
+      note: "Guidance is appended to this turn's prompt only — the workflow instruction is unchanged. It is recorded as an operator decision.",
+    },
+    next_task_approval: {
+      title: "Is this the right next task?",
+      summary: "The proposal is preserved exactly as written. Start planning it, finish the loop here, or send the strategic session a revision.",
+      yes: "Start planning",
+      no: "Finish here",
+      alt: "Revise the proposal",
+      directionLabel: "What should the strategic session change?",
+      send: "Send revision",
+    },
+    validation_execution_approval: {
+      title: "Run the validation commands?",
+      summary: "These host commands run once in the isolated implementation worktree. You are approving the commands, not a provider turn.",
+      yes: "Run validation",
+      no: "Cancel run",
+      alt: "Send to repair instead",
+      directionLabel: "What must the implementation session change before validation?",
+      send: "Send to repair",
+    },
+    validation_receipt_required: {
+      title: "Validation receipt required",
+      summary: "This run's validation must be executed by you and attached as a patch-bound receipt from a terminal.",
+      no: "Cancel run",
+      alt: "Add direction",
+      directionLabel: "Receipt or validation guidance",
+      send: "Send direction",
+    },
+    unknown_validation_execution: {
+      title: "Validation outcome is unknown",
+      summary: "Host validation started, but no trustworthy completion record was sealed. Nothing reruns automatically — route the work or stop.",
+      yes: "Inspect and repair",
+      no: "Cancel run",
+      alt: "Direct the recovery",
+      directionLabel: "What evidence should be inspected before any rerun?",
+      send: "Send direction",
+    },
+    provider_invocation_failed: {
+      title: "That step didn’t run",
+      summary: "The agent stopped before returning usable work. Retry it, or change the agent below.",
+      yes: "Retry",
+      no: "Cancel run",
+      alt: "Retry with direction",
+      directionLabel: "Direction for the retried turn",
+      send: "Retry with direction",
+      compactOptions: true,
+    },
+    planning_round_cap_reached: {
+      title: "Planning rounds are used up",
+      summary: "The planning loop reached its configured rounds without agreement.",
+      yes: "Extend one round",
+      no: "Cancel run",
+      alt: "Extend with direction",
+      directionLabel: "What must change in the next planning round?",
+      send: "Extend with direction",
+    },
+    implementation_round_cap_reached: {
+      title: "Repair rounds are used up",
+      summary: "The implementation loop reached its configured repair rounds.",
+      yes: "Extend one round",
+      no: "Cancel run",
+      alt: "Extend with direction",
+      directionLabel: "What must the implementation session change?",
+      send: "Extend with direction",
+    },
+    validation_failed_at_repair_cap: {
+      title: "Validation still fails",
+      summary: "Repair rounds are used up, and the failure is new — it does not match the clean baseline.",
+      yes: "Extend repair",
+      no: "Cancel run",
+      alt: "Direct the repair",
+      directionLabel: "Describe the evidence or repair you require",
+      send: "Send direction",
+    },
+    validation_baseline_failure_decision: {
+      title: "Your change is ready",
+      summary: "It didn’t break anything. One older issue still needs fixing.",
+      yes: "Just commit",
+      no: "Stop without committing",
+      alt: "Request changes instead",
+      directionLabel: "What should the implementation session change instead of committing?",
+      send: "Send back for changes",
+      followUp: {label: "Commit & fix it next", choice: "yes"},
+      followUpPrimary: true,
+      compactOptions: true,
+    },
+  };
+  const model = presentations[reason] || {
+    title: humanizeReason(reason),
+    summary: `The run paused at ${nextTitle}. Review the stored evidence, then continue, cancel, or add direction.`,
+    yes: "Continue",
+    no: "Cancel run",
+    alt: "Add direction",
+    directionLabel: "Direction",
+    send: "Send direction",
+  };
+  const workflow = state.workflow_snapshot || bootstrap?.workflows?.[state.workflow] || {};
+  const atNextTask = [workflow.next_task_stage, workflow.next_task_revision_stage]
+    .filter(Boolean)
+    .includes(state.current_stage);
+  const hasOlderIssue = Boolean(state.pending_baseline_acceptance?.classification)
+    || Object.values(state.artifacts || {}).some((item) => (
+      item?.type === "baseline-debt" && item?.cycle === state.cycle
+    ));
+  if (hasOlderIssue && reason === "provider_invocation_failed" && atNextTask) {
+    model.title = "Your change is committed";
+    model.summary = "The next step stopped before choosing what to fix next.";
+    model.followUp = {label: "Retry with older issue next", choice: "yes"};
+    model.followUpPrimary = true;
+  } else if (hasOlderIssue && reason === "next_task_approval") {
+    model.followUp = {label: "Make the older issue next", choice: "other"};
   }
-  label.textContent = textarea.placeholder || "Optional direction";
-  gate.dataset.draftKey = `${currentRunId}:${reason}`;
-  textarea.value = gateDrafts.get(gate.dataset.draftKey) || "";
+  return model;
+}
+
+// Evidence stays exact but moves behind a disclosure instead of being appended
+// to the gate copy.
+function gateEvidence(reason, state) {
   if (reason === "validation_execution_approval") {
     const commands = (state.pending_validation?.commands || []).map((item) => `${item.id}: ${item.command}`);
-    if (commands.length) description.textContent += `\n\nPending host commands:\n${commands.join("\n")}`;
-    description.textContent = `You are approving these host commands once in the isolated worktree, not a provider turn.\n\n${description.textContent}\n\nWhere: ${state.execution_worktree || "isolated worktree"} at ${(state.working_revision || state.source_revision || "").slice(0, 12)}`;
-    textarea.hidden = true;
-    label.hidden = true;
+    if (!commands.length) return null;
+    return {
+      label: `View the ${commands.length} pending command${commands.length === 1 ? "" : "s"}`,
+      body: `${commands.join("\n")}\n\nWhere: ${state.execution_worktree || "isolated worktree"} at ${(state.working_revision || state.source_revision || "").slice(0, 12)}`,
+    };
   }
   if (reason === "validation_baseline_failure_decision") {
     const classification = state.pending_baseline_acceptance?.classification;
-    if (classification) {
-      const failures = Object.entries(classification.failures || {})
-        .map(([id, item]) => `${id}: ${(item.current?.lines || []).join("; ") || "see validation output"}`);
-      description.textContent += `\n\nBaseline ${String(classification.baseline_revision || "").slice(0, 12)} · matched failures:\n${failures.join("\n")}`;
-    }
+    if (!classification) return null;
+    const failures = Object.entries(classification.failures || {})
+      .map(([id, item]) => `${id}: ${(item.current?.lines || []).join("; ") || "see validation output"}`);
+    return {
+      label: `See the older issue${failures.length === 1 ? "" : "s"}`,
+      body: `This was already broken before your change (${String(classification.baseline_revision || "").slice(0, 12)}):\n\n${failures.join("\n")}`,
+    };
   }
+  if (reason === "validation_receipt_required") {
+    return {
+      label: "How to attach the receipt",
+      body: `python -m toledo_orchestrator validate ${state.run_id} --receipt-file "C:\\path\\to\\receipt.json"`,
+    };
+  }
+  return null;
+}
+
+function configureGate(fragment, state) {
+  const reason = state.pending_human_decision || "human_decision";
+  const gate = $(".human-gate", fragment);
+  const model = gatePresentation(state);
   gate.dataset.reason = reason;
-  if (reason === "operator_step") {
-    no.hidden = true;
-    other.hidden = true;
-    stop.hidden = false;
-    description.hidden = true;
-    note.hidden = false;
-    note.textContent = "Guidance is appended to this turn's prompt only — the workflow instruction is unchanged. It is recorded as an operator decision.";
+  gate.dataset.draftKey = `${currentRunId}:${reason}`;
+  $("[data-gate-title]", gate).textContent = model.title;
+  const summary = $("[data-gate-summary]", gate);
+  summary.textContent = model.summary || "";
+  summary.hidden = !model.summary;
+  const evidence = gateEvidence(reason, state);
+  if (evidence) {
+    $("[data-gate-evidence-label]", gate).textContent = evidence.label;
+    $("[data-gate-evidence-body]", gate).textContent = evidence.body;
+    $("[data-gate-evidence]", gate).hidden = false;
   }
-  if (reason === "validation_receipt_required") yes.hidden = true;
+  const yes = $('[data-choice="yes"]', gate);
+  const no = $('[data-choice="no"]', gate);
+  const alt = $("[data-gate-alt]", gate);
+  const followUp = $("[data-gate-follow-up]", gate);
+  const send = $('[data-choice="other"]', gate);
+  yes.textContent = model.yes || "";
+  yes.hidden = !model.yes;
+  yes.className = model.followUpPrimary ? "quiet-button" : "primary-button";
+  no.textContent = model.no || "";
+  no.hidden = !model.no;
+  alt.textContent = model.alt || "";
+  alt.hidden = !model.alt;
+  if (model.followUp) {
+    followUp.textContent = model.followUp.label;
+    followUp.dataset.choice = model.followUp.choice;
+    followUp.dataset.followUp = "baseline_failure";
+    followUp.className = model.followUpPrimary ? "primary-button" : "quiet-button";
+    followUp.hidden = false;
+  }
+  const actions = $(".gate-actions", gate);
+  const more = $("[data-gate-more]", gate);
+  const moreActions = $("[data-gate-more-actions]", gate);
+  if (model.followUpPrimary) actions.prepend(followUp);
+  if (model.compactOptions) {
+    moreActions.append(no, alt);
+    more.hidden = false;
+  } else {
+    actions.append(no, alt);
+  }
+  send.textContent = model.send || "Send direction";
+  send.hidden = Boolean(model.guidanceOnly);
+  $("[data-gate-stop]", gate).hidden = !model.stop;
+  const textarea = $("[data-gate-text]", gate);
+  $("[data-gate-label]", gate).textContent = model.directionLabel || "Direction";
+  textarea.placeholder = model.directionLabel || "Direction";
+  textarea.value = gateDrafts.get(gate.dataset.draftKey) || "";
+  if (textarea.value) $("[data-gate-direction]", gate).hidden = false;
+  const note = $("[data-gate-note]", gate);
+  if (model.note) {
+    note.textContent = model.note;
+    note.hidden = false;
+  }
 }
 
 function humanizeReason(reason) {
   const text = String(reason || "review required").replace(/[_-]+/g, " ");
   return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function decisionReasonLabel(reason) {
+  const labels = {
+    validation_execution_approval: "Checks approved",
+    validation_baseline_failure_decision: "Older issue acknowledged",
+    provider_invocation_failed: "Retry after interruption",
+    next_task_approval: "Next task choice",
+  };
+  return labels[reason] || humanizeReason(reason);
 }
 
 function populateNewRun() {
@@ -1357,13 +1543,32 @@ function toggleStageEditor(row, workflow, stage, sharedWith) {
     const selection = catalogSelection(editor);
     selection.provider = providerSelect.value;
     if (!selection.model || !selection.effort) { alert("Model and reasoning effort are required."); return; }
+    const slotProfiles = [stage.profile, ...partners];
+    const effective = new Map(slotProfiles.map((profileId) => [
+      profileId,
+      profileId === stage.profile ? selection : effectiveProfile(workflow, profileId),
+    ]));
+    const mismatched = [...effective]
+      .filter(([, value]) => value.provider !== selection.provider)
+      .map(([profileId]) => profileId);
+    if (mismatched.length) {
+      showNewRunError(`Default not saved. This route shares one provider session with ${mismatched.join(", ")}. Apply ${selection.provider} to those routes first, then Save as default; the whole session will be saved together.`);
+      return;
+    }
+    const profileOverrides = Object.fromEntries([...effective].map(([profileId, value]) => [profileId, {
+      provider: value.provider,
+      model: value.model,
+      effort: value.effort,
+      custom: Boolean(value.custom),
+    }]));
     event.target.disabled = true;
     try {
-      await api("/api/profile", {method:"POST",body:JSON.stringify({workflow:$("#new-workflow").value, profile:stage.profile, ...selection})});
+      await api("/api/profile", {method:"POST",body:JSON.stringify({workflow:$("#new-workflow").value, profile_overrides:profileOverrides})});
       // The default now matches this draft, so a run-only override would be
       // pure noise; the flash on the rebuilt row confirms the write.
-      launchOverrides.delete(stage.profile);
+      for (const profileId of slotProfiles) launchOverrides.delete(profileId);
       defaultsSavedFlash = stage.profile;
+      showNewRunError("");
       await loadBootstrap();
     } catch (error) {
       alert(`Not saved: ${error.message}`);

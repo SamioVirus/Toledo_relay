@@ -79,7 +79,7 @@ def test_unchanged_baseline_failure_pauses_for_closure_and_accepts_with_debt(
     # The repair loop was not entered for a failure the change did not introduce.
     assert "reviewer_ready_but_validation_failed" not in state["errors"]
 
-    state = app.decide(run_id, "yes")
+    state = app.decide(run_id, "yes", follow_up="baseline_failure")
     assert state["pending_human_decision"] == "next_task_approval"
     assert state["working_revision"] != state["source_revision"]
     debt = [key for key, value in state["artifacts"].items() if value.get("type") == "baseline-debt"]
@@ -93,6 +93,10 @@ def test_unchanged_baseline_failure_pauses_for_closure_and_accepts_with_debt(
     assert "FAILED tests/test_math.py::test_fixture" in transcript
     assert "toledo_orchestrator.baseline_debt.v1" in transcript
     assert "toledo_orchestrator.completion.v1" in transcript
+    assert state["decisions"][-1]["follow_up"] == "baseline_failure"
+    next_task_prompt = claude.invocations[-1]["prompt"]
+    assert b"Make the recorded older issue the next task" in next_task_prompt
+    assert b"FAILED tests/test_math.py::test_fixture" in next_task_prompt
 
 
 def test_new_regression_still_routes_to_repair_and_round_cap(

@@ -2133,6 +2133,7 @@ class CycleOrchestrator:
         choice: str,
         reason: str,
         title: str | None = None,
+        follow_up: str | None = None,
     ) -> dict[str, Any]:
         decision_number = len(state["decisions"]) + 1
         relative = Path("decisions") / f"decision.{decision_number:04d}.md"
@@ -2146,6 +2147,8 @@ class CycleOrchestrator:
             "after_turn": state["current_turn"],
             "title": title or f"Human: {choice}",
         }
+        if follow_up:
+            record["follow_up"] = follow_up
         state["decisions"].append(record)
         self._event(
             state,
@@ -2155,8 +2158,47 @@ class CycleOrchestrator:
         )
         return record
 
+    def _baseline_failure_follow_up(self, state: dict[str, Any]) -> bytes:
+        """Turn recorded clean-base failures into exact next-task direction."""
+        classification: dict[str, Any] | None = None
+        pending = state.get("pending_baseline_acceptance")
+        if isinstance(pending, dict) and isinstance(pending.get("classification"), dict):
+            classification = pending["classification"]
+        if classification is None:
+            for relative, metadata in reversed(list(state.get("artifacts", {}).items())):
+                if not isinstance(metadata, dict) or metadata.get("type") != "baseline-debt":
+                    continue
+                if metadata.get("cycle") != state.get("cycle"):
+                    continue
+                debt = read_json(self._run_dir(state["run_id"]) / relative)
+                if isinstance(debt.get("classification"), dict):
+                    classification = debt["classification"]
+                    break
+        if classification is None:
+            raise ValueError("the older issue record is missing")
+        failure_lines: list[str] = []
+        for check_id, item in classification.get("failures", {}).items():
+            current = item.get("current", {}) if isinstance(item, dict) else {}
+            lines = current.get("lines", []) if isinstance(current, dict) else []
+            detail = "; ".join(str(line) for line in lines if str(line).strip())
+            failure_lines.append(f"- {check_id}: {detail or 'inspect the recorded check output'}")
+        if not failure_lines:
+            raise ValueError("the older issue record contains no failures")
+        return (
+            "Make the recorded older issue the next task. Propose the smallest focused repair "
+            "that gets the repository fully passing.\n\nOlder issue:\n"
+            + "\n".join(failure_lines)
+            + "\n"
+        ).encode("utf-8")
+
     @_locked
-    def decide(self, run_id: str, choice: str, text: bytes = b"") -> dict[str, Any]:
+    def decide(
+        self,
+        run_id: str,
+        choice: str,
+        text: bytes = b"",
+        follow_up: str | None = None,
+    ) -> dict[str, Any]:
         if choice not in {"yes", "no", "other"}:
             raise ValueError("decision choice must be yes, no, or other")
         state = self.state(run_id)
@@ -2168,9 +2210,31 @@ class CycleOrchestrator:
             raise ValueError("use the advance command to start the next step")
         if reason == "validation_receipt_required" and choice == "yes":
             raise ValueError("attach the required validation receipt with the validate command")
+        if follow_up:
+            if follow_up != "baseline_failure":
+                raise ValueError("unknown decision follow-up")
+            workflow = self._workflow(state)
+            allowed = (
+                reason == "validation_baseline_failure_decision" and choice == "yes"
+            ) or (
+                reason == "next_task_approval" and choice == "other"
+            ) or (
+                reason == "provider_invocation_failed"
+                and choice == "yes"
+                and state.get("current_stage") in {
+                    workflow.next_task_stage,
+                    workflow.next_task_revision_stage,
+                }
+            )
+            if not allowed:
+                raise ValueError("the older issue cannot be carried forward from this decision")
+            if text.strip():
+                raise ValueError("decision text cannot accompany a structured follow-up")
+            text = self._baseline_failure_follow_up(state)
+            decode_text_artifact(text, "decision")
         if choice == "other" and not text.strip():
             raise ValueError("the other decision requires explanatory text")
-        if choice != "other" and text.strip():
+        if choice != "other" and text.strip() and not follow_up:
             raise ValueError("decision text is accepted only with choice=other")
         accepted_proposal: dict[str, Any] | None = None
         accepted_proposal_bytes: bytes | None = None
@@ -2182,7 +2246,13 @@ class CycleOrchestrator:
                 state, f"turns/{accepted_proposal['output_file']}"
             )
         payload = text if text else (choice + "\n").encode("utf-8")
-        self._record_decision(state, payload=payload, choice=choice, reason=reason)
+        self._record_decision(
+            state,
+            payload=payload,
+            choice=choice,
+            reason=reason,
+            follow_up=follow_up,
+        )
         state["pending_human_decision"] = None
         if reason == "next_task_approval":
             if choice == "no":

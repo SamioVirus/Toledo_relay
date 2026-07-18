@@ -18,7 +18,7 @@ from .configuration import (
     load_configured_workflows,
     save_project_value,
     save_workflow_variant,
-    update_profile,
+    update_profiles,
 )
 from .catalog import load_catalog, refresh_catalog, research_catalog, validate_selection
 from .core import read_json
@@ -379,9 +379,10 @@ def make_handler(
                     run_id = parts[2]
                     choice = str(value.get("choice", ""))
                     text = str(value.get("text", "")).encode("utf-8")
+                    follow_up = str(value.get("follow_up", "")).strip() or None
                     workers.start(
                         run_id,
-                        lambda: engine.decide(run_id, choice, text),
+                        lambda: engine.decide(run_id, choice, text, follow_up),
                         lambda error: engine.record_background_failure(run_id, error),
                         before_start=lambda: _persist_submitted_next_turn_override(
                             engine, run_id, value
@@ -440,35 +441,47 @@ def make_handler(
                     return
                 if parsed.path == "/api/profile":
                     workflow_id = str(value.get("workflow", "continuous-development"))
-                    profile_id = str(value["profile"])
                     workflow = load_configured_workflows(engine.runtime_dir)[workflow_id]
-                    current = workflow.profiles[profile_id]
-                    provider = str(value["provider"]) if value.get("provider") else current.provider
-                    model = str(value["model"]) if "model" in value else current.model
-                    effort = str(value["effort"]) if "effort" in value else current.effort
+                    bulk = value.get("profile_overrides")
+                    if bulk is not None:
+                        if not isinstance(bulk, dict) or not bulk:
+                            raise ValueError("profile_overrides must be a non-empty object")
+                        overrides = bulk
+                        profile_id = None
+                    else:
+                        profile_id = str(value["profile"])
+                        overrides = {
+                            profile_id: {
+                                key: value[key]
+                                for key in ("provider", "model", "effort", "permission", "label", "custom")
+                                if key in value
+                            }
+                        }
                     catalog = load_catalog(engine.runtime_dir, refresh=False)
                     # Discovery can be unavailable (for example a locked-down
                     # field host).  A stale/empty catalog warns the UI but is
                     # never a persistence or run blocker; when it has entries,
                     # the combination is validated deterministically.
                     if catalog.get("models"):
-                        validate_selection(
-                            catalog, provider=provider, model=model,
-                            effort=effort, custom=bool(value.get("custom")),
-                        )
-                    workflow = update_profile(
-                        engine.runtime_dir,
-                        workflow_id,
-                        profile_id,
-                        provider=str(value["provider"]) if value.get("provider") else None,
-                        model=str(value["model"]) if "model" in value else None,
-                        effort=str(value["effort"]) if "effort" in value else None,
-                        permission=str(value["permission"]) if "permission" in value else None,
-                        label=str(value["label"]) if "label" in value else None,
-                        custom=bool(value.get("custom")),
-                    )
+                        for selected_profile, changes in overrides.items():
+                            if selected_profile not in workflow.profiles:
+                                raise ValueError(f"unknown profile: {selected_profile}")
+                            if not isinstance(changes, dict):
+                                raise ValueError(f"profile override for {selected_profile} must be an object")
+                            current = workflow.profiles[selected_profile]
+                            provider = str(changes.get("provider") or current.provider)
+                            model = str(changes["model"]) if "model" in changes else current.model
+                            effort = str(changes["effort"]) if "effort" in changes else current.effort
+                            validate_selection(
+                                catalog, provider=provider, model=model,
+                                effort=effort, custom=bool(changes.get("custom", current.custom)),
+                            )
+                    workflow = update_profiles(engine.runtime_dir, workflow_id, overrides)
                     engine.workflows = load_configured_workflows(engine.runtime_dir)
-                    saved = workflow.public_summary()["profiles"][profile_id]
+                    summary = workflow.public_summary()
+                    saved = summary["profiles"][profile_id] if profile_id else {
+                        "profiles": {key: summary["profiles"][key] for key in overrides}
+                    }
                     self._send(saved)
                     return
                 if parsed.path == "/api/workflows/save-as":

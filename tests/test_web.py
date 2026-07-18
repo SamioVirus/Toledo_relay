@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from toledo_orchestrator.configuration import load_configured_workflows, update_profile
+from toledo_orchestrator.configuration import load_configured_workflows, update_profile, update_profiles
 from toledo_orchestrator.catalog import CATALOG_SCHEMA
 from toledo_orchestrator.core import sha256, write_json
 from toledo_orchestrator.cycle import CycleOrchestrator
@@ -64,6 +64,26 @@ def test_profile_provider_switch_is_persisted_and_slot_consistent(tmp_path: Path
     assert reloaded["codex-implementation"].provider == "claude"
 
 
+def test_shared_session_provider_defaults_can_be_switched_atomically(tmp_path: Path):
+    saved = update_profiles(tmp_path, "continuous-development", {
+        "claude-planning-review": {
+            "provider": "codex", "model": "gpt-5.6-terra", "effort": "high",
+        },
+        "claude-implementation-review": {
+            "provider": "codex", "model": "gpt-5.6-sol", "effort": "xhigh",
+        },
+    })
+    assert saved.profiles["claude-planning-review"].provider == "codex"
+    assert saved.profiles["claude-implementation-review"].provider == "codex"
+    assert load_configured_workflows(tmp_path)["continuous-development"].profiles[
+        "claude-implementation-review"
+    ].model == "gpt-5.6-sol"
+    with pytest.raises(ValueError, match="requires model and effort"):
+        update_profiles(tmp_path, "continuous-development", {
+            "codex-planning": {"model": ""},
+        })
+
+
 def test_workflow_variant_accepts_provider_overrides_with_slot_rule(tmp_path: Path):
     from toledo_orchestrator.configuration import save_workflow_variant
 
@@ -77,7 +97,9 @@ def test_workflow_variant_accepts_provider_overrides_with_slot_rule(tmp_path: Pa
         save_workflow_variant(
             tmp_path, "continuous-development", "mixed-reviewers", "Mixed reviewers",
             profile_overrides={"claude-implementation-review": {"provider": "codex", "model": "gpt-5.6-terra", "effort": "high"}},
+            prompt_overrides={"planning-kickoff.md": "# Must not be written\n"},
         )
+    assert not (tmp_path / "config" / "prompts" / "mixed-reviewers").exists()
 
 
 def test_profile_api_rejects_unknown_catalog_selection_but_records_custom(tmp_path: Path):
@@ -108,6 +130,20 @@ def test_profile_api_rejects_unknown_catalog_selection_but_records_custom(tmp_pa
             "model": "operator-token", "effort": "special", "custom": True,
         })
         assert status == 200 and saved["custom"] is True and saved["model"] == "operator-token"
+        status, saved_slot = request_json(base + "/api/profile", method="POST", nonce="test-nonce", value={
+            "workflow": "continuous-development",
+            "profile_overrides": {
+                "claude-planning-review": {
+                    "provider": "codex", "model": "review-token", "effort": "special", "custom": True,
+                },
+                "claude-implementation-review": {
+                    "provider": "codex", "model": "audit-token", "effort": "special", "custom": True,
+                },
+            },
+        })
+        assert status == 200
+        assert saved_slot["profiles"]["claude-planning-review"]["provider"] == "codex"
+        assert saved_slot["profiles"]["claude-implementation-review"]["model"] == "audit-token"
     finally:
         server.shutdown(); server.server_close(); thread.join(timeout=5)
 
@@ -488,8 +524,13 @@ def test_gate_action_persists_displayed_override_before_scheduling(
         events.append(("continue", direction))
         return {"run_id": run_id}
 
-    def decide(run_id: str, choice: str, text: bytes = b"") -> dict[str, object]:
-        events.append(("decision", (choice, text)))
+    def decide(
+        run_id: str,
+        choice: str,
+        text: bytes = b"",
+        follow_up: str | None = None,
+    ) -> dict[str, object]:
+        events.append(("decision", (choice, text, follow_up)))
         return {"run_id": run_id}
 
     engine.set_next_turn_override = set_next_turn_override  # type: ignore[method-assign]
@@ -512,7 +553,7 @@ def test_gate_action_persists_displayed_override_before_scheduling(
     value.update(
         {"direction": "Run with these settings."}
         if endpoint == "continue"
-        else {"choice": "yes", "text": ""}
+        else {"choice": "yes", "text": "", "follow_up": "baseline_failure"}
     )
     try:
         status, _ = request_json(
@@ -531,6 +572,8 @@ def test_gate_action_persists_displayed_override_before_scheduling(
         assert persisted["model"] == "claude-opus-4-8"
         assert persisted["effort"] == "low"
         assert persisted["session_action"] == "new"
+        if endpoint == "decision":
+            assert events[1][1] == ("yes", b"", "baseline_failure")
     finally:
         server.shutdown()
         server.server_close()
