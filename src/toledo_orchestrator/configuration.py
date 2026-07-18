@@ -136,6 +136,7 @@ def update_profile(
     workflow_id: str,
     profile_id: str,
     *,
+    provider: str | None = None,
     model: str | None = None,
     effort: str | None = None,
     permission: str | None = None,
@@ -146,16 +147,31 @@ def update_profile(
     profiles = value.get("profiles", {})
     if profile_id not in profiles:
         raise ValueError(f"unknown profile: {profile_id}")
-    changes = {"model": model, "effort": effort, "permission": permission, "label": label, "custom": custom}
+    changes = {"provider": provider, "model": model, "effort": effort, "permission": permission, "label": label, "custom": custom}
     for key, selected in changes.items():
         if selected is not None:
             profiles[profile_id][key] = selected
     # A label is presentation only.  When an operator changes selection fields
     # without deliberately setting a custom label, keep the visible label
     # truthful by deriving it from the persisted values.
-    if label is None and (model is not None or effort is not None):
+    if label is None and (provider is not None or model is not None or effort is not None):
         profiles[profile_id]["label"] = f"{profiles[profile_id]['model']} · {profiles[profile_id]['effort']}"
-    return save_workflow_value(runtime_dir, value)
+    target = configuration_dir(runtime_dir) / "workflows" / f"{workflow_id}.json"
+    previous = target.read_bytes() if target.is_file() else None
+    parsed = save_workflow_value(runtime_dir, value)
+    # The saved file validates standalone, but workflows that extend it are
+    # only re-validated on load.  A provider flip that mixes providers inside a
+    # dependent workflow's session slot would otherwise brick every subsequent
+    # load, so verify the whole layered set and roll back on failure.
+    try:
+        load_configured_workflows(runtime_dir)
+    except ValueError as error:
+        if previous is None:
+            target.unlink(missing_ok=True)
+        else:
+            atomic_write(target, previous)
+        raise ValueError(f"not saved; this change breaks a dependent workflow: {error}")
+    return parsed
 
 
 def save_project_value(runtime_dir: Path, value: dict[str, Any]) -> ProjectDefinition:

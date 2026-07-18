@@ -42,6 +42,28 @@ def test_profile_overrides_are_runtime_local_and_validated(tmp_path: Path):
     assert (tmp_path / "config" / "workflows" / "continuous-development.json").is_file()
 
 
+def test_profile_provider_switch_is_persisted_and_slot_consistent(tmp_path: Path):
+    # The implementer slot is served by one profile, so flipping its provider
+    # keeps every stage in the slot consistent.
+    update_profile(
+        tmp_path, "continuous-development", "codex-implementation",
+        provider="claude", model="claude-fable-5", effort="max",
+    )
+    after = load_configured_workflows(tmp_path)["continuous-development"].profiles["codex-implementation"]
+    assert after.provider == "claude" and after.model == "claude-fable-5" and after.effort == "max"
+    # The reviewer slot is shared by both review profiles; a one-sided flip
+    # would resume a Claude session with Codex, so it must be rejected and the
+    # stored workflow must stay loadable.
+    with pytest.raises(ValueError, match="session slot"):
+        update_profile(
+            tmp_path, "continuous-development", "claude-implementation-review",
+            provider="codex", model="gpt-5.6-terra", effort="high",
+        )
+    reloaded = load_configured_workflows(tmp_path)["continuous-development"].profiles
+    assert reloaded["claude-implementation-review"].provider == "claude"
+    assert reloaded["codex-implementation"].provider == "claude"
+
+
 def test_profile_api_rejects_unknown_catalog_selection_but_records_custom(tmp_path: Path):
     engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
     write_json(engine.runtime_dir / "catalog" / "capabilities.v1.json", {
@@ -103,6 +125,19 @@ def test_local_web_api_serves_ui_requires_nonce_and_blocks_artifact_traversal(tm
             html = response.read().decode("utf-8")
             assert response.status == 200 and "Toledo Relay" in html
             assert response.headers["Content-Security-Policy"].startswith("default-src 'self'")
+            assert '<div class="run-context">' in html
+            assert '<button class="quiet-button" id="jump-active">Active</button>' in html
+
+        with urllib.request.urlopen(base + "/styles.css", timeout=5) as response:
+            css = response.read().decode("utf-8")
+            assert ".run-context { position:sticky; top:0;" in css
+            assert ".timeline-toolbar { min-height:46px;" in css
+            assert ".turn-quick-take summary" in css
+
+        with urllib.request.urlopen(base + "/app.js", timeout=5) as response:
+            javascript = response.read().decode("utf-8")
+            assert "function quickTakeMarkup(turn)" in javascript
+            assert "head.summary_sequence" in javascript
 
         status, bootstrap = request_json(base + "/api/bootstrap")
         assert status == 200 and bootstrap["nonce"] == "test-nonce"
@@ -279,6 +314,7 @@ def test_head_endpoint_returns_only_change_detection_fields(tmp_path: Path):
         assert head == {
             "run_id": run_id,
             "event_sequence": 42,
+            "summary_sequence": 0,
             "status": "paused",
             "current_turn": 7,
             "pending_human_decision": "next_task_approval",
@@ -286,6 +322,55 @@ def test_head_endpoint_returns_only_change_detection_fields(tmp_path: Path):
         }
         # The head response must stay small: it never carries turns or events.
         assert "turns" not in head and "events" not in head
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_run_projection_includes_async_quick_take_and_summary_revision(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    run_id = "run_20260717T120000Z_1234abcd"
+    turns = engine.runs_dir / run_id / "turns"
+    turns.mkdir(parents=True)
+    (turns / "turn.0001.output.md").write_text("Plan output", encoding="utf-8")
+    write_json(engine.runs_dir / run_id / "run.json", {
+        "run_id": run_id,
+        "status": "paused",
+        "current_turn": 1,
+        "pending_human_decision": "operator_step",
+        "turns": [{
+            "id": "turn.0001", "route": "codex-propose", "provider": "codex",
+            "output_file": "turn.0001.output.md", "substantive": True,
+        }],
+    })
+
+    class FakeSummaryWorkers:
+        def revision(self, selected_run_id: str) -> int:
+            assert selected_run_id == run_id
+            return 7
+
+        def enrich(self, selected_run_id: str, state: dict[str, object]) -> None:
+            assert selected_run_id == run_id
+            state["turns"][0]["quick_take"] = {
+                "status": "ready", "text": "Planner produced a concise plan.",
+                "model": "gemma4:test", "generated_at": "2026-07-17T12:00:00Z", "error": None,
+            }
+
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_handler(engine, workers, "test-nonce", summary_workers=FakeSummaryWorkers()),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        _, head = request_json(base + f"/api/runs/{run_id}/head")
+        _, state = request_json(base + f"/api/runs/{run_id}")
+        assert head["summary_sequence"] == 7
+        assert state["summary_sequence"] == 7
+        assert state["turns"][0]["quick_take"]["text"] == "Planner produced a concise plan."
     finally:
         server.shutdown()
         server.server_close()

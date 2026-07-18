@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Toledo Relay</title>
-  <link rel="stylesheet" href="/styles.css?v=routectl6">
+  <link rel="stylesheet" href="/styles.css?v=quicktake2">
 </head>
 <body>
   <div class="app-shell">
@@ -28,18 +28,20 @@
     </aside>
 
     <main class="workspace">
-      <section class="run-status-strip" id="run-status-strip" aria-live="polite" hidden></section>
-      <section class="run-header" id="run-header">
-        <div><p class="eyebrow">NO RUN SELECTED</p><h2>Start with a concrete request.</h2></div>
-        <div class="run-facts" id="run-facts"></div>
-      </section>
+      <div class="run-context">
+        <section class="run-status-strip" id="run-status-strip" aria-live="polite" hidden></section>
+        <section class="run-header" id="run-header">
+          <div><p class="eyebrow">NO RUN SELECTED</p><h2>Start with a concrete request.</h2></div>
+          <div class="run-facts" id="run-facts"></div>
+        </section>
 
-      <section class="timeline-toolbar" aria-label="Timeline controls">
-        <div class="zoom-control"><span>Overview</span><input id="zoom-slider" type="range" min="72" max="118" value="94" aria-label="Timeline density"><span>Detail</span></div>
-        <select id="phase-filter" aria-label="Filter by phase"><option value="all">All phases</option></select>
-        <select id="session-filter" aria-label="Filter by session"><option value="all">All sessions</option></select>
-        <button class="quiet-button" id="jump-active">Jump to active</button>
-      </section>
+        <section class="timeline-toolbar" aria-label="Timeline controls">
+          <div class="zoom-control"><span>Overview</span><input id="zoom-slider" type="range" min="72" max="118" value="94" aria-label="Timeline density"><span>Detail</span></div>
+          <select id="phase-filter" aria-label="Filter by phase"><option value="all">All phases</option></select>
+          <select id="session-filter" aria-label="Filter by session"><option value="all">All sessions</option></select>
+          <button class="quiet-button" id="jump-active">Active</button>
+        </section>
+      </div>
 
       <section id="empty-state" class="empty-state">
         <div class="empty-orbit"><span>A</span><span>B</span><span>C</span></div>
@@ -125,6 +127,6 @@
     </article>
   </template>
 
-  <script src="/app.js?v=routectl6" defer></script>
+  <script src="/app.js?v=quicktake2" defer></script>
 </body>
 </html>

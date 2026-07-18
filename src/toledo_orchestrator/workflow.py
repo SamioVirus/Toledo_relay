@@ -291,7 +291,9 @@ class WorkflowDefinition:
             previous_provider = slot_providers.setdefault(stage.session_slot, profile.provider)
             if previous_provider != profile.provider:
                 raise ValueError(
-                    f"session slot {stage.session_slot} changes provider between stages"
+                    f"session slot {stage.session_slot} changes provider between stages; "
+                    "routes sharing a session slot resume the same provider session, "
+                    "so switch every profile on that slot together"
                 )
             for token in stage.context:
                 if token in CONTEXT_TOKENS:

@@ -24,6 +24,8 @@ python -m toledo_orchestrator ui
 
 The UI shows Codex on the left, Claude on the right, stable colors and physical-session generations per logical session, named interstitial prompts on the center line, sealed handoff/completion milestones, configured and observed model/effort evidence, direction/transport/output inspectors, semantic overview/detail density, and human gates. It also exposes editable route profiles, repository configuration, exact optional owner direction at every step, and recorded one-turn model/effort plus `new`/`continue` overrides.
 
+Each successful substantive turn also gets a collapsed **Quick take**: a one- or two-sentence, human-review digest generated locally with Gemma 4 through Ollama. It is an additive side artifact, never controller input or a replacement for the exact output. Generation starts asynchronously after a new turn is saved, so continuous runs and automatic transitions do not wait; opening an older run backfills missing digests. An unavailable local model leaves the full Relay run unaffected, and reopening the run after the cooldown retries the digest. The defaults are `gemma4:12b-it-qat` at `http://127.0.0.1:11434/api/chat`; advanced local setups may override them with `TOLEDO_RELAY_SUMMARY_MODEL` and `TOLEDO_RELAY_OLLAMA_URL`.
+
 ## Readiness and profiles
 
 ```powershell

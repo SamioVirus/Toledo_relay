@@ -174,6 +174,31 @@ class FailedOnceThenSessionAdapter(SessionAdapter):
         return super().invoke_configured(route, prompt, working_directory, **kwargs)
 
 
+class FailedNthInvocationAdapter(SessionAdapter):
+    """Succeeds normally except for the Nth invocation, which fails like a
+    quota/network cut-off without consuming a scripted response."""
+
+    def __init__(self, provider: str, scripted: list[tuple[str, str]], fail_on: int) -> None:
+        super().__init__(provider, scripted)
+        self.fail_on = fail_on
+
+    def invoke_configured(self, route: str, prompt: bytes, working_directory: Path, **kwargs: Any) -> ProviderResult:
+        if len(self.invocations) + 1 == self.fail_on:
+            self.invocations.append({**kwargs, "route": route, "prompt": prompt, "cwd": working_directory})
+            return ProviderResult(
+                self.provider,
+                route,
+                b"",
+                stderr=b"quota exhausted",
+                exit_code=1,
+                error="fixture quota failure",
+                configured_model=kwargs["model"],
+                configured_reasoning=kwargs["reasoning"],
+                session_action=kwargs["session_action"],
+            )
+        return super().invoke_configured(route, prompt, working_directory, **kwargs)
+
+
 @pytest.fixture
 def writable_project(tmp_path: Path) -> ProjectDefinition:
     root = tmp_path / "project"
@@ -1009,6 +1034,58 @@ def test_fork_rewind_requires_opt_in_and_preserves_source_evidence(tmp_path: Pat
     assert len(fork["turns"]) == 1 and fork["next_turn_override"]["session_action"] == "new"
     assert (app._run_dir(result["run_id"]) / "turns" / "turn.0002.output.md").is_file()
     assert (app._run_dir(result["run_id"]) / "fork.json").is_file()
+
+
+def test_provider_failure_gate_unlocks_provider_switch_without_stage_opt_in(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Initial plan")),
+        ("planning-review", response("human", "Codex rescue review")),
+    ])
+    claude = FailedOnceThenSessionAdapter("claude", [])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Task", "test")
+    failed = app.run_to_stop(run_id)
+    assert failed["pending_human_decision"] == "provider_invocation_failed"
+
+    # planning-review does not opt in to provider_switchable, but the failure
+    # gate unlocks the switch so the operator can route around the outage.
+    with pytest.raises(ValueError, match="new physical session"):
+        app.set_next_turn_override(run_id, profile="codex-planning", session_action="continue")
+    saved = app.set_next_turn_override(run_id, profile="codex-planning", session_action="new")
+    assert saved["next_turn_override"]["provider_switch"] is True
+
+    retried = app.decide(run_id, "yes")
+    assert retried["turns"][-1]["provider"] == "codex"
+    assert codex.invocations[-1]["route"] == "planning-review"
+    assert codex.invocations[-1]["session_action"] == "new"
+
+
+def test_cutoff_retry_can_resume_the_interrupted_session(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Initial plan")),
+        ("planning-revise", response("continue", "Revised plan")),
+    ])
+    claude = FailedNthInvocationAdapter("claude", [
+        ("planning-review", response("continue", "Needs one revision")),
+        ("planning-review", response("human", "Review complete after the cut-off")),
+    ], fail_on=2)
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Task", "test")
+    failed = app.run_to_stop(run_id)
+    assert failed["pending_human_decision"] == "provider_invocation_failed"
+    assert failed["cycles"][0]["sessions"]["reviewer"]["active_session_id"] == "claude-session-1"
+
+    app.set_next_turn_override(run_id, session_action="continue")
+    state = app.decide(run_id, "other", b"We were cut off. Please continue.")
+    resumed = claude.invocations[-1]
+    assert resumed["session_action"] == "continue"
+    assert resumed["session_id"] == "claude-session-1"
+    assert b"We were cut off. Please continue." in resumed["prompt"]
+    assert state["pending_human_decision"] == "provider_requested_human"
 
 
 def test_provider_failure_retry_preserves_the_selected_profile_model_and_effort(

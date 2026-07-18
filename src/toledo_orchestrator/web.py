@@ -24,6 +24,7 @@ from .catalog import load_catalog, refresh_catalog, research_catalog, validate_s
 from .core import read_json
 from .cycle import CycleOrchestrator
 from .director import state_caption
+from .turn_summaries import TurnSummaryWorkers
 
 
 class RunWorkers:
@@ -175,6 +176,7 @@ def make_handler(
     nonce: str,
     server_started_at: str | None = None,
     server_revision: str | None = None,
+    summary_workers: TurnSummaryWorkers | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     ui_root = Path(__file__).with_name("ui").resolve()
     server_started_at = server_started_at or datetime.now(timezone.utc).isoformat()
@@ -261,6 +263,7 @@ def make_handler(
                     self._send({
                         "run_id": run_id,
                         "event_sequence": state.get("event_sequence", 0),
+                        "summary_sequence": summary_workers.revision(run_id) if summary_workers else 0,
                         "status": state.get("status"),
                         "current_turn": state.get("current_turn", 0),
                         "pending_human_decision": state.get("pending_human_decision"),
@@ -270,6 +273,9 @@ def make_handler(
                 if len(parts) == 3 and parts[:2] == ["api", "runs"]:
                     run_id = parts[2]
                     state = _timeline_compatible(engine.state(run_id))
+                    if summary_workers:
+                        summary_workers.enrich(run_id, state)
+                        state["summary_sequence"] = summary_workers.revision(run_id)
                     state["state_caption"] = state_caption(state)
                     state["steer"] = (
                         engine.steer_availability(run_id)
@@ -437,6 +443,7 @@ def make_handler(
                     profile_id = str(value["profile"])
                     workflow = load_configured_workflows(engine.runtime_dir)[workflow_id]
                     current = workflow.profiles[profile_id]
+                    provider = str(value["provider"]) if value.get("provider") else current.provider
                     model = str(value["model"]) if "model" in value else current.model
                     effort = str(value["effort"]) if "effort" in value else current.effort
                     catalog = load_catalog(engine.runtime_dir, refresh=False)
@@ -446,13 +453,14 @@ def make_handler(
                     # the combination is validated deterministically.
                     if catalog.get("models"):
                         validate_selection(
-                            catalog, provider=current.provider, model=model,
+                            catalog, provider=provider, model=model,
                             effort=effort, custom=bool(value.get("custom")),
                         )
                     workflow = update_profile(
                         engine.runtime_dir,
                         workflow_id,
                         profile_id,
+                        provider=str(value["provider"]) if value.get("provider") else None,
                         model=str(value["model"]) if "model" in value else None,
                         effort=str(value["effort"]) if "effort" in value else None,
                         permission=str(value["permission"]) if "permission" in value else None,
@@ -518,6 +526,8 @@ def serve(runtime_dir: Path, host: str = "127.0.0.1", port: int = 8765, open_bro
         raise ValueError("the UI currently supports IPv4 loopback; use 127.0.0.1")
     engine = CycleOrchestrator(runtime_dir=runtime_dir)
     workers = RunWorkers()
+    summary_workers = TurnSummaryWorkers(runtime_dir)
+    summary_workers.start_watching()
     nonce = secrets.token_urlsafe(24)
     try:
         revision = subprocess.run(
@@ -526,7 +536,10 @@ def serve(runtime_dir: Path, host: str = "127.0.0.1", port: int = 8765, open_bro
     except (OSError, subprocess.SubprocessError):
         revision = "unknown"
     started_at = datetime.now(timezone.utc).isoformat()
-    server = ThreadingHTTPServer((host, port), make_handler(engine, workers, nonce, started_at, revision))
+    server = ThreadingHTTPServer(
+        (host, port),
+        make_handler(engine, workers, nonce, started_at, revision, summary_workers),
+    )
     url = f"http://{host}:{server.server_port}/"
     print(f"Toledo Orchestrator UI: {url}")
     print(f"Server start: {started_at} revision: {revision}")
@@ -538,4 +551,5 @@ def serve(runtime_dir: Path, host: str = "127.0.0.1", port: int = 8765, open_bro
     except KeyboardInterrupt:
         pass
     finally:
+        summary_workers.stop_watching()
         server.server_close()

@@ -739,6 +739,7 @@ class CycleOrchestrator:
         stage: StageDefinition,
         profile: ProfileDefinition,
         action_override: str | None = None,
+        provider_switch_allowed: bool = False,
     ) -> tuple[dict[str, Any], str, str | None]:
         cycle = self._cycle(state)
         sessions = cycle["sessions"]
@@ -754,7 +755,7 @@ class CycleOrchestrator:
             }
             sessions[stage.session_slot] = slot
         if slot["provider"] != profile.provider:
-            if action_override != "new" or not stage.provider_switchable:
+            if action_override != "new" or not (stage.provider_switchable or provider_switch_allowed):
                 raise ValueError(f"session slot {stage.session_slot} cannot change providers")
             for previous in slot["history"]:
                 if previous.get("status") == "active":
@@ -1237,7 +1238,15 @@ class CycleOrchestrator:
             self._save(run_id, state)
             return state
         try:
-            slot, action, session_id = self._session(state, stage, profile, override.get("session_action"))
+            slot, action, session_id = self._session(
+                state,
+                stage,
+                profile,
+                override.get("session_action"),
+                # set_next_turn_override validated the switch (rescue gate or
+                # provider_switchable stage) when this override was recorded.
+                provider_switch_allowed=bool(override.get("provider_switch")),
+            )
         except ValueError as error:
             state["status"] = "paused"
             state["pending_human_decision"] = "provider_session_missing"
@@ -2083,6 +2092,26 @@ class CycleOrchestrator:
         state["inflight"] = None
         self._event(state, "run.cancelled", title="Run cancelled", details={"reason": reason})
 
+    def _override_continues_session(self, state: dict[str, Any]) -> bool:
+        """True when the recorded next-turn override asks to continue the
+        interrupted session and that session can actually be continued."""
+        override = state.get("next_turn_override")
+        if not isinstance(override, dict) or override.get("session_action") != "continue":
+            return False
+        if override.get("provider_switch"):
+            return False
+        stage = self._workflow(state).stages.get(str(state.get("current_stage")))
+        if stage is None:
+            return False
+        slot = self._cycle(state).get("sessions", {}).get(stage.session_slot) or {}
+        profile_value = override.get("profile_value")
+        provider = (
+            str(profile_value.get("provider"))
+            if isinstance(profile_value, dict) and profile_value.get("provider")
+            else self._profile(state, stage.profile).provider
+        )
+        return bool(slot.get("active_session_id")) and str(slot.get("provider") or "") == provider
+
     def _force_new_session(self, state: dict[str, Any]) -> None:
         override = state.get("next_turn_override")
         preserved = dict(override) if isinstance(override, dict) else {}
@@ -2407,8 +2436,16 @@ class CycleOrchestrator:
             state["pending_round_extension"] = None
             state["current_stage"] = target
             state["status"] = "running"
+        elif reason == "provider_invocation_failed":
+            # Quota, network, and outage cut-offs are outside this relay's
+            # control. When the operator explicitly asked to continue the
+            # interrupted session (and it is genuinely continuable), honor
+            # that instead of forcing a fresh session and a re-sent prompt.
+            if self._override_continues_session(state):
+                state["status"] = "running"
+            else:
+                self._force_new_session(state)
         elif reason in {
-            "provider_invocation_failed",
             "provider_session_id_missing",
             "provider_session_missing",
             "provider_session_not_new",
@@ -3118,8 +3155,17 @@ class CycleOrchestrator:
         target_profile = self._profile(state, selected_profile)
         expected_provider = self._profile(state, stage.profile).provider
         provider_switch = target_profile.provider != expected_provider
-        if provider_switch and (not stage.provider_switchable or session_action != "new"):
+        # A provider-invocation failure (quota, outage, network) unlocks a
+        # provider switch even on stages that normally lock theirs: the locked
+        # provider is demonstrably unavailable and the operator needs a route
+        # around it. The switch still requires a new physical session.
+        provider_failure_rescue = (
+            str(state.get("pending_human_decision") or "") == "provider_invocation_failed"
+        )
+        if provider_switch and not (stage.provider_switchable or provider_failure_rescue):
             raise ValueError("a provider switch requires an opt-in provider_switchable stage and a new physical session")
+        if provider_switch and session_action != "new":
+            raise ValueError("a provider switch requires a new physical session")
         write_allowed = stage.phase == "implementation" and stage.role == "implementer"
         if target_profile.permission == "workspace-write" and not write_allowed:
             raise ValueError("workspace-write profiles are allowed only for implementation stages")

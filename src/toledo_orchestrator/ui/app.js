@@ -22,8 +22,10 @@ let pollCount = 0;
 let lastHeadSignature = null;
 let railReturnFocus = null;
 let settingsWorkflowId = null;
+let defaultsSavedFlash = null;
 const promptPreviewCache = new Map();
 const gateDrafts = new Map();
+const openQuickTakes = new Set();
 
 async function api(path, options = {}, retriedNonce = false) {
   const headers = {"Content-Type": "application/json", ...(options.headers || {})};
@@ -149,6 +151,7 @@ async function refreshRuns() {
 
 async function selectRun(runId) {
   currentRunId = runId;
+  openQuickTakes.clear();
   currentRenderSignature = null;
   lastHeadSignature = null;
   closeRunRail();
@@ -171,6 +174,7 @@ function stateSignature(state) {
     worker: state.worker,
     override: state.next_turn_override,
     steer: state.steer,
+    quickTakes: (state.turns || []).map((turn) => [turn.id, turn.quick_take]),
   });
 }
 
@@ -181,7 +185,7 @@ async function poll() {
     let changed = true;
     try {
       const head = await api(`/api/runs/${encodeURIComponent(currentRunId)}/head`);
-      const signature = JSON.stringify([head.event_sequence, head.status, head.current_turn, head.pending_human_decision, head.worker]);
+      const signature = JSON.stringify([head.event_sequence, head.summary_sequence, head.status, head.current_turn, head.pending_human_decision, head.worker]);
       changed = signature !== lastHeadSignature;
       lastHeadSignature = signature;
     } catch { changed = true; }
@@ -250,7 +254,7 @@ function renderRun() {
   const strip = $("#run-status-strip");
   strip.hidden = false;
   strip.innerHTML = `<span>${escapeHtml(state.status)}</span><span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
-  $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(state.run_id)} · ${escapeHtml(state.status.toUpperCase())}</p><h2>${escapeHtml(heading || "Run complete")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">cycle ${state.cycle || 1}</span><span class="fact">${state.current_turn || 0} turns</span><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span>${state.execution_branch ? `<span class="fact">${escapeHtml(state.execution_branch)}</span>` : ''}<button class="quiet-button run-action" id="export-run" title="Download the full conversation and transport prompts as plain text">Export plain text</button><button class="quiet-button run-action" id="copy-run" title="Copy the same full plain-text conversation">Copy all</button>${canRecover ? '<button class="accept-button run-action" id="recover-run">Recover run</button>' : ''}</div>`;
+  $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(state.status.toUpperCase())}</p><h2>${escapeHtml(heading || "Run complete")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span><button class="quiet-button run-action" id="export-run" title="Download the full conversation and transport prompts as plain text">Export plain text</button><button class="quiet-button run-action" id="copy-run" title="Copy the same full plain-text conversation">Copy all</button>${canRecover ? '<button class="accept-button run-action" id="recover-run">Recover run</button>' : ''}</div>`;
   $("#export-run")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     button.disabled = true;
@@ -448,6 +452,27 @@ function turnEvidence(turn) {
   };
 }
 
+function quickTakeModelLabel(model) {
+  const value = String(model || "local model");
+  if (value.toLowerCase().startsWith("gemma4")) return "Gemma 4";
+  return value;
+}
+
+function quickTakeMarkup(turn) {
+  const quickTake = turn.quick_take;
+  if (!quickTake) return "";
+  const model = quickTakeModelLabel(quickTake.model);
+  const disclosure = `data-quick-take="${escapeHtml(turn.id)}"${openQuickTakes.has(turn.id) ? " open" : ""}`;
+  if (quickTake.status === "ready") {
+    return `<details class="turn-quick-take" ${disclosure}><summary><span>Quick take</span><span class="quick-take-state ready">${escapeHtml(model)} · ready</span></summary><p>${escapeHtml(quickTake.text || "Digest unavailable.")}</p></details>`;
+  }
+  if (["queued", "writing", "missing"].includes(quickTake.status)) {
+    return `<details class="turn-quick-take pending" ${disclosure}><summary><span>Quick take</span><span class="quick-take-state writing" aria-live="polite">${escapeHtml(model)} is writing…</span></summary><p>${escapeHtml(model)} is reading this turn. The relay does not wait on this digest.</p></details>`;
+  }
+  const retryNote = quickTake.retry_after ? " Reopen this run shortly to retry." : "";
+  return `<details class="turn-quick-take failed" ${disclosure}><summary><span>Quick take</span><span class="quick-take-state failed">Unavailable</span></summary><p>${escapeHtml(quickTake.error || "The local digest could not be generated. Full output is unaffected.")}${escapeHtml(retryNote)}</p></details>`;
+}
+
 function turnRow(turn, {canSteer = false} = {}) {
   const row = document.createElement("div");
   row.className = "timeline-row";
@@ -458,9 +483,14 @@ function turnRow(turn, {canSteer = false} = {}) {
   const evidence = turnEvidence(turn);
   const interstitialFile = turn.direction_file || turn.interstitial_file || turn.prompt_file;
   const tooltipId = `direction-${String(turn.id || "turn").replaceAll(".", "-")}`;
-  row.innerHTML = `<button class="prompt-node" data-interstitial-path="${escapeHtml(turnArtifactPath(interstitialFile))}" aria-describedby="${escapeHtml(tooltipId)}" aria-label="Open ${escapeHtml(turn.prompt_label || turn.title)} direction"><span class="prompt-label">${escapeHtml(turn.prompt_label || promptShort(turn.prompt_kind))}</span><span class="prompt-tooltip" id="${escapeHtml(tooltipId)}" role="tooltip">Loading exact direction…</span></button><article class="turn-card ${escapeHtml(turn.provider)} ${colorClass}"><div class="turn-card-head"><div class="actor"><span class="session-token">${escapeHtml(sessionDisplay(turn))}</span><div><h3>${escapeHtml(turn.title)}</h3><span class="route">${escapeHtml(turn.provider)} · ${escapeHtml(turn.role)}</span></div></div><span class="turn-number">${escapeHtml(turn.id)}</span></div><div class="turn-preview"><span class="turn-preview-tag">Output excerpt</span><p>${escapeHtml(preview)}</p><div class="turn-preview-actions"><button type="button" data-open-output>Open full output</button><button type="button" data-copy-output>Copy output</button>${canSteer ? '<button type="button" data-steer-output>Reply / revise</button>' : ""}</div></div><div class="turn-evidence ${evidence.mismatch ? "mismatch" : ""}"><span><b>Configured</b> ${escapeHtml(evidence.configured)}</span><span><b>Observed</b> ${escapeHtml(evidence.observed)}</span>${evidence.mismatch ? '<strong>Mismatch</strong>' : ""}</div><div class="chips"><span class="chip ${escapeHtml(turn.session_action)}">${escapeHtml(turn.session_action)} session</span><span class="chip">${escapeHtml(turn.permission)}</span><span class="chip">${Math.round((turn.elapsed_ms || 0)/1000)}s</span></div></article>`;
+  row.innerHTML = `<button class="prompt-node" data-interstitial-path="${escapeHtml(turnArtifactPath(interstitialFile))}" aria-describedby="${escapeHtml(tooltipId)}" aria-label="Open ${escapeHtml(turn.prompt_label || turn.title)} direction"><span class="prompt-label">${escapeHtml(turn.prompt_label || promptShort(turn.prompt_kind))}</span><span class="prompt-tooltip" id="${escapeHtml(tooltipId)}" role="tooltip">Loading exact direction…</span></button><article class="turn-card ${escapeHtml(turn.provider)} ${colorClass}"><div class="turn-card-head"><div class="actor"><span class="session-token">${escapeHtml(sessionDisplay(turn))}</span><div><h3>${escapeHtml(turn.title)}</h3><span class="route">${escapeHtml(turn.provider)} · ${escapeHtml(turn.role)}</span></div></div><span class="turn-number">${escapeHtml(turn.id)}</span></div>${quickTakeMarkup(turn)}<div class="turn-preview"><span class="turn-preview-tag">Output excerpt</span><p>${escapeHtml(preview)}</p><div class="turn-preview-actions"><button type="button" data-open-output>Open full output</button><button type="button" data-copy-output>Copy output</button>${canSteer ? '<button type="button" data-steer-output>Reply / revise</button>' : ""}</div></div><div class="turn-evidence ${evidence.mismatch ? "mismatch" : ""}"><span><b>Configured</b> ${escapeHtml(evidence.configured)}</span><span><b>Observed</b> ${escapeHtml(evidence.observed)}</span>${evidence.mismatch ? '<strong>Mismatch</strong>' : ""}</div><div class="chips"><span class="chip ${escapeHtml(turn.session_action)}">${escapeHtml(turn.session_action)} session</span><span class="chip">${escapeHtml(turn.permission)}</span><span class="chip">${Math.round((turn.elapsed_ms || 0)/1000)}s</span></div></article>`;
   const card = $(".turn-card", row);
   const prompt = $(".prompt-node", row);
+  $(".turn-quick-take", card)?.addEventListener("toggle", (event) => {
+    const turnId = event.currentTarget.dataset.quickTake;
+    if (event.currentTarget.open) openQuickTakes.add(turnId);
+    else openQuickTakes.delete(turnId);
+  });
   $("[data-open-output]", card).addEventListener("click", () => openTurn(turn, "output"));
   $("[data-copy-output]", card).addEventListener("click", async (event) => {
     const button = event.currentTarget;
@@ -674,12 +704,21 @@ function bindGate(fragment) {
   });
 }
 
+function gateProviderSwitchable(preview) {
+  // A provider-invocation failure unlocks provider switching even on stages
+  // that lock theirs: the locked provider is unavailable (quota, outage,
+  // network) and the operator needs a route around it. Mirrors the backend
+  // rescue rule in set_next_turn_override.
+  return Boolean(preview.stage?.provider_switchable)
+    || preview.pending_human_decision === "provider_invocation_failed";
+}
+
 function gateProfileOptions(workflow, preview) {
   const writeAllowed = preview.stage?.phase === "implementation" && preview.stage?.role === "implementer";
   return Object.entries(workflow?.profiles || {})
     .map(([id, value]) => ({id, ...value}))
     .filter((candidate) => writeAllowed || candidate.permission !== "workspace-write")
-    .filter((candidate) => preview.stage?.provider_switchable || candidate.provider === preview.profile?.provider);
+    .filter((candidate) => gateProviderSwitchable(preview) || candidate.provider === preview.profile?.provider);
 }
 
 function gateProfileLabel(profile) {
@@ -733,9 +772,11 @@ async function populateGateUpnext(gate, state) {
   providerSelect.innerHTML = providers.map((providerName) => `<option value="${escapeHtml(providerName)}">${escapeHtml(providerName)}</option>`).join("");
   providerSelect.value = providers.includes(profile.provider) ? profile.provider : (providers[0] || profile.provider || "");
   providerSelect.disabled = providers.length < 2;
-  providerSelect.title = providers.length < 2 && !preview.stage?.provider_switchable
+  providerSelect.title = providers.length < 2 && !gateProviderSwitchable(preview)
     ? "This workflow stage locks the provider. Model and effort can still change."
-    : "";
+    : (gateProviderSwitchable(preview) && !preview.stage?.provider_switchable
+      ? "Unlocked for this retry: the planned provider failed, so you may route this turn to another provider. A provider change starts a new physical session."
+      : "");
   const fillProfiles = (preferredId = null) => {
     const matching = candidateProfiles.filter((candidate) => candidate.provider === providerSelect.value);
     profileSelect.innerHTML = matching.map((candidate) => `<option value="${escapeHtml(candidate.id)}">${escapeHtml(gateProfileLabel(candidate))}</option>`).join("");
@@ -777,8 +818,10 @@ async function populateGateUpnext(gate, state) {
     } else if (effortChanged && resolvedAction === "continue") {
       rule = "This effort change will continue the active session. CLI acceptance is not proof of effective effort; observed evidence will be shown when the provider reports it.";
     } else {
-      rule = preview.stage?.provider_switchable
-        ? "Provider changes require a new physical session. Same-provider model or effort changes may continue the active session."
+      rule = gateProviderSwitchable(preview)
+        ? (preview.stage?.provider_switchable
+          ? "Provider changes require a new physical session. Same-provider model or effort changes may continue the active session."
+          : "Provider switching is unlocked for this retry because the planned provider failed. A provider change starts a new physical session; same-provider model or effort changes may continue the active session.")
         : "This stage keeps its provider. Same-provider model or effort changes may continue the active session.";
     }
     $("[data-gate-session-rule]", panel).textContent = rule;
@@ -825,6 +868,33 @@ async function populateGateUpnext(gate, state) {
   });
   panel.hidden = false;
   tools.hidden = false;
+  const canResumeCutOff = preview.pending_human_decision === "provider_invocation_failed"
+    && session.has_active_session
+    && session.active_provider === profile.provider;
+  if (canResumeCutOff && !$("[data-gate-continue]", gate)) {
+    const quick = document.createElement("div");
+    quick.className = "gate-quick-retry";
+    quick.innerHTML = `<button type="button" class="accept-button" data-gate-continue title="For cut-offs outside the relay's control — quota limits, lost connection, provider outage. Once capacity is back (for example after the limit resets), this resumes the same ${escapeHtml(profile.provider || "")} session with the same settings and tells it: we were cut off, please continue. The gate below closes.">We were cut off — resume &amp; continue</button><p>Same session, same settings. Use after the quota resets or the connection recovers; to switch provider or model instead, use the controls below.</p>`;
+    panel.before(quick);
+    $("[data-gate-continue]", quick).addEventListener("click", async (event) => {
+      event.target.disabled = true;
+      try {
+        await api(`/api/runs/${encodeURIComponent(currentRunId)}/decision`, {method: "POST", body: JSON.stringify({
+          choice: "other",
+          text: "We were cut off by an issue outside this relay's control (quota, network, or provider outage). Please continue exactly where you left off and complete this turn in full.",
+          next_turn_override: {
+            profile: profile.id || null,
+            model: profile.model || null,
+            effort: profile.effort || null,
+            custom: Boolean(profile.custom),
+            session_action: "continue",
+          },
+        })});
+        gateDrafts.delete(gate.dataset.draftKey);
+        await refreshCurrent();
+      } catch (error) { alert(error.message); event.target.disabled = false; }
+    });
+  }
   $("[data-gate-prompt]", gate).onclick = () => {
     inspectorPayload = {
       transport: preview.prompt || `Prompt preview unavailable: ${preview.prompt_error || "unknown"}`,
@@ -857,7 +927,7 @@ function configureGate(fragment, state) {
     validation_execution_approval: ["Run the validation commands?", "These commands execute on the host against the isolated implementation worktree. Review the pending commands before approving.", "Yes — run validation", "No — cancel run", "Other — send to repair", "Explain what the implementation session must change before validation"],
     validation_receipt_required: ["Validation receipt required", `Attach the patch-bound receipt from a terminal with: python -m toledo_orchestrator validate ${state.run_id} --receipt-file "C:\\path\\to\\receipt.json"`, "", "No — cancel run", "Other — add direction", "Add receipt or validation guidance"],
     unknown_validation_execution: ["Validation completion is unknown", "The controller stopped after host validation started but before a trustworthy completion record was sealed. It will not rerun the commands automatically. Route the work to repair/inspection, cancel, or add exact recovery direction.", "Yes — inspect and repair", "No — cancel run", "Other — direct recovery", "Tell the implementation session what evidence to inspect before any rerun"],
-    provider_invocation_failed: ["Provider invocation failed", "No successful model response was accepted (quota, network, or CLI failure). Use the provider, model, effort, and session controls below to choose capacity with headroom, then retry — the override applies to the retried turn.", "Retry with displayed settings", "Cancel run", "Retry with direction", "Optional direction for the retried turn"],
+    provider_invocation_failed: ["Provider invocation failed", "No successful model response was accepted (quota, network, or CLI failure). If the cause was outside the relay's control, resume the interrupted session once capacity is back. Or use the provider, model, effort, and session controls below — provider switching is unlocked at this gate — then retry; the override applies to the retried turn.", "Retry with displayed settings", "Cancel run", "Retry with direction", "Optional direction for the retried turn"],
     planning_round_cap_reached: ["Planning round cap reached", "The planning loop used its configured rounds without agreement. Extend it, stop, or redirect the next revision.", "Yes — extend one round", "No — cancel run", "Other — extend with direction", "Tell the planning sessions what must change"],
     implementation_round_cap_reached: ["Implementation round cap reached", "The implementation loop used its configured repair rounds. Extend it, stop, or direct one more repair.", "Yes — extend one round", "No — cancel run", "Other — extend with direction", "Tell the implementation sessions what must change"],
     validation_failed_at_repair_cap: ["Validation still fails", "Required validation failed after the configured repair rounds, and the failure does not match the clean baseline. Extend repair, stop, or give a specific recovery direction.", "Yes — extend repair", "No — cancel run", "Other — direct repair", "Describe the evidence or repair you require"],
@@ -1419,7 +1489,7 @@ function renderSettings() {
       .map((title) => `<strong>${escapeHtml(title)}</strong>`)
       .join("");
     const row = document.createElement("tr");
-    row.innerHTML = `<td data-label="Used for"><div class="defaults-used-for">${usedForList}</div><span class="defaults-profile-id">${escapeHtml(profile.id || profileId)}</span></td><td data-label="Provider">${escapeHtml(profile.provider)}</td><td data-label="Model"><select data-field="model" aria-label="${escapeHtml(profile.label)} model"></select><div data-catalog-custom hidden><input data-field="custom-model" autocomplete="off" placeholder="exact model ID"></div></td><td data-label="Effort"><select data-field="effort" aria-label="${escapeHtml(profile.label)} reasoning effort"></select><div data-catalog-custom-effort hidden><input data-field="custom-effort" autocomplete="off" placeholder="exact effort"></div><p class="catalog-detail" data-catalog-detail hidden></p></td><td data-label="Action"><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} default">Save</button></td>`;
+    row.innerHTML = `<td data-label="Used for"><div class="defaults-used-for">${usedForList}</div><span class="defaults-profile-id">${escapeHtml(profile.id || profileId)}</span></td><td data-label="Provider"><select data-field="provider" aria-label="${escapeHtml(profile.label)} provider">${["codex", "claude"].map((name) => `<option value="${name}"${name === profile.provider ? " selected" : ""}>${name}</option>`).join("")}</select></td><td data-label="Model"><select data-field="model" aria-label="${escapeHtml(profile.label)} model"></select><div data-catalog-custom hidden><input data-field="custom-model" autocomplete="off" placeholder="exact model ID"></div></td><td data-label="Effort"><select data-field="effort" aria-label="${escapeHtml(profile.label)} reasoning effort"></select><div data-catalog-custom-effort hidden><input data-field="custom-effort" autocomplete="off" placeholder="exact effort"></div><p class="catalog-detail" data-catalog-detail hidden></p></td><td data-label="Action"><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} default">Save</button></td>`;
     // installCatalogPicker expects one custom container; bridge the split cells.
     const customEffortBox = $("[data-catalog-custom-effort]", row);
     const customBox = $("[data-catalog-custom]", row);
@@ -1427,18 +1497,45 @@ function renderSettings() {
     installCatalogPicker(row, profile.provider, profile.model, profile.effort);
     new MutationObserver(syncCustomVisibility).observe(customBox, {attributes: true, attributeFilter: ["hidden"]});
     syncCustomVisibility();
+    const providerSelect = $('[data-field="provider"]', row);
+    providerSelect.addEventListener("change", () => {
+      // Rebuild model/effort choices for the newly selected provider. Keep the
+      // saved selection when returning to the profile's stored provider;
+      // otherwise start from that provider's first catalog entry.
+      const keepSaved = providerSelect.value === profile.provider;
+      const fallback = catalogModels(providerSelect.value)[0]?.selection_token || "";
+      installCatalogPicker(
+        row,
+        providerSelect.value,
+        keepSaved ? profile.model : fallback,
+        keepSaved ? profile.effort : "",
+      );
+      syncCustomVisibility();
+    });
     $("button", row).addEventListener("click", async (event) => {
       const selection = catalogSelection(row);
+      selection.provider = providerSelect.value;
       if (!selection.model || !selection.effort) { alert("Custom model and reasoning effort are required."); return; }
       event.target.disabled = true;
       try {
         await api("/api/profile", {method:"POST",body:JSON.stringify({workflow:workflow.id, profile:profile.id || profileId, ...selection})});
+        // loadBootstrap re-renders this table, discarding the clicked button —
+        // flag the row so the rebuilt one confirms the write visibly.
+        defaultsSavedFlash = profile.id || profileId;
         await loadBootstrap();
       } catch(error) {
         alert(`Not saved: ${error.message}. Reload to discard this draft.`);
         event.target.disabled = false;
       }
     });
+    if (defaultsSavedFlash === (profile.id || profileId)) {
+      defaultsSavedFlash = null;
+      const note = document.createElement("span");
+      note.className = "defaults-saved-note";
+      note.textContent = "Saved";
+      $("td[data-label=Action]", row).append(note);
+      setTimeout(() => { note.classList.add("fading"); setTimeout(() => note.remove(), 600); }, 3500);
+    }
     body.append(row);
   }
   const tableWrap = document.createElement("div");
