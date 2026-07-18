@@ -278,16 +278,19 @@ class CycleOrchestrator:
                     if not isinstance(changes, dict):
                         raise ValueError(f"profile override for {profile_id} must be an object")
                     target = value["profiles"][profile_id]
+                    provider = str(changes.get("provider") or target["provider"]).strip()
                     model = str(changes.get("model") or target["model"]).strip()
                     effort = str(changes.get("effort") or target["effort"]).strip()
                     custom = bool(changes.get("custom"))
                     if not model or not effort:
                         raise ValueError(f"profile override for {profile_id} requires model and effort")
                     if catalog.get("models"):
-                        validate_selection(catalog, provider=str(target["provider"]), model=model, effort=effort, custom=custom)
-                    target.update({"model": model, "effort": effort, "custom": custom, "label": f"{model} · {effort}"})
+                        validate_selection(catalog, provider=provider, model=model, effort=effort, custom=custom)
+                    target.update({"provider": provider, "model": model, "effort": effort, "custom": custom, "label": f"{model} · {effort}"})
             if round_overrides:
                 apply_round_overrides(value, round_overrides)
+            # from_value re-validates the whole adjusted workflow, including the
+            # rule that stages sharing a session slot keep one provider.
             workflow_definition = WorkflowDefinition.from_value(value)
         prompt_names = {
             "orchestrator-law.md",

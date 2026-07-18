@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Toledo Relay</title>
-  <link rel="stylesheet" href="/styles.css?v=quicktake2">
+  <link rel="stylesheet" href="/styles.css?v=consolidate1">
 </head>
 <body>
   <div class="app-shell">
@@ -16,7 +16,6 @@
       <div class="topbar-actions">
         <div class="connection"><i id="connection-dot"></i><span id="connection-label">Connecting</span></div>
         <button class="ghost-button mobile-only" id="mobile-runs-button" aria-controls="run-rail" aria-expanded="false">Runs</button>
-        <button class="ghost-button" id="settings-button"><span class="desktop-label">Settings</span><span class="mobile-label">Settings</span></button>
         <button class="primary-button" id="new-run-button" aria-label="New cycle"><span class="desktop-label">New cycle</span><span class="mobile-label">New</span></button>
       </div>
     </header>
@@ -65,14 +64,20 @@
   <dialog id="new-run-dialog" class="modal">
     <form method="dialog" id="new-run-form">
       <div class="modal-head"><div><p class="eyebrow">START A/B/C CYCLE</p><h2>What should the team build?</h2></div><button value="cancel" aria-label="Close">×</button></div>
-      <label>Project<select id="new-project"></select></label>
+      <div class="project-row">
+        <label>Repository<select id="new-project"></select></label>
+        <button type="button" class="quiet-button" id="add-project-button">Add repository</button>
+      </div>
+      <p id="project-facts" class="settings-hint" hidden></p>
+      <div id="project-host"></div>
       <label>Workflow<select id="new-workflow"></select></label>
       <label>Run mode<select id="new-run-mode"><option value="auto">Auto — continue until a decision is needed</option><option value="step">Pause after each turn</option></select></label>
       <section class="route-preflight" aria-labelledby="route-preflight-title">
-        <div class="route-preflight-head"><div><p class="eyebrow">ROUTE</p><h3 id="route-preflight-title">Who acts, reviews, and loops</h3></div><span id="route-preflight-summary"></span></div>
+        <div class="route-preflight-head"><div><p class="eyebrow">ROUTE</p><h3 id="route-preflight-title">Who acts, reviews, and loops</h3></div><div class="route-preflight-tools"><span id="route-preflight-summary"></span><button type="button" class="quiet-button" id="catalog-toggle">Model catalog</button></div></div>
+        <div id="catalog-host" hidden><div id="catalog-status"></div></div>
         <div id="route-warnings" class="route-warnings" hidden></div>
         <ol id="new-run-preflight" class="route-steps"></ol>
-        <p class="route-footnote">Adjustments here bind to this run only. Saved defaults live in Settings → Route defaults.</p>
+        <p class="route-footnote">Adjustments here bind to this run only. Save as default inside a route editor to change the workflow itself, or save all adjustments as a new workflow below.</p>
         <div class="route-saveas">
           <button type="button" class="quiet-button" id="workflow-saveas-toggle">Save adjustments as new workflow…</button>
           <div id="workflow-saveas-form" hidden>
@@ -84,31 +89,6 @@
       <label>Request<textarea id="new-request" rows="11" placeholder="Describe the outcome, why it matters, constraints, and evidence you want. The planning session will develop the implementation handoff."></textarea></label>
       <p id="new-run-error" class="route-warnings" hidden></p>
       <div class="modal-actions"><button value="cancel" class="ghost-button">Cancel</button><button type="button" id="create-run" class="primary-button">Start planning</button></div>
-    </form>
-  </dialog>
-
-  <dialog id="settings-dialog" class="modal wide-modal">
-    <form method="dialog">
-      <div class="modal-head"><div><p class="eyebrow">CONTROL SURFACE</p><h2>Settings</h2></div><button value="cancel" aria-label="Close">×</button></div>
-      <div class="settings-tabs" role="tablist" aria-label="Settings sections">
-        <button type="button" class="active" data-settings-tab="models" role="tab" aria-selected="true">Models</button>
-        <button type="button" data-settings-tab="defaults" role="tab" aria-selected="false">Route defaults</button>
-        <button type="button" data-settings-tab="projects" role="tab" aria-selected="false">Projects</button>
-      </div>
-      <section data-settings-panel="models">
-        <p class="settings-hint">What the selector can offer on this machine. Codex is discovered from the installed CLI; Claude comes from a dated official manifest plus an installed-CLI capability check. Live invocation evidence is labeled separately.</p>
-        <div id="catalog-status"></div>
-      </section>
-      <section data-settings-panel="defaults" hidden>
-        <label class="settings-workflow-picker">Workflow<select id="settings-workflow"></select></label>
-        <p class="settings-hint">Saved defaults per route profile. New runs snapshot these at launch; the New-cycle route can override any of them for one run.</p>
-        <div id="profile-settings"></div>
-      </section>
-      <section data-settings-panel="projects" hidden>
-        <p class="settings-hint">Each run binds to one repository and executes implementation in an isolated worktree.</p>
-        <div id="project-settings"></div>
-        <button type="button" class="quiet-button" id="add-project-button">Add repository</button>
-      </section>
     </form>
   </dialog>
 
@@ -127,6 +107,6 @@
     </article>
   </template>
 
-  <script src="/app.js?v=quicktake2" defer></script>
+  <script src="/app.js?v=consolidate1" defer></script>
 </body>
 </html>

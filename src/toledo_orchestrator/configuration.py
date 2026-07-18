@@ -107,14 +107,15 @@ def save_workflow_variant(
             if not isinstance(changes, dict):
                 raise ValueError(f"profile override for {profile_id} must be an object")
             target = value["profiles"][profile_id]
+            provider = str(changes.get("provider") or target["provider"]).strip()
             model = str(changes.get("model") or target["model"]).strip()
             effort = str(changes.get("effort") or target["effort"]).strip()
             custom = bool(changes.get("custom"))
             if not model or not effort:
                 raise ValueError(f"profile override for {profile_id} requires model and effort")
             if validate_profile is not None:
-                validate_profile(provider=str(target["provider"]), model=model, effort=effort, custom=custom)
-            target.update({"model": model, "effort": effort, "custom": custom, "label": f"{model} · {effort}"})
+                validate_profile(provider=provider, model=model, effort=effort, custom=custom)
+            target.update({"provider": provider, "model": model, "effort": effort, "custom": custom, "label": f"{model} · {effort}"})
     if round_overrides:
         apply_round_overrides(value, round_overrides)
     stage_prompt_files = {

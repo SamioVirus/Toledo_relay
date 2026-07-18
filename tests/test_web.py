@@ -64,6 +64,22 @@ def test_profile_provider_switch_is_persisted_and_slot_consistent(tmp_path: Path
     assert reloaded["codex-implementation"].provider == "claude"
 
 
+def test_workflow_variant_accepts_provider_overrides_with_slot_rule(tmp_path: Path):
+    from toledo_orchestrator.configuration import save_workflow_variant
+
+    saved = save_workflow_variant(
+        tmp_path, "continuous-development", "claude-builds", "Claude builds",
+        profile_overrides={"codex-implementation": {"provider": "claude", "model": "claude-fable-5", "effort": "max"}},
+    )
+    profile = saved.profiles["codex-implementation"]
+    assert profile.provider == "claude" and profile.model == "claude-fable-5" and profile.effort == "max"
+    with pytest.raises(ValueError, match="session slot"):
+        save_workflow_variant(
+            tmp_path, "continuous-development", "mixed-reviewers", "Mixed reviewers",
+            profile_overrides={"claude-implementation-review": {"provider": "codex", "model": "gpt-5.6-terra", "effort": "high"}},
+        )
+
+
 def test_profile_api_rejects_unknown_catalog_selection_but_records_custom(tmp_path: Path):
     engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
     write_json(engine.runtime_dir / "catalog" / "capabilities.v1.json", {

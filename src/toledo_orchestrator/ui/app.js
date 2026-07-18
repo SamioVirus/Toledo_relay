@@ -21,7 +21,6 @@ let pollBusy = false;
 let pollCount = 0;
 let lastHeadSignature = null;
 let railReturnFocus = null;
-let settingsWorkflowId = null;
 let defaultsSavedFlash = null;
 const promptPreviewCache = new Map();
 const gateDrafts = new Map();
@@ -123,7 +122,7 @@ async function loadBootstrap() {
   $("#connection-dot").classList.add("online");
   $("#connection-label").textContent = "Local engine ready";
   populateNewRun();
-  renderSettings();
+  renderCatalogStatus();
   renderRunList(bootstrap.runs);
   if (!currentRunId && bootstrap.runs.length) selectRun(bootstrap.runs[0].run_id);
 }
@@ -984,6 +983,7 @@ function populateNewRun() {
     ? selectedWorkflow
     : (bootstrap.workflows?.["continuous-development"] ? "continuous-development" : Object.keys(bootstrap.workflows || {})[0]);
   if (initialWorkflow) $("#new-workflow").value = initialWorkflow;
+  renderProjectFacts();
   renderNewRunPreflight();
 }
 
@@ -1198,7 +1198,11 @@ function routeProfileRow(workflow, stage, groupStages) {
   const policies = [...new Set(visibleProfileStages.map((item) => preflightSessionPolicy(item.session_policy)))];
   const inCatalog = catalogModels(profile.provider).some((entry) => entry.selection_token === profile.model);
   const sharedWith = profileStages.filter((other) => other.id !== stage.id).map((other) => other.title);
-  row.innerHTML = `<div><strong>${escapeHtml(actors.join(" / "))}</strong><span>${escapeHtml(profile.provider)} · ${escapeHtml(profile.model || "provider default")} · ${escapeHtml(profile.effort || "default")} · ${escapeHtml(profile.permission || "read-only")} · ${escapeHtml(policies.join(" / "))}</span></div><div class="route-profile-actions">${profile.overridden ? '<span class="text-status success">This run only</span>' : ""}${!inCatalog && catalogModels(profile.provider).length ? '<span class="text-status warning">Not in catalog</span>' : ""}<button type="button" class="quiet-button" data-profile-adjust>Change for this run</button></div><div class="route-step-editor" data-step-editor hidden></div>`;
+  const savedFlash = defaultsSavedFlash === stage.profile;
+  if (savedFlash) defaultsSavedFlash = null;
+  row.innerHTML = `<div><strong>${escapeHtml(actors.join(" / "))}</strong><span>${escapeHtml(profile.provider)} · ${escapeHtml(profile.model || "provider default")} · ${escapeHtml(profile.effort || "default")} · ${escapeHtml(profile.permission || "read-only")} · ${escapeHtml(policies.join(" / "))}</span></div><div class="route-profile-actions">${savedFlash ? '<span class="defaults-saved-note">Saved as default</span>' : ""}${profile.overridden ? '<span class="text-status success">This run only</span>' : ""}${!inCatalog && catalogModels(profile.provider).length ? '<span class="text-status warning">Not in catalog</span>' : ""}<button type="button" class="quiet-button" data-profile-adjust>Adjust</button></div><div class="route-step-editor" data-step-editor hidden></div>`;
+  const flashNote = $(".defaults-saved-note", row);
+  if (flashNote) setTimeout(() => { flashNote.classList.add("fading"); setTimeout(() => flashNote.remove(), 600); }, 3500);
   $("[data-profile-adjust]", row).addEventListener("click", () => toggleStageEditor(row, workflow, stage, sharedWith));
   return row;
 }
@@ -1298,15 +1302,49 @@ async function toggleStageInstruction(row, workflowId, stage) {
   }
 }
 
+function knownProviders(currentProvider) {
+  // Derived from the discovered catalog so a newly installed provider CLI
+  // (grok, gemini, ...) appears here the moment discovery records it.
+  const discovered = (bootstrap?.catalog?.models || []).map((entry) => entry.provider);
+  return [...new Set([...discovered, "codex", "claude", currentProvider].filter(Boolean))];
+}
+
+function slotPartnerProfiles(workflow, stage) {
+  // Other profiles serving the same session slot: they resume this slot's
+  // provider session, so a provider change must move them together.
+  return [...new Set(Object.values(workflow.stages || {})
+    .filter((other) => other.session_slot === stage.session_slot && other.profile !== stage.profile)
+    .map((other) => other.profile))];
+}
+
 function toggleStageEditor(row, workflow, stage, sharedWith) {
   const editor = $("[data-step-editor]", row);
   if (!editor.hidden) { editor.hidden = true; editor.innerHTML = ""; return; }
   const profile = effectiveProfile(workflow, stage.profile);
+  const providers = knownProviders(profile.provider);
+  const partners = slotPartnerProfiles(workflow, stage);
   editor.hidden = false;
-  editor.innerHTML = `<div class="editor-grid"><label>Model<select data-field="model" aria-label="${escapeHtml(stage.title)} model"></select></label><label>Reasoning effort<select data-field="effort" aria-label="${escapeHtml(stage.title)} reasoning effort"></select></label></div><div data-catalog-custom hidden><label>Exact model ID<input data-field="custom-model" autocomplete="off"></label><label>Exact reasoning effort<input data-field="custom-effort" autocomplete="off"></label></div><p class="catalog-detail" data-catalog-detail hidden></p><p class="editor-note">Applies to route profile <strong>${escapeHtml(stage.profile)}</strong> for this run only${sharedWith.length ? ` — also used by: ${escapeHtml(sharedWith.join(", "))}` : ""}. Saved defaults are in Settings.</p><div class="editor-actions">${launchOverrides.has(stage.profile) ? '<button type="button" class="ghost-button" data-editor-reset>Reset to default</button>' : ""}<button type="button" class="primary-button" data-editor-apply>Apply to this run</button></div>`;
+  editor.innerHTML = `<div class="editor-grid"><label>Provider<select data-field="provider" aria-label="${escapeHtml(stage.title)} provider">${providers.map((name) => `<option value="${escapeHtml(name)}"${name === profile.provider ? " selected" : ""}>${escapeHtml(name)}</option>`).join("")}</select></label><label>Model<select data-field="model" aria-label="${escapeHtml(stage.title)} model"></select></label><label>Reasoning effort<select data-field="effort" aria-label="${escapeHtml(stage.title)} reasoning effort"></select></label></div><div data-catalog-custom hidden><label>Exact model ID<input data-field="custom-model" autocomplete="off"></label><label>Exact reasoning effort<input data-field="custom-effort" autocomplete="off"></label></div><p class="catalog-detail" data-catalog-detail hidden></p><p class="editor-note" data-provider-note hidden></p><p class="editor-note">Route profile <strong>${escapeHtml(stage.profile)}</strong>${sharedWith.length ? ` — also used by: ${escapeHtml(sharedWith.join(", "))}` : ""}. Apply binds to this run only; Save as default changes the workflow for every future run.</p><div class="editor-actions">${launchOverrides.has(stage.profile) ? '<button type="button" class="ghost-button" data-editor-reset>Reset to default</button>' : ""}<button type="button" class="ghost-button" data-editor-save-default>Save as default</button><button type="button" class="primary-button" data-editor-apply>Apply to this run</button></div>`;
+  const providerSelect = $('[data-field="provider"]', editor);
+  const providerNote = $("[data-provider-note]", editor);
+  const syncProviderNote = () => {
+    const changed = providerSelect.value !== workflow.profiles?.[stage.profile]?.provider;
+    providerNote.hidden = !(changed && partners.length);
+    providerNote.textContent = changed && partners.length
+      ? `This route shares its session with ${partners.join(", ")} — a provider change only launches if that route moves to ${providerSelect.value} too.`
+      : "";
+  };
   installCatalogPicker(editor, profile.provider, profile.model, profile.effort);
+  providerSelect.addEventListener("change", () => {
+    const keepSaved = providerSelect.value === profile.provider;
+    const fallback = catalogModels(providerSelect.value)[0]?.selection_token || "";
+    installCatalogPicker(editor, providerSelect.value, keepSaved ? profile.model : fallback, keepSaved ? profile.effort : "");
+    syncProviderNote();
+  });
+  syncProviderNote();
   $("[data-editor-apply]", editor).addEventListener("click", () => {
     const selection = catalogSelection(editor);
+    selection.provider = providerSelect.value;
     if (!selection.model || !selection.effort) { alert("Model and reasoning effort are required."); return; }
     launchOverrides.set(stage.profile, selection);
     renderNewRunPreflight();
@@ -1314,6 +1352,23 @@ function toggleStageEditor(row, workflow, stage, sharedWith) {
   $("[data-editor-reset]", editor)?.addEventListener("click", () => {
     launchOverrides.delete(stage.profile);
     renderNewRunPreflight();
+  });
+  $("[data-editor-save-default]", editor).addEventListener("click", async (event) => {
+    const selection = catalogSelection(editor);
+    selection.provider = providerSelect.value;
+    if (!selection.model || !selection.effort) { alert("Model and reasoning effort are required."); return; }
+    event.target.disabled = true;
+    try {
+      await api("/api/profile", {method:"POST",body:JSON.stringify({workflow:$("#new-workflow").value, profile:stage.profile, ...selection})});
+      // The default now matches this draft, so a run-only override would be
+      // pure noise; the flash on the rebuilt row confirms the write.
+      launchOverrides.delete(stage.profile);
+      defaultsSavedFlash = stage.profile;
+      await loadBootstrap();
+    } catch (error) {
+      alert(`Not saved: ${error.message}`);
+      event.target.disabled = false;
+    }
   });
 }
 
@@ -1331,10 +1386,25 @@ function renderRouteWarnings(workflow, stages) {
     }
   }
   if (missing.length) lines.push(`Not in the local catalog — will run as unverified custom selections: ${missing.join(", ")}.`);
+  // Stages sharing a session slot resume one provider session; a draft that
+  // mixes providers inside a slot will be rejected at launch, so say so now.
+  const slotProviders = new Map();
+  for (const stage of stages) {
+    const provider = effectiveProfile(workflow, stage.profile).provider;
+    if (!slotProviders.has(stage.session_slot)) slotProviders.set(stage.session_slot, new Map());
+    slotProviders.get(stage.session_slot).set(stage.profile, provider);
+  }
+  for (const [slot, byProfile] of slotProviders) {
+    const providersInSlot = [...new Set(byProfile.values())];
+    if (providersInSlot.length > 1) {
+      const detail = [...byProfile].map(([profileId, provider]) => `${profileId} → ${provider}`).join(", ");
+      lines.push(`Session ${humanizeReason(slot)} would mix providers (${detail}) — these routes share one session, so give them the same provider before launching.`);
+    }
+  }
   for (const provider of ["codex", "claude"]) {
     const error = catalog.sources?.[provider]?.error || catalog.last_refresh?.sources?.[provider]?.error;
     if (!catalogModels(provider).length) {
-      lines.push(`${provider === "codex" ? "Codex" : "Claude"} discovery unavailable${error ? `: ${error}` : ""} — refresh from Settings → Models.`);
+      lines.push(`${provider === "codex" ? "Codex" : "Claude"} discovery unavailable${error ? `: ${error}` : ""} — open Model catalog above and refresh.`);
     }
   }
   root.hidden = !lines.length;
@@ -1415,8 +1485,8 @@ function installCatalogPicker(root, provider, model, effort, onSelectionChange =
     const custom = !selected;
     customBox.hidden = !custom;
     (effortSelect.closest("label") || effortSelect).hidden = custom;
-    // The catalog provenance lives once in Settings → Models; per-card text
-    // appears only for the deliberate custom escape hatch.
+    // The catalog provenance lives once in the Model catalog panel; per-card
+    // text appears only for the deliberate custom escape hatch.
     if (custom) {
       detail.hidden = false;
       detail.textContent = "Not in the local catalog — runs as an unverified custom selection, recorded as evidence.";
@@ -1459,91 +1529,12 @@ function catalogSelection(root) {
   };
 }
 
-function renderSettings() {
-  renderCatalogStatus();
-  const workflows = bootstrap.workflows;
-  settingsWorkflowId = workflows[settingsWorkflowId]
-    ? settingsWorkflowId
-    : (workflows["continuous-development"] ? "continuous-development" : Object.keys(workflows)[0]);
-  const selector = $("#settings-workflow");
-  selector.innerHTML = Object.entries(workflows).map(([id, workflow]) => `<option value="${escapeHtml(id)}">${escapeHtml(workflow.label)}</option>`).join("");
-  selector.value = settingsWorkflowId;
-  const workflow = workflows[settingsWorkflowId];
-  const root = $("#profile-settings");
-  root.innerHTML = "";
-  // A compact table, one row per route profile; the only free text lives in
-  // the explicit Custom… branch inside the cells.
-  const table = document.createElement("table");
-  table.className = "defaults-table";
-  table.innerHTML = `<thead><tr><th>Used for</th><th>Provider</th><th>Model</th><th>Effort</th><th></th></tr></thead><tbody></tbody>`;
-  const body = $("tbody", table);
-  // List stages in execution order so planning reads before closure work.
-  const orderedStages = workflow ? reachableWorkflowStages(workflow) : [];
-  const orderedIds = new Set(orderedStages.map((stage) => stage.id));
-  const remainingStages = Object.values(workflow?.stages || {}).filter((stage) => !orderedIds.has(stage.id));
-  for (const [profileId, profile] of Object.entries(workflow?.profiles || {})) {
-    const usedFor = [...orderedStages, ...remainingStages]
-      .filter((stage) => stage.profile === (profile.id || profileId))
-      .map((stage) => stage.title);
-    const usedForList = (usedFor.length ? usedFor : [profile.label])
-      .map((title) => `<strong>${escapeHtml(title)}</strong>`)
-      .join("");
-    const row = document.createElement("tr");
-    row.innerHTML = `<td data-label="Used for"><div class="defaults-used-for">${usedForList}</div><span class="defaults-profile-id">${escapeHtml(profile.id || profileId)}</span></td><td data-label="Provider"><select data-field="provider" aria-label="${escapeHtml(profile.label)} provider">${["codex", "claude"].map((name) => `<option value="${name}"${name === profile.provider ? " selected" : ""}>${name}</option>`).join("")}</select></td><td data-label="Model"><select data-field="model" aria-label="${escapeHtml(profile.label)} model"></select><div data-catalog-custom hidden><input data-field="custom-model" autocomplete="off" placeholder="exact model ID"></div></td><td data-label="Effort"><select data-field="effort" aria-label="${escapeHtml(profile.label)} reasoning effort"></select><div data-catalog-custom-effort hidden><input data-field="custom-effort" autocomplete="off" placeholder="exact effort"></div><p class="catalog-detail" data-catalog-detail hidden></p></td><td data-label="Action"><button type="button" class="quiet-button" aria-label="Save ${escapeHtml(profile.label)} default">Save</button></td>`;
-    // installCatalogPicker expects one custom container; bridge the split cells.
-    const customEffortBox = $("[data-catalog-custom-effort]", row);
-    const customBox = $("[data-catalog-custom]", row);
-    const syncCustomVisibility = () => { customEffortBox.hidden = customBox.hidden; };
-    installCatalogPicker(row, profile.provider, profile.model, profile.effort);
-    new MutationObserver(syncCustomVisibility).observe(customBox, {attributes: true, attributeFilter: ["hidden"]});
-    syncCustomVisibility();
-    const providerSelect = $('[data-field="provider"]', row);
-    providerSelect.addEventListener("change", () => {
-      // Rebuild model/effort choices for the newly selected provider. Keep the
-      // saved selection when returning to the profile's stored provider;
-      // otherwise start from that provider's first catalog entry.
-      const keepSaved = providerSelect.value === profile.provider;
-      const fallback = catalogModels(providerSelect.value)[0]?.selection_token || "";
-      installCatalogPicker(
-        row,
-        providerSelect.value,
-        keepSaved ? profile.model : fallback,
-        keepSaved ? profile.effort : "",
-      );
-      syncCustomVisibility();
-    });
-    $("button", row).addEventListener("click", async (event) => {
-      const selection = catalogSelection(row);
-      selection.provider = providerSelect.value;
-      if (!selection.model || !selection.effort) { alert("Custom model and reasoning effort are required."); return; }
-      event.target.disabled = true;
-      try {
-        await api("/api/profile", {method:"POST",body:JSON.stringify({workflow:workflow.id, profile:profile.id || profileId, ...selection})});
-        // loadBootstrap re-renders this table, discarding the clicked button —
-        // flag the row so the rebuilt one confirms the write visibly.
-        defaultsSavedFlash = profile.id || profileId;
-        await loadBootstrap();
-      } catch(error) {
-        alert(`Not saved: ${error.message}. Reload to discard this draft.`);
-        event.target.disabled = false;
-      }
-    });
-    if (defaultsSavedFlash === (profile.id || profileId)) {
-      defaultsSavedFlash = null;
-      const note = document.createElement("span");
-      note.className = "defaults-saved-note";
-      note.textContent = "Saved";
-      $("td[data-label=Action]", row).append(note);
-      setTimeout(() => { note.classList.add("fading"); setTimeout(() => note.remove(), 600); }, 3500);
-    }
-    body.append(row);
-  }
-  const tableWrap = document.createElement("div");
-  tableWrap.className = "defaults-table-wrap";
-  tableWrap.append(table);
-  root.append(tableWrap);
-  const projects = $("#project-settings");
-  projects.innerHTML = Object.entries(bootstrap.projects).map(([id, value]) => `<article class="project-card"><strong>${escapeHtml(id)}</strong><code>${escapeHtml(value.root)}</code><p>${value.implementation_enabled ? "Isolated implementation enabled" : "Read-only"} · ${escapeHtml(value.branch || "detached")} · ${value.dirty ? "source has local changes" : "source clean"} · ${escapeHtml((value.source_revision || "").slice(0,8))}</p></article>`).join("");
+function renderProjectFacts() {
+  const facts = $("#project-facts");
+  const value = bootstrap?.projects?.[$("#new-project").value];
+  facts.hidden = !value;
+  if (!value) { facts.textContent = ""; return; }
+  facts.textContent = `${value.implementation_enabled ? "Isolated implementation enabled" : "Read-only"} · ${value.branch || "detached"} · ${value.dirty ? "source has local changes" : "source clean"} · ${(value.source_revision || "").slice(0, 8)}`;
 }
 
 function showProjectForm() {
@@ -1559,10 +1550,15 @@ function showProjectForm() {
     const writePaths = $('[data-field="write-paths"]',form).value.split(",").map((value)=>value.trim()).filter(Boolean);
     const validation = $('[data-field="validation"]',form).value.trim();
     const payload = {id,root,read_only:true,instruction_files:instructions,validations:[{id:"local-checks",environment:"local",command:validation,required:true}],implementation:{enabled:true,write_allowlist:writePaths,commit_on_accept:true,allow_no_validations:false,validation_requires_approval:true}};
-    try { await api("/api/project",{method:"POST",body:JSON.stringify(payload)}); await loadBootstrap(); }
+    try {
+      await api("/api/project",{method:"POST",body:JSON.stringify(payload)});
+      await loadBootstrap();
+      form.remove();
+      if (bootstrap.projects?.[id]) { $("#new-project").value = id; renderProjectFacts(); }
+    }
     catch(error){ alert(error.message); }
   });
-  $("#project-settings").append(form);
+  $("#project-host").append(form);
 }
 
 async function createRun() {
@@ -1683,7 +1679,6 @@ function bindStaticEvents() {
   $("#new-run-button").addEventListener("click", openNew);
   $("#empty-new-run").addEventListener("click", openNew);
   $("#create-run").addEventListener("click", createRun);
-  $("#settings-button").addEventListener("click", () => $("#settings-dialog").showModal());
   $("#mobile-runs-button").addEventListener("click", openRunRail);
   $("#close-run-rail").addEventListener("click", closeRunRail);
   window.addEventListener("resize", syncRunRail);
@@ -1696,15 +1691,11 @@ function bindStaticEvents() {
     if (!form.hidden) $("#workflow-saveas-name").focus();
   });
   $("#workflow-saveas-confirm").addEventListener("click", saveWorkflowAs);
-  $$("[data-settings-tab]").forEach((button) => button.addEventListener("click", () => {
-    $$("[data-settings-tab]").forEach((other) => {
-      const selected = other === button;
-      other.classList.toggle("active", selected);
-      other.setAttribute("aria-selected", String(selected));
-    });
-    $$("[data-settings-panel]").forEach((panel) => { panel.hidden = panel.dataset.settingsPanel !== button.dataset.settingsTab; });
-  }));
-  $("#settings-workflow").addEventListener("change", (event) => { settingsWorkflowId = event.target.value; renderSettings(); });
+  $("#new-project").addEventListener("change", renderProjectFacts);
+  $("#catalog-toggle").addEventListener("click", () => {
+    const host = $("#catalog-host");
+    host.hidden = !host.hidden;
+  });
   $("#refresh-button").addEventListener("click", async () => { await loadBootstrap(); if(currentRunId) await refreshCurrent(); });
   $("#close-inspector").addEventListener("click", closeInspector);
   $$(".inspector-tabs button").forEach((button) => button.addEventListener("click", () => selectInspectorTab(button.dataset.tab)));
@@ -1719,12 +1710,9 @@ function bindStaticEvents() {
   });
   applyTimelineDensity($("#zoom-slider").value);
   // Deep links so dialogs are directly addressable (and screenshotable).
-  if (location.hash === "#new") openNew();
-  if (location.hash.startsWith("#settings")) {
-    $("#settings-dialog").showModal();
-    const tab = location.hash.split("-")[1];
-    if (tab) $(`[data-settings-tab="${tab}"]`)?.click();
-  }
+  // #settings-* used to open the removed Settings dialog; all of its controls
+  // now live in the New-cycle dialog, so old links land there.
+  if (location.hash === "#new" || location.hash.startsWith("#settings")) openNew();
 }
 
 bindStaticEvents();
