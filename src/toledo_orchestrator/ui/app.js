@@ -136,10 +136,15 @@ function renderRunList(runs) {
   for (const run of runs) {
     const button = document.createElement("button");
     button.className = `run-item ${run.run_id === currentRunId ? "active" : ""}`;
-    button.innerHTML = `<div class="run-item-top"><strong>${escapeHtml(compactId(run.run_id))}</strong><span class="status-pill ${escapeHtml(run.worker?.active ? "running" : run.status)}">${escapeHtml(run.worker?.active ? "active" : run.status)}</span></div><p>${escapeHtml(run.project)} · ${escapeHtml(run.workflow)} · ${run.current_turn || 0} turns</p>`;
+    const status = run.worker?.active ? "running" : run.status;
+    button.innerHTML = `<div class="run-item-top"><strong>${escapeHtml(run.project)}</strong><span class="status-pill ${escapeHtml(status)}">${escapeHtml(runStatusLabel(status))}</span></div><p>${escapeHtml(run.workflow)} · ${run.current_turn || 0} turns · ${escapeHtml(compactId(run.run_id))}</p>`;
     button.addEventListener("click", () => selectRun(run.run_id));
     root.append(button);
   }
+}
+
+function runStatusLabel(status) {
+  return ({complete: "completed", running: "active", created: "ready"})[status] || status;
 }
 
 async function refreshRuns() {
@@ -231,7 +236,7 @@ function renderRun() {
   const cycle = state.cycles?.[state.cycle - 1];
   const canRecover = state.schema_version === "toledo_orchestrator.run.v2" && ["created", "running"].includes(state.status) && !state.worker?.active;
   const terminalHeadings = {
-    complete: "Run complete",
+    complete: "Project completed",
     cancelled: "Run cancelled",
     stopped: "Stopped by operator — work may be incomplete",
     failed: "Run failed",
@@ -252,8 +257,8 @@ function renderRun() {
   const cost = (state.turns || []).reduce((sum, turn) => sum + Number(turn.usage?.total_cost_usd || 0), 0);
   const strip = $("#run-status-strip");
   strip.hidden = false;
-  strip.innerHTML = `<span>${escapeHtml(state.status)}</span><span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
-  $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(state.status.toUpperCase())}</p><h2>${escapeHtml(heading || "Run complete")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span><button class="quiet-button run-action" id="export-run" title="Download the full conversation and transport prompts as plain text">Export plain text</button><button class="quiet-button run-action" id="copy-run" title="Copy the same full plain-text conversation">Copy all</button>${canRecover ? '<button class="accept-button run-action" id="recover-run">Recover run</button>' : ''}</div>`;
+  strip.innerHTML = `<span>${escapeHtml(runStatusLabel(state.status))}</span><span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
+  $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(runStatusLabel(state.status).toUpperCase())}</p><h2>${escapeHtml(heading || "Project completed")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span><button class="quiet-button run-action" id="export-run" title="Download the full conversation and transport prompts as plain text">Export plain text</button><button class="quiet-button run-action" id="copy-run" title="Copy the same full plain-text conversation">Copy all</button>${canRecover ? '<button class="accept-button run-action" id="recover-run">Recover run</button>' : ''}</div>`;
   $("#export-run")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     button.disabled = true;
@@ -535,8 +540,7 @@ function humanDecisionNode(decision, index) {
   const button = document.createElement("button");
   button.className = "decision-node";
   button.dataset.decisionPath = decision.file;
-  const choices = {yes: "Continue", no: "Stop", other: "Direction", direction: "Direction"};
-  button.innerHTML = `<span class="decision-choice">You · ${escapeHtml(choices[decision.choice] || "Decision")}</span><span class="decision-reason">${escapeHtml(decisionReasonLabel(decision.reason))}</span><span class="decision-preview">Open stored direction</span>`;
+  button.innerHTML = `<span class="decision-choice">You · ${escapeHtml(decisionChoiceLabel(decision))}</span><span class="decision-reason">${escapeHtml(decisionReasonLabel(decision.reason, decision.choice))}</span><span class="decision-preview">Open stored direction</span>`;
   button.addEventListener("click", () => openDecision(decision, index));
   row.append(button);
   return row;
@@ -607,8 +611,8 @@ async function openDecision(decision, index) {
   inspectorPayload = {direction:content, metadata:JSON.stringify(decision, null, 2)};
   setDirectionTabLabel("Owner direction");
   $("#inspector-kicker").textContent = `HUMAN DIRECTION · ${String(index + 1).padStart(2, "0")}`;
-  $("#inspector-title").textContent = decisionReasonLabel(decision.reason);
-  $("#inspector-meta").innerHTML = `<span class="chip">${escapeHtml(decision.choice)}</span><span class="chip">cycle ${escapeHtml(decision.cycle)}</span><span class="chip">after turn ${escapeHtml(decision.after_turn)}</span>`;
+  $("#inspector-title").textContent = decisionReasonLabel(decision.reason, decision.choice);
+  $("#inspector-meta").innerHTML = `<span class="chip">${escapeHtml(decisionChoiceLabel(decision))}</span><span class="chip">cycle ${escapeHtml(decision.cycle)}</span><span class="chip">after turn ${escapeHtml(decision.after_turn)}</span>`;
   openInspector("direction");
 }
 
@@ -714,6 +718,15 @@ function bindGate(fragment) {
       await refreshCurrent();
       await refreshRuns();
     } catch (error) { alert(error.message); event.target.disabled = false; }
+  });
+  $("[data-gate-complete]", gate)?.addEventListener("click", async (event) => {
+    event.target.disabled = true;
+    try {
+      await api(`/api/runs/${encodeURIComponent(currentRunId)}/complete`, {method:"POST", body:JSON.stringify({})});
+      gateDrafts.delete(gate.dataset.draftKey);
+      await refreshCurrent();
+      await refreshRuns();
+    } catch (error) { alert(`The project was not completed. ${error.message}`); event.target.disabled = false; }
   });
 }
 
@@ -943,9 +956,9 @@ function gatePresentation(state) {
     },
     next_task_approval: {
       title: "Is this the right next task?",
-      summary: "The proposal is preserved exactly as written. Start planning it, finish the loop here, or send the strategic session a revision.",
+      summary: "Start planning this proposal, complete the project, or ask for a revision.",
       yes: "Start planning",
-      no: "Finish here",
+      no: "Complete project",
       alt: "Revise the proposal",
       directionLabel: "What should the strategic session change?",
       send: "Send revision",
@@ -1039,10 +1052,27 @@ function gatePresentation(state) {
   const atNextTask = [workflow.next_task_stage, workflow.next_task_revision_stage]
     .filter(Boolean)
     .includes(state.current_stage);
+  const currentCycle = state.cycles?.[state.cycle - 1] || {};
+  const canCompleteProject = Boolean(currentCycle.completion_receipt) && atNextTask && [
+    "operator_step",
+    "provider_invocation_failed",
+    "next_task_approval",
+  ].includes(reason);
   const hasOlderIssue = Boolean(state.pending_baseline_acceptance?.classification)
     || Object.values(state.artifacts || {}).some((item) => (
       item?.type === "baseline-debt" && item?.cycle === state.cycle
     ));
+  if (canCompleteProject && reason === "operator_step") {
+    model.title = "Your change is committed";
+    model.summary = "Choose what to build next, or complete the project here.";
+    model.yes = "Choose next build";
+    model.complete = {label: "Complete project"};
+    model.compactOptions = true;
+    model.stop = false;
+    model.note = null;
+  } else if (canCompleteProject && reason === "provider_invocation_failed") {
+    model.complete = {label: "Complete project", inMore: true};
+  }
   if (hasOlderIssue && reason === "provider_invocation_failed" && atNextTask) {
     model.title = "Your change is committed";
     model.summary = "The next step stopped before choosing what to fix next.";
@@ -1104,6 +1134,7 @@ function configureGate(fragment, state) {
   const no = $('[data-choice="no"]', gate);
   const alt = $("[data-gate-alt]", gate);
   const followUp = $("[data-gate-follow-up]", gate);
+  const complete = $("[data-gate-complete]", gate);
   const send = $('[data-choice="other"]', gate);
   yes.textContent = model.yes || "";
   yes.hidden = !model.yes;
@@ -1119,16 +1150,22 @@ function configureGate(fragment, state) {
     followUp.className = model.followUpPrimary ? "primary-button" : "quiet-button";
     followUp.hidden = false;
   }
+  if (model.complete) {
+    complete.textContent = model.complete.label;
+    complete.hidden = false;
+  }
   const actions = $(".gate-actions", gate);
   const more = $("[data-gate-more]", gate);
   const moreActions = $("[data-gate-more-actions]", gate);
   if (model.followUpPrimary) actions.prepend(followUp);
   if (model.compactOptions) {
-    moreActions.append(no, alt);
+    if (model.complete?.inMore) moreActions.append(complete, alt, no);
+    else moreActions.append(no, alt);
     more.hidden = false;
   } else {
     actions.append(no, alt);
   }
+  if (model.complete && !model.complete.inMore) actions.append(complete);
   send.textContent = model.send || "Send direction";
   send.hidden = Boolean(model.guidanceOnly);
   $("[data-gate-stop]", gate).hidden = !model.stop;
@@ -1149,7 +1186,10 @@ function humanizeReason(reason) {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-function decisionReasonLabel(reason) {
+function decisionReasonLabel(reason, choice = null) {
+  if (choice === "complete" || (reason === "next_task_approval" && choice === "no")) {
+    return "Project completed";
+  }
   const labels = {
     validation_execution_approval: "Checks approved",
     validation_baseline_failure_decision: "Older issue acknowledged",
@@ -1157,6 +1197,13 @@ function decisionReasonLabel(reason) {
     next_task_approval: "Next task choice",
   };
   return labels[reason] || humanizeReason(reason);
+}
+
+function decisionChoiceLabel(decision) {
+  if (decision.choice === "complete" || (decision.reason === "next_task_approval" && decision.choice === "no")) {
+    return "Complete";
+  }
+  return ({yes: "Continue", no: "Stop", other: "Direction", direction: "Direction"})[decision.choice] || "Decision";
 }
 
 function populateNewRun() {

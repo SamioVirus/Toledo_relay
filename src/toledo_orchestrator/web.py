@@ -407,6 +407,10 @@ def make_handler(
                     note = str(value.get("note", "")).encode("utf-8")
                     self._send(engine.stop_run(parts[2], note))
                     return
+                if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "complete":
+                    note = str(value.get("note", "")).encode("utf-8")
+                    self._send(engine.complete_project(parts[2], note))
+                    return
                 if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
                     run_id = parts[2]
                     workers.start(

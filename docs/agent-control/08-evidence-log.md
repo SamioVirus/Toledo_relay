@@ -1,5 +1,13 @@
 # Evidence log
 
+## 2026-07-18 — Explicit project completion after accepted implementation
+
+- Post-implementation human gates now offer a positive terminal outcome instead of forcing the operator to request another task or misuse cancellation. `Complete project` is available only when the current cycle has a sealed completion receipt and the run is paused at next-task selection, next-task approval, or a failed next-task provider turn.
+- The controller records an exact `Human: project complete` decision, closes the current cycle and run as `complete`, clears pending operation state, and seals a `run.completed_by_operator` event. The existing next-task `no` path uses the same terminal-state helper, so every completion route has one lifecycle meaning.
+- The UI keeps the recommendation hierarchy intact: on the owner's current interrupted gate, `Retry with older issue next` remains primary while `Complete project` appears under `More options`; in step mode, `Choose next build` and `Complete project` are the two immediate outcomes. The successful next-task-proposal gate now says `Complete project` instead of the vague `Finish here`.
+- The run rail now leads with the project name and renders terminal state as `completed`; the terminal header says `Project completed`, and the stored decision reads `You · Complete / Project completed` rather than inheriting the prior gate's retry caption.
+- Verification: focused controller/API/static coverage `4 passed`; full suite `145 passed in 76.22s`; Python compile, JavaScript syntax, and diff checks passed. A disposable copy of real run `run_20260717T020530Z_8bde5d9c` proved the exact current gate, clicked `Complete project`, and reached the completed rail/header/timeline state with zero console warnings/errors and no horizontal overflow at desktop or 375×844. The owner's real run was not changed and no provider was invoked. Final startup proof replaced three idle servers with one main server on port 8765 at the new standalone revision; the real run remained paused at the same next-task provider gate with an idle worker.
+
 ## 2026-07-18 — Human copy and older-issue carry-forward
 
 - Owner comprehension testing rejected `validation`, `clean baseline`, and `recorded debt` even after the first geometry reduction. The final baseline gate says `Your change is ready` / `It didn’t break anything. One older issue still needs fixing.`, leads with `Commit & fix it next`, keeps `Just commit` quiet, and moves stop/repair choices under `More options`.

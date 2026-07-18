@@ -190,6 +190,8 @@ def test_local_web_api_serves_ui_requires_nonce_and_blocks_artifact_traversal(tm
             javascript = response.read().decode("utf-8")
             assert "function quickTakeMarkup(turn)" in javascript
             assert "head.summary_sequence" in javascript
+            assert 'model.complete = {label: "Complete project", inMore: true}' in javascript
+            assert 'runStatusLabel(status)' in javascript
 
         status, bootstrap = request_json(base + "/api/bootstrap")
         assert status == 200 and bootstrap["nonce"] == "test-nonce"
@@ -501,6 +503,37 @@ def test_local_web_continue_forwards_optional_owner_direction(tmp_path: Path):
         while not received and time.monotonic() < deadline:
             time.sleep(0.01)
         assert received == [("run_20260712T120000Z_1234abcd", b"How about now?\r\n")]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_local_web_complete_marks_the_project_without_scheduling_a_worker(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    received: list[tuple[str, bytes]] = []
+
+    def complete_project(run_id: str, note: bytes = b"") -> dict[str, object]:
+        received.append((run_id, note))
+        return {"run_id": run_id, "status": "complete"}
+
+    engine.complete_project = complete_project  # type: ignore[method-assign]
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status, state = request_json(
+            base + "/api/runs/run_20260718T120000Z_1234abcd/complete",
+            method="POST",
+            nonce="test-nonce",
+            value={},
+        )
+        assert status == 200
+        assert state["status"] == "complete"
+        assert received == [("run_20260718T120000Z_1234abcd", b"")]
+        assert workers.status("run_20260718T120000Z_1234abcd")["active"] is False
     finally:
         server.shutdown()
         server.server_close()

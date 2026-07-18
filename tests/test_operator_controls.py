@@ -13,7 +13,13 @@ from toledo_orchestrator.core import write_text
 from toledo_orchestrator.project import ProjectDefinition, ValidationDefinition
 from toledo_orchestrator.validation import failure_signature
 
-from test_cycle import SessionAdapter, make_cycle, response, writable_project  # noqa: F401
+from test_cycle import (  # noqa: F401
+    FailedNthInvocationAdapter,
+    SessionAdapter,
+    make_cycle,
+    response,
+    writable_project,
+)
 
 
 def _commit_all(root: Path, message: str) -> None:
@@ -185,6 +191,46 @@ def test_stop_run_records_operator_finish_not_cancellation(
     assert state["events"][-1]["kind"] == "run.stopped"
     with pytest.raises(ValueError):
         app.decide(run_id, "yes")
+
+
+def test_project_completion_closes_only_an_accepted_post_implementation_loop(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    early = make_cycle(
+        tmp_path / "early",
+        writable_project,
+        SessionAdapter("codex", [("planning-propose", response("ready", "Plan"))]),
+        SessionAdapter("claude", []),
+    )
+    early_id = early.create_run(b"Not implemented yet", "test", run_mode="step")
+    early.run_to_stop(early_id)
+    with pytest.raises(ValueError, match="only after an implementation was accepted"):
+        early.complete_project(early_id)
+
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("ready", "Plan")),
+        ("implementation", response("ready", "Built")),
+    ], writer=True)
+    claude = FailedNthInvocationAdapter("claude", [
+        ("planning-review", response("ready", "Plan accepted")),
+        ("implementation-review", response("ready", "Implementation accepted")),
+    ], fail_on=3)
+    app = make_cycle(tmp_path / "accepted", writable_project, codex, claude)
+    run_id = app.create_run(b"Finish a verified project", "test")
+    paused = app.run_to_stop(run_id)
+    assert paused["pending_human_decision"] == "provider_invocation_failed"
+    assert paused["current_stage"] == "next-task"
+    assert paused["cycles"][0]["completion_receipt"]
+
+    completed = app.complete_project(run_id)
+    assert completed["status"] == "complete"
+    assert completed["cycles"][0]["status"] == "complete"
+    assert completed["current_stage"] is None
+    assert completed["pending_human_decision"] is None
+    assert completed["decisions"][-1]["choice"] == "complete"
+    assert completed["decisions"][-1]["title"] == "Human: project complete"
+    assert completed["events"][-1]["kind"] == "run.completed_by_operator"
+    assert completed["events"][-1]["title"] == "Project completed"
 
 
 def test_create_run_profile_overrides_bind_to_snapshot_only(

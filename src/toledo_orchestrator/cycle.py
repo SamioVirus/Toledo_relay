@@ -1782,6 +1782,68 @@ class CycleOrchestrator:
         self._save(run_id, state)
         return state
 
+    def _project_completion_available(self, state: dict[str, Any]) -> bool:
+        """Return whether this pause follows a sealed, accepted implementation."""
+        workflow = self._workflow(state)
+        next_task_stages = {
+            value
+            for value in (workflow.next_task_stage, workflow.next_task_revision_stage)
+            if value
+        }
+        return bool(self._cycle(state).get("completion_receipt")) and (
+            str(state.get("current_stage") or "") in next_task_stages
+            and str(state.get("pending_human_decision") or "") in {
+                "operator_step",
+                "provider_invocation_failed",
+                "next_task_approval",
+            }
+        )
+
+    def _complete_project_state(self, state: dict[str, Any], *, reason: str) -> None:
+        cycle = self._cycle(state)
+        cycle["status"] = "complete"
+        cycle["end_turn"] = state["current_turn"]
+        state["status"] = "complete"
+        state["current_stage"] = None
+        state["pending_human_decision"] = None
+        state["pending_validation"] = None
+        state["validation_inflight"] = None
+        state["pending_completion"] = None
+        state["pending_commit"] = None
+        state["pending_round_extension"] = None
+        state["pending_repair_stage"] = None
+        state["pending_baseline_acceptance"] = None
+        state["next_turn_override"] = None
+        state["inflight"] = None
+        self._event(
+            state,
+            "run.completed_by_operator",
+            title="Project completed",
+            details={"reason": reason, "completion_receipt": cycle["completion_receipt"]},
+        )
+
+    @_locked
+    def complete_project(self, run_id: str, note: bytes = b"") -> dict[str, Any]:
+        """Close a verified project loop without asking for another task."""
+        state = self.state(run_id)
+        if state.get("status") != "paused" or state.get("inflight") or state.get("validation_inflight"):
+            raise ValueError("only a paused run with no active operation can be completed")
+        if not self._project_completion_available(state):
+            raise ValueError("the project can be completed only after an implementation was accepted")
+        decode_text_artifact(note, "project completion note")
+        reason = str(state.get("pending_human_decision") or "project_complete")
+        payload = note if note.strip() else b"Project completed here.\n"
+        self._record_decision(
+            state,
+            payload=payload,
+            choice="complete",
+            reason=reason,
+            title="Human: project complete",
+        )
+        self._complete_project_state(state, reason=reason)
+        self._save(run_id, state)
+        return state
+
     def _capture_baseline_validations(self, state: dict[str, Any]) -> dict[str, Any]:
         """Run the project validations once at the clean base revision.
 
@@ -2251,15 +2313,17 @@ class CycleOrchestrator:
             payload=payload,
             choice=choice,
             reason=reason,
+            title=(
+                "Human: project complete"
+                if reason == "next_task_approval" and choice == "no"
+                else None
+            ),
             follow_up=follow_up,
         )
         state["pending_human_decision"] = None
         if reason == "next_task_approval":
             if choice == "no":
-                self._cycle(state)["status"] = "complete"
-                self._cycle(state)["end_turn"] = state["current_turn"]
-                state["status"] = "complete"
-                state["current_stage"] = None
+                self._complete_project_state(state, reason=reason)
                 self._save(run_id, state)
                 return state
             if choice == "other":
