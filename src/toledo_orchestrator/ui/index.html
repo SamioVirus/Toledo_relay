@@ -72,6 +72,14 @@
       <div id="project-host"></div>
       <label>Workflow<select id="new-workflow"></select></label>
       <label>Run mode<select id="new-run-mode"><option value="auto">Auto — continue until a decision is needed</option><option value="step">Pause after each turn</option></select></label>
+      <section class="continuous-loop-control" aria-labelledby="continuous-loop-title">
+        <label class="toggle-control">
+          <input type="checkbox" id="new-continuous-loop">
+          <span><strong id="continuous-loop-title">Continuous loop</strong><small>Automatically approve each generated next idea and begin another full cycle.</small></span>
+        </label>
+        <label id="continuous-loop-count" hidden>Stop after<select id="new-continuous-loop-cycles"><option value="3">3 complete cycles</option><option value="4">4 complete cycles</option><option value="5">5 complete cycles</option></select></label>
+        <p id="continuous-loop-note">Off — Relay stops for your approval before starting the next idea.</p>
+      </section>
       <section class="route-preflight" aria-labelledby="route-preflight-title">
         <div class="route-preflight-head"><div><p class="eyebrow">ROUTE</p><h3 id="route-preflight-title">Who acts, reviews, and loops</h3></div><div class="route-preflight-tools"><span id="route-preflight-summary"></span><button type="button" class="quiet-button" id="catalog-toggle">Model catalog</button></div></div>
         <div id="catalog-host" hidden><div id="catalog-status"></div></div>

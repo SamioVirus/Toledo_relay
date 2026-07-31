@@ -60,6 +60,31 @@ $port = 8765
 $url = "http://127.0.0.1:$port/"
 $projectRoot = "__PROJECT_ROOT__"
 
+function Get-AppBrowser {
+    # Prefer stable Chrome for the dedicated app window.  Brave is an equivalent
+    # Chromium fallback on this machine if Chrome is ever removed.
+    $candidates = @(
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
+        "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
+        "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe",
+        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe"
+    )
+    return $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
+
+function Open-RelayApp {
+    $browser = Get-AppBrowser
+    if ($browser) {
+        # --app opens the relay in a standalone, tabless application window,
+        # rather than in an existing browser tab.
+        Start-Process -FilePath $browser -ArgumentList "--app=$url", "--window-size=1440,960"
+        return
+    }
+    Start-Process $url
+}
+
 function Test-RelayReady {
     try {
         $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 1
@@ -68,7 +93,7 @@ function Test-RelayReady {
 }
 
 if (Test-RelayReady) {
-    Start-Process $url
+    Open-RelayApp
     exit 0
 }
 
@@ -79,11 +104,12 @@ $deadline = (Get-Date).AddSeconds(25)
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 400
     if (Test-RelayReady) {
-        Start-Process $url
+        Open-RelayApp
         exit 0
     }
 }
 
+Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.MessageBox]::Show("Toledo Workflow Relay did not become ready on port $port. Run its command from a terminal to see the startup error.", "Toledo Workflow Relay", "OK", "Error") | Out-Null
 '@.Replace("__PROJECT_ROOT__", $projectRoot.Replace("'", "''"))
 

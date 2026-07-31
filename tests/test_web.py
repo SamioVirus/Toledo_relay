@@ -179,18 +179,33 @@ def test_local_web_api_serves_ui_requires_nonce_and_blocks_artifact_traversal(tm
             assert response.headers["Content-Security-Policy"].startswith("default-src 'self'")
             assert '<div class="run-context">' in html
             assert '<button class="quiet-button" id="jump-active">Active</button>' in html
+            assert 'id="new-continuous-loop"' in html
+            assert 'id="new-continuous-loop-cycles"' in html
+            assert "3 complete cycles" in html and "5 complete cycles" in html
 
         with urllib.request.urlopen(base + "/styles.css", timeout=5) as response:
             css = response.read().decode("utf-8")
             assert ".run-context { position:sticky; top:0;" in css
             assert ".timeline-toolbar { min-height:46px;" in css
             assert ".turn-quick-take summary" in css
+            assert ".continuous-loop-control" in css
 
         with urllib.request.urlopen(base + "/app.js", timeout=5) as response:
             javascript = response.read().decode("utf-8")
             assert "function quickTakeMarkup(turn)" in javascript
             assert "head.summary_sequence" in javascript
             assert 'model.complete = {label: "Complete project", inMore: true}' in javascript
+            assert "source has uncommitted tracked changes" in javascript
+            assert "source status unavailable" in javascript
+            assert "button.disabled = !Boolean(value.implementation_ready)" in javascript
+            assert "function validationApprovalCommands(state)" in javascript
+            assert "Routine tests and read-only checks run automatically." in javascript
+            assert "This routine check can continue" in javascript
+            assert "See what would run and why" in javascript
+            assert "Local project check (routine checks run automatically)" in javascript
+            assert "function syncContinuousLoopControls()" in javascript
+            assert "Continuous loop finished" in javascript
+            assert "Safety, failure, and permission gates still stop immediately." in javascript
             assert 'runStatusLabel(status)' in javascript
 
         status, bootstrap = request_json(base + "/api/bootstrap")
@@ -607,6 +622,93 @@ def test_gate_action_persists_displayed_override_before_scheduling(
         assert persisted["session_action"] == "new"
         if endpoint == "decision":
             assert events[1][1] == ("yes", b"", "baseline_failure")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_decision_treats_json_null_follow_up_as_absent(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    decisions: list[tuple[str, bytes, str | None]] = []
+
+    def decide(
+        run_id: str,
+        choice: str,
+        text: bytes = b"",
+        follow_up: str | None = None,
+    ) -> dict[str, object]:
+        decisions.append((choice, text, follow_up))
+        return {"run_id": run_id}
+
+    engine.decide = decide  # type: ignore[method-assign]
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    run_id = "run_20260712T120000Z_1234abcd"
+    try:
+        status, _ = request_json(
+            base + f"/api/runs/{run_id}/decision",
+            method="POST",
+            nonce="test-nonce",
+            value={"choice": "no", "text": "", "follow_up": None},
+        )
+        assert status == 202
+        deadline = time.monotonic() + 5
+        while not decisions and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert decisions == [("no", b"", None)]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_run_create_forwards_bounded_continuous_loop_settings(tmp_path: Path):
+    engine = CycleOrchestrator(runtime_dir=tmp_path / "runtime")
+    workers = RunWorkers()
+    received: dict[str, object] = {}
+
+    def create_run(
+        request: bytes,
+        project: str,
+        workflow: str,
+        **options: object,
+    ) -> str:
+        received.update({
+            "request": request,
+            "project": project,
+            "workflow": workflow,
+            **options,
+        })
+        return "run_20260731T120000Z_1234abcd"
+
+    engine.create_run = create_run  # type: ignore[method-assign]
+    engine.run_to_stop = lambda run_id: {"run_id": run_id}  # type: ignore[method-assign]
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, workers, "test-nonce"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status, result = request_json(
+            base + "/api/runs",
+            method="POST",
+            nonce="test-nonce",
+            value={
+                "request": "Run three ideas",
+                "project": "jobs",
+                "workflow": "continuous-development",
+                "run_mode": "auto",
+                "continuous_loop": {"enabled": True, "target_cycles": 3},
+            },
+        )
+        assert status == 202
+        assert result["run_id"] == "run_20260731T120000Z_1234abcd"
+        assert received["continuous_loop_enabled"] is True
+        assert received["continuous_loop_cycles"] == 3
+        assert received["run_mode"] == "auto"
     finally:
         server.shutdown()
         server.server_close()

@@ -69,6 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--workflow", required=True)
     run.add_argument("--request-file", type=Path, required=True)
     run.add_argument("--step", action="store_true", help="pause after each provider turn")
+    run.add_argument(
+        "--continuous-loop",
+        type=int,
+        choices=(3, 4, 5),
+        metavar="CYCLES",
+        help="auto-approve next ideas until 3, 4, or 5 complete cycles finish",
+    )
     status = commands.add_parser("status")
     status.add_argument("run_id")
     show = commands.add_parser("show")
@@ -173,17 +180,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         request = args.request_file.read_bytes()
         if args.workflow == "dev-review":
-            if args.step:
-                raise ValueError("--step is available only for continuous v2 workflows")
+            if args.step or args.continuous_loop:
+                raise ValueError("--step and --continuous-loop are available only for continuous v2 workflows")
             engine = _base(args.runtime_dir)
             run_id = engine.create_run(request, args.project, args.workflow)
         else:
+            if args.step and args.continuous_loop:
+                raise ValueError("--continuous-loop cannot be combined with --step")
             engine = _cycle(args.runtime_dir)
             run_id = engine.create_run(
                 request,
                 args.project,
                 args.workflow,
                 run_mode="step" if args.step else "auto",
+                continuous_loop_enabled=args.continuous_loop is not None,
+                continuous_loop_cycles=args.continuous_loop or 3,
             )
         _emit(engine.run_to_stop(run_id))
         return 0

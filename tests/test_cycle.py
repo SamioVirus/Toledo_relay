@@ -268,7 +268,7 @@ def test_continuous_cycle_preserves_a_and_b_and_starts_fresh_c(tmp_path: Path, w
     assert reviewer["label"] == "B" and reviewer["active_session_id"] == "claude-session-1"
     assert implementer["label"] == "C" and implementer["active_session_id"] == "codex-session-2"
     assert claude.invocations[0]["model"] == "claude-fable-5"
-    assert claude.invocations[2]["model"] == "claude-opus-4-8"
+    assert claude.invocations[2]["model"] == "claude-opus-5"
     assert claude.invocations[-1]["route"] == "next-task"
     assert claude.invocations[-1]["model"] == "claude-fable-5"
     assert all(item["session_id"] == "claude-session-1" for item in claude.invocations)
@@ -349,11 +349,115 @@ def test_yes_starts_fresh_d_e_f_cycle_from_exact_claude_proposal(
     assert second["working_revision"] != first_revision
     assert second["execution_branch"] == first["execution_branch"]
     assert [item["model"] for item in claude.invocations] == [
-        "claude-fable-5", "claude-opus-4-8", "claude-fable-5",
-        "claude-fable-5", "claude-opus-4-8", "claude-fable-5",
+        "claude-fable-5", "claude-opus-5", "claude-fable-5",
+        "claude-fable-5", "claude-opus-5", "claude-fable-5",
     ]
     assert [item["session_id"] for item in claude.invocations[:3]] == ["claude-session-1"] * 3
     assert [item["session_id"] for item in claude.invocations[3:]] == ["claude-session-2"] * 3
+
+
+def test_continuous_loop_runs_exact_bounded_cycle_count_then_pauses(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan one")),
+        ("implementation", sentinel("continue", "Build one")),
+        ("planning-propose", sentinel("continue", "Plan two")),
+        ("implementation", sentinel("continue", "Build two")),
+        ("planning-propose", sentinel("continue", "Plan three")),
+        ("implementation", sentinel("continue", "Build three")),
+        ("planning-propose", sentinel("continue", "Plan four")),
+        ("implementation", sentinel("continue", "Build four")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Plan one ready")),
+        ("implementation-review", sentinel("ready", "Build one ready")),
+        ("next-task", sentinel("human", "Cycle two request\n")),
+        ("planning-review", sentinel("ready", "Plan two ready")),
+        ("implementation-review", sentinel("ready", "Build two ready")),
+        ("next-task", sentinel("human", "Cycle three request\n")),
+        ("planning-review", sentinel("ready", "Plan three ready")),
+        ("implementation-review", sentinel("ready", "Build three ready")),
+        ("next-task", sentinel("human", "Cycle four request\n")),
+        ("planning-review", sentinel("ready", "Plan four ready")),
+        ("implementation-review", sentinel("ready", "Build four ready")),
+        ("next-task", sentinel("human", "Cycle five request\n")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+
+    state = app.run_to_stop(app.create_run(
+        b"Cycle one request",
+        "test",
+        continuous_loop_enabled=True,
+        continuous_loop_cycles=3,
+    ))
+
+    assert state["status"] == "paused"
+    assert state["pending_human_decision"] == "next_task_approval"
+    assert state["cycle"] == 3
+    assert state["continuous_loop"] == {
+        "enabled": True,
+        "target_cycles": 3,
+        "completed_cycles": 3,
+        "status": "target_reached",
+    }
+    assert [cycle["status"] for cycle in state["cycles"]] == ["complete", "complete", "active"]
+    automatic = [decision for decision in state["decisions"] if decision.get("actor") == "relay"]
+    assert [(item["cycle"], item["choice"], item["reason"]) for item in automatic] == [
+        (1, "yes", "next_task_approval"),
+        (2, "yes", "next_task_approval"),
+    ]
+    assert all(item["title"] == "Relay: continuous loop" for item in automatic)
+    assert sum(event["kind"] == "automation.decision" for event in state["events"]) == 2
+    assert sum(event["kind"] == "continuous_loop.target_reached" for event in state["events"]) == 1
+    assert len(codex.invocations) == 6
+    assert len(claude.invocations) == 9
+    second_request = app._run_dir(state["run_id"]) / state["cycles"][1]["request_file"]
+    third_request = app._run_dir(state["run_id"]) / state["cycles"][2]["request_file"]
+    assert second_request.read_bytes() == b"Cycle two request"
+    assert third_request.read_bytes() == b"Cycle three request"
+
+    extended = app.decide(state["run_id"], "yes")
+    assert extended["cycle"] == 4
+    assert extended["status"] == "paused"
+    assert extended["pending_human_decision"] == "next_task_approval"
+    assert extended["continuous_loop"]["status"] == "manual_extension"
+    assert sum(item.get("actor") == "relay" for item in extended["decisions"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("run_mode", "enabled", "cycles", "message"),
+    [
+        ("step", True, 3, "requires auto run mode"),
+        ("auto", True, 2, "must be 3, 4, or 5"),
+        ("auto", True, 6, "must be 3, 4, or 5"),
+    ],
+)
+def test_continuous_loop_rejects_unbounded_or_incompatible_settings(
+    tmp_path: Path,
+    writable_project: ProjectDefinition,
+    run_mode: str,
+    enabled: bool,
+    cycles: int,
+    message: str,
+):
+    app = make_cycle(
+        tmp_path,
+        writable_project,
+        SessionAdapter("codex", []),
+        SessionAdapter("claude", []),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        app.create_run(
+            b"Task",
+            "test",
+            run_mode=run_mode,
+            continuous_loop_enabled=enabled,
+            continuous_loop_cycles=cycles,
+        )
+
+    assert not app.runs_dir.exists() or not list(app.runs_dir.iterdir())
 
 
 def test_step_mode_pauses_before_d_and_accepts_d_override(tmp_path: Path, writable_project: ProjectDefinition):
@@ -1459,6 +1563,53 @@ def test_create_run_rejects_dirty_source_before_creating_run(tmp_path: Path, wri
     assert not list((tmp_path / "runtime" / "worktrees").glob("*"))
 
 
+def test_project_status_probe_avoids_optional_locks_and_preserves_git_error(
+    monkeypatch: pytest.MonkeyPatch,
+    writable_project: ProjectDefinition,
+):
+    from toledo_orchestrator import project as project_module
+
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if "branch" in command:
+            return subprocess.CompletedProcess(command, 0, stdout="main\n", stderr="")
+        assert command[1] == "--no-optional-locks"
+        return subprocess.CompletedProcess(
+            command,
+            128,
+            stdout="",
+            stderr="fatal: unable to read the index",
+        )
+
+    monkeypatch.setattr(project_module.subprocess, "run", fake_run)
+
+    branch, dirty, error = writable_project.git_context()
+
+    assert branch == "main"
+    assert dirty is None
+    assert error == "git status failed: fatal: unable to read the index"
+    assert len(commands) == 2
+
+
+def test_create_run_surfaces_source_checkout_probe_failure(
+    tmp_path: Path,
+    writable_project: ProjectDefinition,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        ProjectDefinition,
+        "git_context",
+        lambda self: ("main", None, "git status failed: fatal: unable to read the index"),
+    )
+    app = make_cycle(tmp_path, writable_project, SessionAdapter("codex", []), SessionAdapter("claude", []))
+
+    with pytest.raises(ValueError, match="fatal: unable to read the index"):
+        app.create_run(b"Task", "test")
+    assert not app.runs_dir.exists() or not list(app.runs_dir.iterdir())
+
+
 def test_create_run_ignores_untracked_files_in_source_checkout(tmp_path: Path, writable_project: ProjectDefinition):
     # Untracked notes never reach the isolated worktree and the accepted commit
     # lands on the run branch, so they must not block a continuous run.
@@ -1496,7 +1647,118 @@ def test_execution_worktree_identity_drift_pauses_before_provider(
     assert codex.invocations == [] and state["turns"] == []
 
 
-def test_validation_requires_explicit_approval_and_no_cancels(tmp_path: Path, writable_project: ProjectDefinition):
+@pytest.mark.parametrize(
+    "command",
+    [
+        'python -c "from pathlib import Path; assert Path(\'source.md\').is_file()"',
+        "python -m pytest -q",
+        "python interview_prep/verify_package.py",
+        "npm test",
+        "docker compose config",
+        "curl http://127.0.0.1:8765/health",
+    ],
+)
+def test_routine_validation_commands_do_not_require_approval(command: str):
+    approval = ValidationDefinition("routine", command, "local").approval()
+
+    assert approval == {
+        "required": False,
+        "risk": "routine",
+        "summary": "Routine project check; no operator approval is needed.",
+        "reasons": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        ("Remove-Item -Recurse build", "delete or irreversibly replace"),
+        ('python -c "Path(\'marker\').write_text(\'x\')"', "create or change files"),
+        ("python -m pip install package", "install or update software"),
+        ("sudo systemctl restart relay", "administrator access"),
+        ("docker compose up -d", "containers or infrastructure"),
+        ("git push origin main", "external system"),
+        ("curl -X POST https://example.invalid/deploy", "external system"),
+    ],
+)
+def test_only_clearly_consequential_validation_commands_require_approval(command: str, reason: str):
+    approval = ValidationDefinition("consequential", command, "local").approval()
+
+    assert approval["required"] is True
+    assert approval["risk"] == "high"
+    assert approval["summary"] == "This check can affect more than the isolated working copy."
+    assert any(reason in item for item in approval["reasons"])
+
+
+def test_legacy_pending_validation_gets_current_risk_projection(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    project = replace(writable_project, validation_requires_approval=True)
+    app = make_cycle(
+        tmp_path,
+        project,
+        SessionAdapter("codex", []),
+        SessionAdapter("claude", []),
+    )
+    run_id = app.create_run(b"Task", "test")
+    state = app.state(run_id)
+    state["pending_validation"] = {
+        "commands": [
+            {"id": "routine", "command": "python -m pytest -q", "environment": "local"},
+            {"id": "publish", "command": "git push origin main", "environment": "local"},
+        ]
+    }
+    state["pending_human_decision"] = "validation_execution_approval"
+    app._save(run_id, state)
+
+    projected = app.state(run_id)
+
+    routine, publish = projected["pending_validation"]["commands"]
+    assert routine["approval"]["required"] is False
+    assert routine["approval"]["legacy_projection"] is True
+    assert publish["approval"]["required"] is True
+    assert publish["approval"]["legacy_projection"] is True
+
+
+def test_routine_validation_runs_without_interrupting_for_approval(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    command = (
+        f'"{sys.executable}" -c "from pathlib import Path; '
+        "assert Path('AGENTS.md').is_file()\""
+    )
+    project = replace(
+        writable_project,
+        validations=(ValidationDefinition("routine-local", command, "local"),),
+        allow_no_validations=False,
+        validation_requires_approval=True,
+    )
+    app = make_cycle(
+        tmp_path,
+        project,
+        SessionAdapter("codex", [
+            ("planning-propose", sentinel("continue", "Plan")),
+            ("implementation", sentinel("continue", "Built")),
+        ], writer=True),
+        SessionAdapter("claude", [
+            ("planning-review", sentinel("ready", "Plan ready")),
+            ("implementation-review", sentinel("human", "Review pause")),
+        ]),
+    )
+
+    state = app.run_to_stop(app.create_run(b"Task", "test"))
+
+    assert state["pending_human_decision"] == "provider_requested_human"
+    assert state["validations"]["routine-local"]["state"] == "passed"
+    assert not any(
+        event.get("reason") == "validation_execution_approval"
+        for event in state["events"]
+    )
+
+
+def test_high_risk_validation_requires_explicit_approval_and_no_cancels(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
     marker = tmp_path / "validation-ran.txt"
     command = f'"{sys.executable}" -c "from pathlib import Path; Path({str(marker)!r}).write_text(\'ran\', encoding=\'utf-8\')"'
     project = replace(
@@ -1514,10 +1776,20 @@ def test_validation_requires_explicit_approval_and_no_cancels(tmp_path: Path, wr
         ("implementation-review", sentinel("human", "Stop after validation")),
     ])
     app = make_cycle(tmp_path, project, codex, claude)
-    run_id = app.create_run(b"Task", "test")
+    run_id = app.create_run(
+        b"Task",
+        "test",
+        continuous_loop_enabled=True,
+        continuous_loop_cycles=3,
+    )
     paused = app.run_to_stop(run_id)
     assert paused["pending_human_decision"] == "validation_execution_approval"
-    assert not marker.exists() and paused["pending_validation"]["commands"][0]["command"] == command
+    assert paused["continuous_loop"]["status"] == "running"
+    pending_command = paused["pending_validation"]["commands"][0]
+    assert not marker.exists() and pending_command["command"] == command
+    assert pending_command["approval"]["required"] is True
+    assert pending_command["approval"]["risk"] == "high"
+    assert pending_command["approval"]["reasons"] == ["It can create or change files while it runs."]
     resumed = app.decide(run_id, "yes")
     assert marker.read_text(encoding="utf-8") == "ran"
     assert resumed["validations"]["safe-local"]["state"] == "passed"

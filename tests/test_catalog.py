@@ -96,15 +96,51 @@ def test_claude_efforts_are_per_model_and_haiku_gets_default_only(monkeypatch):
     models, metadata = catalog._claude_models()
     by_token = {item["selection_token"]: item for item in models}
     assert by_token["claude-fable-5"]["supported_efforts"] == ["low", "medium", "high", "xhigh", "max"]
+    assert by_token["claude-opus-5"]["supported_efforts"] == ["low", "medium", "high", "xhigh", "max"]
     assert by_token["claude-opus-4-8"]["supported_efforts"] == ["low", "medium", "high", "xhigh", "max"]
     assert by_token["claude-sonnet-5"]["supported_efforts"] == ["low", "medium", "high", "xhigh", "max"]
     assert by_token["claude-fable-5"]["default_effort"] == "high"
+    assert by_token["claude-opus-5"]["default_effort"] == "high"
     assert by_token["claude-opus-4-8"]["default_effort"] == "high"
     assert by_token["claude-sonnet-5"]["default_effort"] == "high"
     # Haiku 4.5 is not in the official effort-support list; it exposes only
     # the provider default and the adapter omits the effort flag.
     assert by_token["claude-haiku-4-5-20251001"]["supported_efforts"] == []
     assert metadata["supports_effort"] is True
+
+
+def test_claude_curation_freshness_is_reported_separately_from_discovery(monkeypatch):
+    """A loadable Claude list can still be missing a model released last week.
+
+    Opus 5 shipped 2026-07-24 and stayed invisible because nothing distinguished
+    "discovery succeeded" from "the hand-maintained list is current".
+    """
+    from toledo_orchestrator import catalog
+
+    def fake_run_text(command):
+        if "--help" in command:
+            return "--model <model>  --effort <level>", None
+        return "2.1.210 (Claude Code)", None
+
+    monkeypatch.setattr(catalog, "_run_text", fake_run_text)
+
+    _, metadata = catalog._claude_models()
+    assert metadata["curated"] is True
+    assert metadata["error"] is None
+    assert metadata["curation_age_days"] is not None
+    assert metadata["curation_stale"] is False
+
+    monkeypatch.setattr(catalog, "CLAUDE_CATALOG_CHECKED_AT", "2020-01-01")
+    _, aged = catalog._claude_models()
+    assert aged["curation_stale"] is True
+    assert aged["curation_age_days"] > catalog.CLAUDE_CURATION_STALE_AFTER_DAYS
+    # Discovery still succeeded; staleness must not masquerade as failure.
+    assert aged["error"] is None
+
+    monkeypatch.setattr(catalog, "CLAUDE_CATALOG_CHECKED_AT", "not-a-date")
+    _, unparseable = catalog._claude_models()
+    assert unparseable["curation_age_days"] is None
+    assert unparseable["curation_stale"] is True
 
 
 def test_selection_for_effortless_model_accepts_only_default():

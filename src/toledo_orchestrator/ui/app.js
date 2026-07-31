@@ -128,7 +128,7 @@ async function loadBootstrap() {
 }
 
 function renderRunList(runs) {
-  const signature = JSON.stringify([currentRunId, runs.map((run) => [run.run_id, run.status, run.current_turn, run.worker?.active, run.worker?.error])]);
+  const signature = JSON.stringify([currentRunId, runs.map((run) => [run.run_id, run.status, run.cycle, run.current_turn, run.continuous_loop, run.worker?.active, run.worker?.error])]);
   if (signature === runListSignature) return;
   runListSignature = signature;
   const root = $("#run-list");
@@ -137,7 +137,9 @@ function renderRunList(runs) {
     const button = document.createElement("button");
     button.className = `run-item ${run.run_id === currentRunId ? "active" : ""}`;
     const status = run.worker?.active ? "running" : run.status;
-    button.innerHTML = `<div class="run-item-top"><strong>${escapeHtml(run.project)}</strong><span class="status-pill ${escapeHtml(status)}">${escapeHtml(runStatusLabel(status))}</span></div><p>${escapeHtml(run.workflow)} · ${run.current_turn || 0} turns · ${escapeHtml(compactId(run.run_id))}</p>`;
+    const loop = run.continuous_loop;
+    const loopProgress = loop?.enabled ? ` · loop ${run.cycle || 1}/${loop.target_cycles}` : "";
+    button.innerHTML = `<div class="run-item-top"><strong>${escapeHtml(run.project)}</strong><span class="status-pill ${escapeHtml(status)}">${escapeHtml(runStatusLabel(status))}</span></div><p>${escapeHtml(run.workflow)}${escapeHtml(loopProgress)} · ${run.current_turn || 0} turns · ${escapeHtml(compactId(run.run_id))}</p>`;
     button.addEventListener("click", () => selectRun(run.run_id));
     root.append(button);
   }
@@ -175,6 +177,7 @@ function stateSignature(state) {
     cycles: state.cycles,
     decisions: state.decisions,
     events: state.events,
+    continuousLoop: state.continuous_loop,
     worker: state.worker,
     override: state.next_turn_override,
     steer: state.steer,
@@ -210,6 +213,7 @@ async function refreshCurrent(force = false) {
       Object.assign(summary, {
         status: currentState.status,
         cycle: currentState.cycle,
+        continuous_loop: currentState.continuous_loop,
         current_turn: currentState.current_turn,
         worker: currentState.worker,
       });
@@ -257,7 +261,11 @@ function renderRun() {
   const cost = (state.turns || []).reduce((sum, turn) => sum + Number(turn.usage?.total_cost_usd || 0), 0);
   const strip = $("#run-status-strip");
   strip.hidden = false;
-  strip.innerHTML = `<span>${escapeHtml(runStatusLabel(state.status))}</span><span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
+  const loop = state.continuous_loop;
+  const loopStatus = loop?.enabled
+    ? `<span>loop ${Math.min(Number(state.cycle || 1), Number(loop.target_cycles || 1))}/${Number(loop.target_cycles || 1)}${loop.status === "target_reached" ? " complete" : ""}</span>`
+    : "";
+  strip.innerHTML = `<span>${escapeHtml(runStatusLabel(state.status))}</span>${loopStatus}<span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
   $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(runStatusLabel(state.status).toUpperCase())}</p><h2>${escapeHtml(heading || "Project completed")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span><button class="quiet-button run-action" id="export-run" title="Download the full conversation and transport prompts as plain text">Export plain text</button><button class="quiet-button run-action" id="copy-run" title="Copy the same full plain-text conversation">Copy all</button>${canRecover ? '<button class="accept-button run-action" id="recover-run">Recover run</button>' : ''}</div>`;
   $("#export-run")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
@@ -540,7 +548,11 @@ function humanDecisionNode(decision, index) {
   const button = document.createElement("button");
   button.className = "decision-node";
   button.dataset.decisionPath = decision.file;
-  button.innerHTML = `<span class="decision-choice">You · ${escapeHtml(decisionChoiceLabel(decision))}</span><span class="decision-reason">${escapeHtml(decisionReasonLabel(decision.reason, decision.choice))}</span><span class="decision-preview">Open stored direction</span>`;
+  const actor = decision.actor === "relay" ? "Relay" : "You";
+  const reason = decision.actor === "relay"
+    ? "Next idea auto-approved"
+    : decisionReasonLabel(decision.reason, decision.choice);
+  button.innerHTML = `<span class="decision-choice">${actor} · ${escapeHtml(decisionChoiceLabel(decision))}</span><span class="decision-reason">${escapeHtml(reason)}</span><span class="decision-preview">Open stored direction</span>`;
   button.addEventListener("click", () => openDecision(decision, index));
   row.append(button);
   return row;
@@ -944,6 +956,18 @@ const GATE_AGENT_SETUP_REASONS = ["operator_step", "provider_invocation_failed"]
 function gatePresentation(state) {
   const reason = state.pending_human_decision || "human_decision";
   const nextTitle = stageTitle(state.current_stage) || "next turn";
+  const continuousLoop = state.continuous_loop;
+  const loopTargetReached = reason === "next_task_approval"
+    && continuousLoop?.enabled
+    && continuousLoop.status === "target_reached";
+  const approvalCommands = validationApprovalCommands(state);
+  const approvalReasons = [...new Set(approvalCommands.flatMap((item) => item.approval?.reasons || []))];
+  const routineLegacyGate = reason === "validation_execution_approval" && approvalCommands.length === 0;
+  const approvalSummary = routineLegacyGate
+    ? "This run paused under Relay's older approval policy. This is now considered a routine check, so it will not stop future runs. Continue once to resume this existing run."
+    : approvalReasons.length
+      ? `${approvalReasons.join(" ")} Nothing has run yet. Routine tests and read-only checks run automatically.`
+      : "This run was paused under the older all-commands approval policy. Nothing has run yet.";
   const presentations = {
     operator_step: {
       title: `Up next: ${nextTitle}`,
@@ -955,22 +979,26 @@ function gatePresentation(state) {
       note: "Guidance is appended to this turn's prompt only — the workflow instruction is unchanged. It is recorded as an operator decision.",
     },
     next_task_approval: {
-      title: "Is this the right next task?",
-      summary: "Start planning this proposal, complete the project, or ask for a revision.",
-      yes: "Start planning",
+      title: loopTargetReached ? "Continuous loop finished" : "Is this the right next task?",
+      summary: loopTargetReached
+        ? `${continuousLoop.completed_cycles} of ${continuousLoop.target_cycles} complete cycles finished. Relay stopped as planned with the next idea ready for your review.`
+        : "Start planning this proposal, complete the project, or ask for a revision.",
+      yes: loopTargetReached ? "Run one more cycle" : "Start planning",
       no: "Complete project",
       alt: "Revise the proposal",
       directionLabel: "What should the strategic session change?",
       send: "Send revision",
     },
     validation_execution_approval: {
-      title: "Run the validation commands?",
-      summary: "These host commands run once in the isolated implementation worktree. You are approving the commands, not a provider turn.",
-      yes: "Run validation",
-      no: "Cancel run",
-      alt: "Send to repair instead",
-      directionLabel: "What must the implementation session change before validation?",
-      send: "Send to repair",
+      title: routineLegacyGate
+        ? "This routine check can continue"
+        : approvalCommands.length === 1 ? "This check needs your approval" : "These checks need your approval",
+      summary: approvalSummary,
+      yes: routineLegacyGate ? "Continue" : approvalCommands.length === 1 ? "Run this check" : "Run these checks",
+      no: "Cancel without running",
+      alt: "Ask the agent to change it",
+      directionLabel: "What should the implementation session change before this check runs?",
+      send: "Send back to the agent",
     },
     validation_receipt_required: {
       title: "Validation receipt required",
@@ -1084,15 +1112,23 @@ function gatePresentation(state) {
   return model;
 }
 
+function validationApprovalCommands(state) {
+  return (state.pending_validation?.commands || []).filter((item) => item.approval?.required !== false);
+}
+
 // Evidence stays exact but moves behind a disclosure instead of being appended
 // to the gate copy.
 function gateEvidence(reason, state) {
   if (reason === "validation_execution_approval") {
-    const commands = (state.pending_validation?.commands || []).map((item) => `${item.id}: ${item.command}`);
+    const commands = validationApprovalCommands(state);
     if (!commands.length) return null;
+    const body = commands.map((item) => {
+      const reasons = item.approval?.reasons || ["This run used the older all-commands approval policy."];
+      return `${item.id}\nWhy Relay paused: ${reasons.join(" ")}\nCommand: ${item.command}`;
+    });
     return {
-      label: `View the ${commands.length} pending command${commands.length === 1 ? "" : "s"}`,
-      body: `${commands.join("\n")}\n\nWhere: ${state.execution_worktree || "isolated worktree"} at ${(state.working_revision || state.source_revision || "").slice(0, 12)}`,
+      label: commands.length === 1 ? "See what would run and why" : "See what would run and why Relay paused",
+      body: `${body.join("\n\n")}\n\nRuns in: ${state.execution_worktree || "isolated worktree"}\nRevision: ${(state.working_revision || state.source_revision || "").slice(0, 12)}`,
     };
   }
   if (reason === "validation_baseline_failure_decision") {
@@ -1191,7 +1227,7 @@ function decisionReasonLabel(reason, choice = null) {
     return "Project completed";
   }
   const labels = {
-    validation_execution_approval: "Checks approved",
+    validation_execution_approval: "Consequential check approved",
     validation_baseline_failure_decision: "Older issue acknowledged",
     provider_invocation_failed: "Retry after interruption",
     next_task_approval: "Next task choice",
@@ -1218,6 +1254,22 @@ function populateNewRun() {
   if (initialWorkflow) $("#new-workflow").value = initialWorkflow;
   renderProjectFacts();
   renderNewRunPreflight();
+  syncContinuousLoopControls();
+}
+
+function syncContinuousLoopControls() {
+  const autoMode = $("#new-run-mode").value === "auto";
+  const toggle = $("#new-continuous-loop");
+  const cycles = Number($("#new-continuous-loop-cycles").value || 3);
+  if (!autoMode) toggle.checked = false;
+  toggle.disabled = !autoMode;
+  $("#continuous-loop-count").hidden = !toggle.checked;
+  $("#continuous-loop-note").textContent = !autoMode
+    ? "Available in Auto mode — step mode still pauses after every agent turn."
+    : toggle.checked
+      ? `Relay will run ${cycles} complete idea → build → audit cycles, then stop with the next idea ready. Safety, failure, and permission gates still stop immediately.`
+      : "Off — Relay stops for your approval before starting the next idea.";
+  $(".continuous-loop-control").classList.toggle("unavailable", !autoMode);
 }
 
 const launchOverrides = new Map();
@@ -1785,8 +1837,23 @@ function renderProjectFacts() {
   const facts = $("#project-facts");
   const value = bootstrap?.projects?.[$("#new-project").value];
   facts.hidden = !value;
-  if (!value) { facts.textContent = ""; return; }
-  facts.textContent = `${value.implementation_enabled ? "Isolated implementation enabled" : "Read-only"} · ${value.branch || "detached"} · ${value.dirty ? "source has local changes" : "source clean"} · ${(value.source_revision || "").slice(0, 8)}`;
+  const button = $("#create-run");
+  if (!value) {
+    facts.textContent = "";
+    button.disabled = true;
+    button.title = "Choose a repository before starting.";
+    return;
+  }
+  const sourceState = value.dirty === true
+    ? "source has uncommitted tracked changes — commit or stash them before starting"
+    : value.dirty === false
+      ? "source clean"
+      : `source status unavailable — ${value.source_checkout_error || "Git did not return a usable status"}`;
+  facts.textContent = `${value.implementation_enabled ? "Isolated implementation enabled" : "Read-only"} · ${value.branch || "detached"} · ${sourceState} · ${(value.source_revision || "").slice(0, 8)}`;
+  button.disabled = !Boolean(value.implementation_ready);
+  button.title = value.implementation_ready
+    ? ""
+    : (value.implementation_error || "This repository is not ready for a continuous run.");
 }
 
 function showProjectForm() {
@@ -1794,7 +1861,7 @@ function showProjectForm() {
   const form = document.createElement("article");
   form.id = "project-add-form";
   form.className = "project-card";
-  form.innerHTML = `<label>ID<input data-field="id" placeholder="my-repo"></label><label>Repository root<input data-field="root" placeholder="C:\\src\\my-repo"></label><label>Instruction files<input data-field="instructions" placeholder="AGENTS.md, docs/plan.md"></label><label>Implementation write paths<input data-field="write-paths" value="." placeholder="src, tests, docs"></label><label>Required local validation<input data-field="validation" value="python -m pytest -q" placeholder="python -m pytest -q"></label><button type="button" class="primary-button">Save repository</button>`;
+  form.innerHTML = `<label>ID<input data-field="id" placeholder="my-repo"></label><label>Repository root<input data-field="root" placeholder="C:\\src\\my-repo"></label><label>Instruction files<input data-field="instructions" placeholder="AGENTS.md, docs/plan.md"></label><label>Implementation write paths<input data-field="write-paths" value="." placeholder="src, tests, docs"></label><label>Local project check (routine checks run automatically)<input data-field="validation" value="python -m pytest -q" placeholder="python -m pytest -q"></label><button type="button" class="primary-button">Save repository</button>`;
   $("button", form).addEventListener("click", async () => {
     const id = $('[data-field="id"]',form).value.trim();
     const root = $('[data-field="root"]',form).value.trim();
@@ -1825,14 +1892,20 @@ async function createRun() {
     const workflowId = $("#new-workflow").value;
     const workflow = bootstrap?.workflows?.[workflowId] || {};
     const adjustments = collectLaunchAdjustments(workflow);
-    const result = await api("/api/runs", {method:"POST",body:JSON.stringify({project:$("#new-project").value,workflow:workflowId,run_mode:$("#new-run-mode").value,request,...adjustments})});
+    const continuousLoop = {
+      enabled: $("#new-continuous-loop").checked,
+      target_cycles: Number($("#new-continuous-loop-cycles").value),
+    };
+    const result = await api("/api/runs", {method:"POST",body:JSON.stringify({project:$("#new-project").value,workflow:workflowId,run_mode:$("#new-run-mode").value,continuous_loop:continuousLoop,request,...adjustments})});
     $("#new-run-dialog").close();
     $("#new-request").value = "";
+    $("#new-continuous-loop").checked = false;
+    syncContinuousLoopControls();
     clearLaunchAdjustments();
     await refreshRuns();
     await selectRun(result.run_id);
   } catch(error) { showNewRunError(`The run was not started. ${error.message}`); }
-  finally { button.disabled = false; }
+  finally { renderProjectFacts(); }
 }
 
 async function saveWorkflowAs() {
@@ -1936,6 +2009,9 @@ function bindStaticEvents() {
   window.addEventListener("resize", syncRunRail);
   syncRunRail();
   $("#add-project-button").addEventListener("click", showProjectForm);
+  $("#new-run-mode").addEventListener("change", syncContinuousLoopControls);
+  $("#new-continuous-loop").addEventListener("change", syncContinuousLoopControls);
+  $("#new-continuous-loop-cycles").addEventListener("change", syncContinuousLoopControls);
   $("#new-workflow").addEventListener("change", () => { clearLaunchAdjustments(); showNewRunError(""); renderNewRunPreflight(); });
   $("#workflow-saveas-toggle").addEventListener("click", () => {
     const form = $("#workflow-saveas-form");

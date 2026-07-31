@@ -123,6 +123,7 @@ def _run_summaries(engine: CycleOrchestrator, workers: RunWorkers) -> list[dict[
             "project": state.get("project"),
             "status": state.get("status"),
             "cycle": state.get("cycle", 1),
+            "continuous_loop": state.get("continuous_loop"),
             "current_turn": state.get("current_turn", 0),
             "schema_version": state.get("schema_version"),
             "worker": workers.status(run_id),
@@ -359,6 +360,11 @@ def make_handler(
                     prompt_overrides = value.get("prompt_overrides")
                     if prompt_overrides is not None and not isinstance(prompt_overrides, dict):
                         raise ValueError("prompt_overrides must be an object")
+                    continuous_loop = value.get("continuous_loop") or {}
+                    if not isinstance(continuous_loop, dict):
+                        raise ValueError("continuous_loop must be an object")
+                    continuous_loop_enabled = continuous_loop.get("enabled", False)
+                    continuous_loop_cycles = continuous_loop.get("target_cycles", 3)
                     run_id = engine.create_run(
                         request,
                         str(value.get("project", "toledo")),
@@ -367,6 +373,8 @@ def make_handler(
                         profile_overrides=overrides,
                         round_overrides=round_overrides,
                         prompt_overrides=prompt_overrides,
+                        continuous_loop_enabled=continuous_loop_enabled,
+                        continuous_loop_cycles=continuous_loop_cycles,
                     )
                     workers.start(
                         run_id,
@@ -379,7 +387,12 @@ def make_handler(
                     run_id = parts[2]
                     choice = str(value.get("choice", ""))
                     text = str(value.get("text", "")).encode("utf-8")
-                    follow_up = str(value.get("follow_up", "")).strip() or None
+                    raw_follow_up = value.get("follow_up")
+                    follow_up = (
+                        str(raw_follow_up).strip() or None
+                        if raw_follow_up is not None
+                        else None
+                    )
                     workers.start(
                         run_id,
                         lambda: engine.decide(run_id, choice, text, follow_up),

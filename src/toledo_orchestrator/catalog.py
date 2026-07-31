@@ -29,13 +29,24 @@ STALE_AFTER_SECONDS = 7 * 24 * 60 * 60
 # Full IDs only: headless `--model` silently ignores family aliases.
 # Effort support is PER MODEL, from the official effort documentation
 # (https://platform.claude.com/docs/en/build-with-claude/effort): Fable 5,
-# Opus 4.8, and Sonnet 5 support low..max; Haiku 4.5 is not in the supported
-# list, so it exposes only the provider default.
+# Opus 5, Opus 4.8, and Sonnet 5 support low..max; Haiku 4.5 is not in the
+# supported list, so it exposes only the provider default.
+#
+# THIS LIST GOES STALE SILENTLY.  Unlike Codex (enumerated live through
+# `codex app-server` model/list), Claude entries are hand-maintained, so a new
+# flagship is invisible until someone edits this tuple -- Opus 5 shipped
+# 2026-07-24 and was missed for exactly that reason.  CLAUDE_CATALOG_CHECKED_AT
+# is the last date a human reconciled this list against the official model
+# overview; `claude_curation_age_days` surfaces it so the UI can nag.
+CLAUDE_CATALOG_CHECKED_AT = "2026-07-30"
+CLAUDE_CATALOG_SOURCE = "https://platform.claude.com/docs/en/about-claude/models/overview"
+CLAUDE_CURATION_STALE_AFTER_DAYS = 30
 CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 CURATED_CLAUDE_MODELS = (
     ("claude-fable-5", "Claude Fable 5", CLAUDE_EFFORTS, "high"),
-    ("claude-opus-4-8", "Claude Opus 4.8", CLAUDE_EFFORTS, "high"),
+    ("claude-opus-5", "Claude Opus 5", CLAUDE_EFFORTS, "high"),
     ("claude-sonnet-5", "Claude Sonnet 5", CLAUDE_EFFORTS, "high"),
+    ("claude-opus-4-8", "Claude Opus 4.8 (legacy)", CLAUDE_EFFORTS, "high"),
     ("claude-haiku-4-5-20251001", "Claude Haiku 4.5", [], None),
 )
 DEFAULT_EFFORT_TOKEN = "default"
@@ -305,6 +316,19 @@ def _codex_models() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return [], metadata
 
 
+def _claude_curation_age_days() -> int | None:
+    """Days since a human last reconciled the curated Claude list.
+
+    Returns None when the stamp is unparseable, which callers treat as stale
+    rather than fresh: an unreadable date is not evidence of recency.
+    """
+    try:
+        checked = datetime.fromisoformat(CLAUDE_CATALOG_CHECKED_AT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return max(0, (datetime.now(timezone.utc) - checked).days)
+
+
 def _claude_models() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     help_text, error = _run_text(["claude", "--help"])
     version, _ = _run_text(["claude", "--version"])
@@ -313,10 +337,21 @@ def _claude_models() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     # Do not infer this from documentation or similarly named commands. The
     # installed binary must advertise the exact execution capability.
     supports_ultracode = "ultracode" in help_text.lower()
+    curation_age = _claude_curation_age_days()
     metadata: dict[str, Any] = {
         "cli": "claude", "cli_version": version.strip(), "error": error,
         "supports_model": supports_model, "supports_effort": supports_effort,
         "supports_ultracode": supports_ultracode,
+        # Curation freshness is reported separately from discovery success: the
+        # Claude list can be perfectly loadable and still be missing a model
+        # released last week.
+        "curated": True,
+        "curation_checked_at": CLAUDE_CATALOG_CHECKED_AT,
+        "curation_source": CLAUDE_CATALOG_SOURCE,
+        "curation_age_days": curation_age,
+        "curation_stale": (
+            curation_age is None or curation_age > CLAUDE_CURATION_STALE_AFTER_DAYS
+        ),
     }
     if error or not supports_model:
         return [], metadata

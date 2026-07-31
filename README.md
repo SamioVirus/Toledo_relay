@@ -40,7 +40,7 @@ The packaged A/B/C defaults reflect the owner's current workflow and remain edit
 - Planning A: Codex `gpt-5.6-sol`, `xhigh`, read-only.
 - Planning review B: Claude `claude-fable-5`, `xhigh`, read-only.
 - Implementation C: Codex `gpt-5.6-terra`, `high`, isolated workspace-write.
-- Implementation review B: Claude `claude-opus-4-8`, `max`, read-only.
+- Implementation review B: Claude `claude-opus-5`, `max`, read-only.
 
 Friendly display labels are separate from exact CLI arguments. `profile-set` and the UI write runtime-local overrides; Python code and packaged defaults remain unchanged.
 
@@ -66,6 +66,12 @@ python -m toledo_orchestrator run --project toledo --workflow continuous-develop
 ```
 
 The source checkout must be clean so the selected committed revision cannot silently omit local work. The command runs until it completes or reaches a human/failure gate. It creates a dedicated execution worktree and durable branch named `codex/orchestrator/<run-id>` from that revision. Planning/review turns remain read-only; only the implementation profile receives workspace-write access inside that worktree. Accepted changes are committed on the execution branch but are never merged, pushed, deployed, or copied into the user's source checkout automatically.
+
+For a bounded self-running sequence, enable **Continuous loop** in New Cycle and choose 3, 4, or 5 cycles, or use `--continuous-loop 3` on the CLI. Relay auto-accepts only each sealed next-task proposal, then runs a fresh idea → plan/review → implementation/audit cycle. It stops after the selected number of completed cycles with the following idea ready for human review. Risky-command approval, validation failures, provider failures, ambiguity, repair caps, and all other safety/recovery gates still stop immediately; this option cannot approve them.
+
+```powershell
+python -m toledo_orchestrator run --project toledo --workflow continuous-development --request-file "C:\path\to\request.md" --continuous-loop 3
+```
 
 Use step mode when you want a deliberate control point before every provider turn:
 
@@ -94,7 +100,7 @@ python -m toledo_orchestrator decide RUN_ID --choice other --text "Make the next
 - `no` ends the continuous run.
 - `other` returns the exact feedback to whichever strategic session produced the proposal and reopens the gate with its revision.
 
-Configured local validation commands are displayed and require explicit approval before they execute on the host. Required remote validations pause for a patch- and revision-bound receipt:
+Configured local validations use a high-threshold approval policy: routine tests, linters, compilers, read-only assertions, and smoke reads run automatically in the isolated worktree. Relay pauses only when a command clearly advertises consequential effects such as destructive file or Git changes, software installation, elevated/system operations, container or infrastructure mutation, deployment, publishing, or external writes. The approval gate explains the detected risk in plain language and still exposes the exact command. Required remote validations pause for a patch- and revision-bound receipt:
 
 ```powershell
 python -m toledo_orchestrator validate RUN_ID --receipt-file "C:\path\to\receipt.json"

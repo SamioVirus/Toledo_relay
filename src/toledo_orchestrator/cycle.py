@@ -39,7 +39,7 @@ from .core import (
 from .configuration import load_configured_projects, load_configured_workflows
 from .director import DirectionContext, select_conditions
 from .locking import run_lock
-from .project import ProjectDefinition, load_projects
+from .project import ProjectDefinition, load_projects, validation_command_approval
 from .stance import CURATED_STANCES
 from .validation import (
     failure_signature,
@@ -119,7 +119,20 @@ class CycleOrchestrator:
         return self.runs_dir / run_id
 
     def state(self, run_id: str) -> dict[str, Any]:
-        return read_json(self._run_dir(run_id) / "run.json")
+        state = read_json(self._run_dir(run_id) / "run.json")
+        pending = state.get("pending_validation")
+        if isinstance(pending, dict):
+            approval_enabled = self._project(state).validation_requires_approval
+            for item in pending.get("commands", []):
+                if not isinstance(item, dict) or isinstance(item.get("approval"), dict):
+                    continue
+                approval = validation_command_approval(str(item.get("command") or ""))
+                item["approval"] = {
+                    **approval,
+                    "required": bool(approval_enabled and approval["required"]),
+                    "legacy_projection": True,
+                }
+        return state
 
     def _save(self, run_id: str, state: dict[str, Any]) -> None:
         write_json(self._run_dir(run_id) / "run.json", state)
@@ -242,10 +255,22 @@ class CycleOrchestrator:
         profile_overrides: dict[str, dict[str, Any]] | None = None,
         round_overrides: dict[str, Any] | None = None,
         prompt_overrides: dict[str, Any] | None = None,
+        continuous_loop_enabled: bool = False,
+        continuous_loop_cycles: int = 3,
     ) -> str:
         decode_text_artifact(request, "request")
         if run_mode not in {"auto", "step"}:
             raise ValueError("run mode must be auto or step")
+        if not isinstance(continuous_loop_enabled, bool):
+            raise ValueError("continuous loop enabled must be true or false")
+        if (
+            not isinstance(continuous_loop_cycles, int)
+            or isinstance(continuous_loop_cycles, bool)
+            or continuous_loop_cycles not in {3, 4, 5}
+        ):
+            raise ValueError("continuous loop cycles must be 3, 4, or 5")
+        if continuous_loop_enabled and run_mode != "auto":
+            raise ValueError("continuous loop requires auto run mode")
         if project not in self.projects:
             raise ValueError(f"unknown project: {project}")
         if workflow not in self.workflows:
@@ -259,7 +284,11 @@ class CycleOrchestrator:
                 "commit or stash them first (untracked files are ignored)"
             )
         if project_check.get("dirty") is None:
-            raise ValueError("project source checkout status must be available before a continuous run starts")
+            detail = project_check.get("source_checkout_error") or "Git returned no usable status"
+            raise ValueError(
+                "project source checkout status must be available before a continuous run starts: "
+                f"{detail}"
+            )
         if not project_check["ready"]:
             raise ValueError(f"project is not ready: {project_check['error'] or project_check['instruction_files']}")
         if not project_definition.implementation_enabled:
@@ -345,6 +374,12 @@ class CycleOrchestrator:
             "execution_branch": execution_branch,
             "status": "created",
             "run_mode": run_mode,
+            "continuous_loop": {
+                "enabled": continuous_loop_enabled,
+                "target_cycles": continuous_loop_cycles,
+                "completed_cycles": 0,
+                "status": "running" if continuous_loop_enabled else "disabled",
+            },
             "current_turn": 0,
             "current_stage": workflow_definition.start_stage,
             "cycle": 1,
@@ -394,6 +429,7 @@ class CycleOrchestrator:
             "profile_overrides": profile_overrides or None,
             "round_overrides": round_overrides or None,
             "prompt_overrides": sorted(override_bytes) or None,
+            "continuous_loop": state["continuous_loop"],
         })
         self._save(run_id, state)
         return run_id
@@ -982,6 +1018,7 @@ class CycleOrchestrator:
                     "command": item.command,
                     "environment": item.environment,
                     "required": item.required,
+                    "approval": item.approval(project.validation_requires_approval),
                 }
                 for item in project.validations
                 if item.environment in {"local", "either"}
@@ -1400,14 +1437,19 @@ class CycleOrchestrator:
                 pre_validation_evidence = collect_worktree_evidence(worktree)
                 assert_allowed_changes(project, pre_validation_evidence.changed_paths)
                 self._prepare_validation(state, stage, directive, pre_validation_evidence)
-                if project.validation_requires_approval and state["pending_validation"]["commands"]:
+                approval_commands = [
+                    item
+                    for item in state["pending_validation"]["commands"]
+                    if (item.get("approval") or {}).get("required")
+                ]
+                if approval_commands:
                     state["status"] = "paused"
                     state["pending_human_decision"] = "validation_execution_approval"
                     self._event(
                         state,
                         "human.gate.opened",
-                        title="Approve validation execution",
-                        details={"reason": "validation_execution_approval", "commands": state["pending_validation"]["commands"]},
+                        title="Approval required for a consequential check",
+                        details={"reason": "validation_execution_approval", "commands": approval_commands},
                     )
                     self._save(run_id, state)
                     return state
@@ -2116,9 +2158,15 @@ class CycleOrchestrator:
         if state["status"] == "created":
             state["status"] = "running"
             self._save(run_id, state)
-        while self.state(run_id)["status"] not in {"complete", "cancelled", "stopped", "paused", "failed"}:
+        while True:
+            state = self.state(run_id)
+            if state["status"] == "paused":
+                if self._auto_continue_continuous_loop(state):
+                    continue
+                return self.state(run_id)
+            if state["status"] in {"complete", "cancelled", "stopped", "failed"}:
+                return state
             self.advance(run_id)
-        return self.state(run_id)
 
     @_locked
     def recover_run(self, run_id: str) -> dict[str, Any]:
@@ -2196,6 +2244,7 @@ class CycleOrchestrator:
         reason: str,
         title: str | None = None,
         follow_up: str | None = None,
+        actor: str = "human",
     ) -> dict[str, Any]:
         decision_number = len(state["decisions"]) + 1
         relative = Path("decisions") / f"decision.{decision_number:04d}.md"
@@ -2208,17 +2257,128 @@ class CycleOrchestrator:
             "cycle": state["cycle"],
             "after_turn": state["current_turn"],
             "title": title or f"Human: {choice}",
+            "actor": actor,
         }
         if follow_up:
             record["follow_up"] = follow_up
         state["decisions"].append(record)
         self._event(
             state,
-            "human.direction" if choice == "direction" else "human.decision",
+            (
+                "automation.decision"
+                if actor == "relay"
+                else "human.direction" if choice == "direction" else "human.decision"
+            ),
             title=str(record["title"]),
             details=record,
         )
         return record
+
+    def _start_next_cycle(
+        self,
+        state: dict[str, Any],
+        proposal: dict[str, Any],
+        source_bytes: bytes,
+        *,
+        automatic: bool,
+    ) -> None:
+        current_cycle = self._cycle(state)
+        current_cycle["status"] = "complete"
+        current_cycle["end_turn"] = state["current_turn"]
+        next_number = int(state["cycle"]) + 1
+        request_path = (
+            self._run_dir(state["run_id"])
+            / "cycles"
+            / f"cycle.{next_number:04d}"
+            / "request.md"
+        )
+        request_hash = atomic_write(request_path, source_bytes)
+        state["cycle"] = next_number
+        state["cycles"].append(
+            self._new_cycle(
+                next_number,
+                request_path.relative_to(self._run_dir(state["run_id"])),
+                request_hash,
+            )
+        )
+        request_relative = str(
+            request_path.relative_to(self._run_dir(state["run_id"]))
+        ).replace("\\", "/")
+        state["artifacts"][request_relative] = {
+            "sha256": request_hash,
+            "type": "request",
+            "cycle": next_number,
+            "source_turn": proposal["id"],
+        }
+        state["current_stage"] = self._workflow(state).start_stage
+        state["status"] = "running"
+        state["next_turn_override"] = None
+        state["current_implementation_evidence"] = None
+        state["completion_receipt"] = None
+        self._event(
+            state,
+            "cycle.started",
+            title=f"Cycle {next_number}",
+            details={
+                "request": request_relative,
+                "source_proposal_turn": proposal["id"],
+                "working_revision": state["working_revision"],
+                "automatic": automatic,
+            },
+        )
+        self._pause_for_step(state)
+
+    def _auto_continue_continuous_loop(self, state: dict[str, Any]) -> bool:
+        """Accept only the next-task boundary while a bounded loop is active.
+
+        Every validation, repair, provider failure, ambiguity, and permission
+        boundary remains a normal pause.  This automation has exactly one
+        authority: use the sealed next-task proposal to begin the next cycle.
+        """
+
+        config = state.get("continuous_loop")
+        if not isinstance(config, dict) or not config.get("enabled"):
+            return False
+        if config.get("status") != "running":
+            return False
+        if state.get("status") != "paused" or state.get("pending_human_decision") != "next_task_approval":
+            return False
+        if state.get("run_mode") != "auto":
+            raise ValueError("continuous loop requires auto run mode")
+        target = int(config.get("target_cycles") or 0)
+        if target not in {3, 4, 5}:
+            raise ValueError("continuous loop target is invalid")
+        completed = int(state["cycle"])
+        config["completed_cycles"] = completed
+        if completed >= target:
+            config["status"] = "target_reached"
+            self._event(
+                state,
+                "continuous_loop.target_reached",
+                title="Continuous loop finished",
+                details={"completed_cycles": completed, "target_cycles": target},
+            )
+            self._save(state["run_id"], state)
+            return False
+        proposal = self._latest_turn(state, "next-task-proposal")
+        if proposal is None:
+            raise ValueError("continuous loop next-task proposal is missing")
+        source_bytes = self._artifact_bytes(state, f"turns/{proposal['output_file']}")
+        self._record_decision(
+            state,
+            payload=(
+                f"Relay continuous loop automatically accepted the next idea "
+                f"after cycle {completed} of {target}.\n"
+            ).encode("utf-8"),
+            choice="yes",
+            reason="next_task_approval",
+            title="Relay: continuous loop",
+            actor="relay",
+        )
+        state["pending_human_decision"] = None
+        self._start_next_cycle(state, proposal, source_bytes, automatic=True)
+        self._save(state["run_id"], state)
+        return True
 
     def _baseline_failure_follow_up(self, state: dict[str, Any]) -> bytes:
         """Turn recorded clean-base failures into exact next-task direction."""
@@ -2335,32 +2495,13 @@ class CycleOrchestrator:
             proposal = accepted_proposal
             source_bytes = accepted_proposal_bytes
             assert proposal is not None and source_bytes is not None
-            current_cycle = self._cycle(state)
-            current_cycle["status"] = "complete"
-            current_cycle["end_turn"] = state["current_turn"]
-            next_number = state["cycle"] + 1
-            request_path = self._run_dir(run_id) / "cycles" / f"cycle.{next_number:04d}" / "request.md"
-            request_hash = atomic_write(request_path, source_bytes)
-            state["cycle"] = next_number
-            state["cycles"].append(self._new_cycle(next_number, request_path.relative_to(self._run_dir(run_id)), request_hash))
-            request_relative = str(request_path.relative_to(self._run_dir(run_id))).replace("\\", "/")
-            state["artifacts"][request_relative] = {
-                "sha256": request_hash,
-                "type": "request",
-                "cycle": next_number,
-                "source_turn": proposal["id"],
-            }
-            state["current_stage"] = self._workflow(state).start_stage
-            state["status"] = "running"
-            state["next_turn_override"] = None
-            state["current_implementation_evidence"] = None
-            state["completion_receipt"] = None
-            self._event(state, "cycle.started", title=f"Cycle {next_number}", details={
-                "request": request_relative,
-                "source_proposal_turn": proposal["id"],
-                "working_revision": state["working_revision"],
-            })
-            self._pause_for_step(state)
+            loop = state.get("continuous_loop")
+            if isinstance(loop, dict) and loop.get("status") == "target_reached":
+                # The bounded automation is finished. A deliberate human
+                # extension starts one additional cycle without silently
+                # reopening unbounded auto-approval.
+                loop["status"] = "manual_extension"
+            self._start_next_cycle(state, proposal, source_bytes, automatic=False)
             self._save(run_id, state)
             return self.run_to_stop(run_id)
 

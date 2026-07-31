@@ -228,6 +228,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .project-row { display:flex; align-items:flex-end; gap:8px; }
 .project-row > label { flex:1; }
 .project-row > button { margin-bottom:2px; white-space:nowrap; }
+.continuous-loop-control { margin:0 0 18px; padding:13px 14px; border:1px solid #26384c; border-radius:11px; background:#0a141f; }
+.modal .toggle-control { flex-direction:row; align-items:flex-start; gap:11px; margin:0; color:var(--ink); cursor:pointer; }
+.modal .toggle-control input { width:18px; height:18px; flex:0 0 auto; margin:1px 0 0; padding:0; accent-color:var(--cyan); }
+.toggle-control span { display:grid; gap:4px; }
+.toggle-control strong { font-size:12px; }
+.toggle-control small { color:var(--muted); font-size:10px; line-height:1.45; }
+.continuous-loop-control > label:not(.toggle-control) { max-width:230px; margin:12px 0 0 29px; }
+.continuous-loop-control > p { margin:10px 0 0 29px; color:var(--faint); font-size:10px; line-height:1.45; }
+.continuous-loop-control.unavailable { opacity:.62; }
 .route-preflight-empty { color:var(--muted); font-size:11px; }
 .route-footnote { margin:6px 0 0; color:var(--faint); font-size:10px; }
 .route-warnings { margin:0 0 12px; padding:9px 12px; border:1px solid #6a5430; border-radius:9px; background:#241d10; color:#f4d99d; font-size:11px; display:grid; gap:4px; }
