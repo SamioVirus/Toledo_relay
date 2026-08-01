@@ -1,0 +1,6 @@
+{
+  "id": "weekly-governance",
+  "extends": "strategy-council",
+  "label": "Weekly Governance - strategy station",
+  "cadence": "weekly"
+}

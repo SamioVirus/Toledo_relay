@@ -128,13 +128,16 @@ class ProjectDefinition:
     commit_on_accept: bool = True
     allow_no_validations: bool = False
     validation_requires_approval: bool = True
+    evidence_exclude_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for item in self.instruction_files + self.write_allowlist:
+        for item in self.instruction_files + self.write_allowlist + self.evidence_exclude_paths:
             relative = Path(item)
             target = (self.root / relative).resolve()
             if relative.is_absolute() or (target != self.root and self.root not in target.parents):
                 raise ValueError(f"project path escapes root: {item}")
+        if any(not item.strip() or item.replace("\\", "/").strip("/") in {"", "."} for item in self.evidence_exclude_paths):
+            raise ValueError("evidence exclude paths must name a repository subpath")
         validation_ids: set[str] = set()
         for validation in self.validations:
             if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", validation.id):
@@ -177,6 +180,7 @@ class ProjectDefinition:
         implementation = value.get("implementation", {})
         implementation_enabled = bool(implementation.get("enabled", False))
         write_allowlist = tuple(str(item) for item in implementation.get("write_allowlist", []))
+        evidence_exclude_paths = tuple(str(item) for item in implementation.get("evidence_exclude_paths", []))
         if implementation_enabled and not write_allowlist:
             raise ValueError("implementation-enabled projects require a write allowlist")
         return cls(
@@ -190,6 +194,7 @@ class ProjectDefinition:
             commit_on_accept=bool(implementation.get("commit_on_accept", True)),
             allow_no_validations=bool(implementation.get("allow_no_validations", False)),
             validation_requires_approval=bool(implementation.get("validation_requires_approval", True)),
+            evidence_exclude_paths=evidence_exclude_paths,
         )
 
     def snapshot(self) -> dict[str, Any]:
@@ -213,6 +218,7 @@ class ProjectDefinition:
                 "commit_on_accept": self.commit_on_accept,
                 "allow_no_validations": self.allow_no_validations,
                 "validation_requires_approval": self.validation_requires_approval,
+                "evidence_exclude_paths": list(self.evidence_exclude_paths),
             },
         }
 
@@ -296,6 +302,7 @@ class ProjectDefinition:
             "commit_on_accept": self.commit_on_accept,
             "allow_no_validations": self.allow_no_validations,
             "validation_requires_approval": self.validation_requires_approval,
+            "evidence_exclude_paths": list(self.evidence_exclude_paths),
             "validations": [
                 {
                     "id": item.id,

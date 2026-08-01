@@ -71,14 +71,20 @@
       <p id="project-facts" class="settings-hint" hidden></p>
       <div id="project-host"></div>
       <label>Workflow<select id="new-workflow"></select></label>
+      <section class="workflow-stack-control" aria-labelledby="workflow-stack-title">
+        <div class="workflow-stack-head"><div><p class="eyebrow">STACK</p><h3 id="workflow-stack-title">Layer workflows</h3></div><span id="workflow-stack-summary"></span></div>
+        <div id="workflow-stack-list" class="workflow-stack-list"></div>
+        <div class="workflow-stack-add"><select id="new-workflow-add" aria-label="Workflow to add to stack"></select><button type="button" class="quiet-button" id="workflow-stack-add">Add layer</button></div>
+        <p class="route-footnote">Layers run in order on the same isolated worktree. Cadence rails connect adjacent weekly &lt;-&gt; daily &lt;-&gt; hourly stations. Each layer closes at its next-task gate before the next one starts; the handoff and evidence remain sealed.</p>
+      </section>
       <label>Run mode<select id="new-run-mode"><option value="auto">Auto — continue until a decision is needed</option><option value="step">Pause after each turn</option></select></label>
       <section class="continuous-loop-control" aria-labelledby="continuous-loop-title">
         <label class="toggle-control">
           <input type="checkbox" id="new-continuous-loop">
-          <span><strong id="continuous-loop-title">Continuous loop</strong><small>Automatically approve each generated next idea and begin another full cycle.</small></span>
+          <span><strong id="continuous-loop-title">Continuous loop</strong><small>Automatically take safe recommended approvals and run each full cycle.</small></span>
         </label>
         <label id="continuous-loop-count" hidden>Stop after<select id="new-continuous-loop-cycles"><option value="3">3 complete cycles</option><option value="4">4 complete cycles</option><option value="5">5 complete cycles</option></select></label>
-        <p id="continuous-loop-note">Off — Relay stops for your approval before starting the next idea.</p>
+        <p id="continuous-loop-note">Off — Relay pauses at approval points between completed work and the next idea.</p>
       </section>
       <section class="route-preflight" aria-labelledby="route-preflight-title">
         <div class="route-preflight-head"><div><p class="eyebrow">ROUTE</p><h3 id="route-preflight-title">Who acts, reviews, and loops</h3></div><div class="route-preflight-tools"><span id="route-preflight-summary"></span><button type="button" class="quiet-button" id="catalog-toggle">Model catalog</button></div></div>

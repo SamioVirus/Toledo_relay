@@ -7,6 +7,13 @@
     "write_allowlist": [
       "."
     ],
+    "evidence_exclude_paths": [
+      ".relay-tmp",
+      ".pytest-tmp-codex",
+      "t",
+      "d",
+      "r"
+    ],
     "commit_on_accept": true,
     "allow_no_validations": false,
     "validation_requires_approval": true

@@ -22,6 +22,7 @@ let pollCount = 0;
 let lastHeadSignature = null;
 let railReturnFocus = null;
 let defaultsSavedFlash = null;
+let launchWorkflowStack = [];
 const promptPreviewCache = new Map();
 const gateDrafts = new Map();
 const openQuickTakes = new Set();
@@ -138,6 +139,9 @@ function renderRunList(runs) {
     button.className = `run-item ${run.run_id === currentRunId ? "active" : ""}`;
     const status = run.worker?.active ? "running" : run.status;
     const loop = run.continuous_loop;
+    const stack = Array.isArray(run.workflow_stack) ? run.workflow_stack : [];
+    const stackProgress = stack.length > 1 ? `stack ${Number(run.workflow_stack_index || 0) + 1}/${stack.length}` : "";
+    if (stackProgress) button.title = stackProgress;
     const loopProgress = loop?.enabled ? ` · loop ${run.cycle || 1}/${loop.target_cycles}` : "";
     button.innerHTML = `<div class="run-item-top"><strong>${escapeHtml(run.project)}</strong><span class="status-pill ${escapeHtml(status)}">${escapeHtml(runStatusLabel(status))}</span></div><p>${escapeHtml(run.workflow)}${escapeHtml(loopProgress)} · ${run.current_turn || 0} turns · ${escapeHtml(compactId(run.run_id))}</p>`;
     button.addEventListener("click", () => selectRun(run.run_id));
@@ -265,7 +269,10 @@ function renderRun() {
   const loopStatus = loop?.enabled
     ? `<span>loop ${Math.min(Number(state.cycle || 1), Number(loop.target_cycles || 1))}/${Number(loop.target_cycles || 1)}${loop.status === "target_reached" ? " complete" : ""}</span>`
     : "";
-  strip.innerHTML = `<span>${escapeHtml(runStatusLabel(state.status))}</span>${loopStatus}<span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
+  const stack = Array.isArray(state.workflow_stack) ? state.workflow_stack : [];
+  const cadencePath = (state.cadence_backbone?.stations || []).map((station) => station.cadence).filter(Boolean).join(" → ");
+  const stackStatus = stack.length > 1 ? `<span>stack ${Number(state.workflow_stack_index || 0) + 1}/${stack.length}${cadencePath ? ` · ${escapeHtml(cadencePath)}` : ""}</span>` : "";
+  strip.innerHTML = `<span>${escapeHtml(runStatusLabel(state.status))}</span>${loopStatus}${stackStatus}<span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
   $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(runStatusLabel(state.status).toUpperCase())}</p><h2>${escapeHtml(heading || "Project completed")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span><button class="quiet-button run-action" id="export-run" title="Download the full conversation and transport prompts as plain text">Export plain text</button><button class="quiet-button run-action" id="copy-run" title="Copy the same full plain-text conversation">Copy all</button>${canRecover ? '<button class="accept-button run-action" id="recover-run">Recover run</button>' : ''}</div>`;
   $("#export-run")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
@@ -551,7 +558,7 @@ function humanDecisionNode(decision, index) {
   const actor = decision.actor === "relay" ? "Relay" : "You";
   const reason = decision.actor === "relay"
     ? "Next idea auto-approved"
-    : decisionReasonLabel(decision.reason, decision.choice);
+    : decisionReasonLabel(decision.reason, decision.choice, decision);
   button.innerHTML = `<span class="decision-choice">${actor} · ${escapeHtml(decisionChoiceLabel(decision))}</span><span class="decision-reason">${escapeHtml(reason)}</span><span class="decision-preview">Open stored direction</span>`;
   button.addEventListener("click", () => openDecision(decision, index));
   row.append(button);
@@ -623,7 +630,7 @@ async function openDecision(decision, index) {
   inspectorPayload = {direction:content, metadata:JSON.stringify(decision, null, 2)};
   setDirectionTabLabel("Owner direction");
   $("#inspector-kicker").textContent = `HUMAN DIRECTION · ${String(index + 1).padStart(2, "0")}`;
-  $("#inspector-title").textContent = decisionReasonLabel(decision.reason, decision.choice);
+  $("#inspector-title").textContent = decisionReasonLabel(decision.reason, decision.choice, decision);
   $("#inspector-meta").innerHTML = `<span class="chip">${escapeHtml(decisionChoiceLabel(decision))}</span><span class="chip">cycle ${escapeHtml(decision.cycle)}</span><span class="chip">after turn ${escapeHtml(decision.after_turn)}</span>`;
   openInspector("direction");
 }
@@ -1076,6 +1083,13 @@ function gatePresentation(state) {
     directionLabel: "Direction",
     send: "Send direction",
   };
+  const stackRemaining = Array.isArray(state.workflow_stack)
+    && Number(state.workflow_stack_index || 0) + 1 < state.workflow_stack.length;
+  if (stackRemaining && reason === "next_task_approval") {
+    model.title = "Layer complete — continue the stack?";
+    model.summary = `The ${state.workflow || "current"} layer is sealed. Continue with layer ${Number(state.workflow_stack_index || 0) + 2} of ${state.workflow_stack.length}, or revise this layer's proposal.`;
+    model.no = "Continue to next layer";
+  }
   const workflow = state.workflow_snapshot || bootstrap?.workflows?.[state.workflow] || {};
   const atNextTask = [workflow.next_task_stage, workflow.next_task_revision_stage]
     .filter(Boolean)
@@ -1092,9 +1106,11 @@ function gatePresentation(state) {
     ));
   if (canCompleteProject && reason === "operator_step") {
     model.title = "Your change is committed";
-    model.summary = "Choose what to build next, or complete the project here.";
+    model.summary = stackRemaining
+      ? "Choose what to build next, or continue to the next workflow layer here."
+      : "Choose what to build next, or complete the project here.";
     model.yes = "Choose next build";
-    model.complete = {label: "Complete project"};
+    model.complete = {label: stackRemaining ? "Continue to next layer" : "Complete project"};
     model.compactOptions = true;
     model.stop = false;
     model.note = null;
@@ -1222,7 +1238,10 @@ function humanizeReason(reason) {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-function decisionReasonLabel(reason, choice = null) {
+function decisionReasonLabel(reason, choice = null, decision = null) {
+  if (reason === "next_task_approval" && choice === "no" && String(decision?.title || "").includes("advance workflow stack")) {
+    return "Workflow layer advanced";
+  }
   if (choice === "complete" || (reason === "next_task_approval" && choice === "no")) {
     return "Project completed";
   }
@@ -1236,10 +1255,56 @@ function decisionReasonLabel(reason, choice = null) {
 }
 
 function decisionChoiceLabel(decision) {
+  if (decision.reason === "next_task_approval" && decision.choice === "no" && String(decision.title || "").includes("advance workflow stack")) {
+    return "Next layer";
+  }
   if (decision.choice === "complete" || (decision.reason === "next_task_approval" && decision.choice === "no")) {
     return "Complete";
   }
   return ({yes: "Continue", no: "Stop", other: "Direction", direction: "Direction"})[decision.choice] || "Decision";
+}
+
+function renderWorkflowStack() {
+  const list = $("#workflow-stack-list");
+  const add = $("#new-workflow-add");
+  const summary = $("#workflow-stack-summary");
+  if (!list || !add || !summary) return;
+  const valid = Object.entries(bootstrap?.workflows || {});
+  const byId = Object.fromEntries(valid);
+  if (!launchWorkflowStack.length || !byId[launchWorkflowStack[0]]) {
+    const fallback = byId["continuous-development"] ? "continuous-development" : valid[0]?.[0];
+    launchWorkflowStack = fallback ? [fallback] : [];
+  }
+  launchWorkflowStack = launchWorkflowStack.filter((id, index) => byId[id] && launchWorkflowStack.indexOf(id) === index);
+  const cadencePath = launchWorkflowStack.map((id) => byId[id]?.cadence).filter(Boolean).join(" → ");
+  list.innerHTML = launchWorkflowStack.map((id, index) => {
+    const workflow = byId[id] || {};
+    const controls = index === 0
+      ? '<span class="workflow-stack-actions"><span class="chip">entry</span></span>'
+      : `<span class="workflow-stack-actions"><button type="button" class="quiet-button" data-stack-up="${escapeHtml(String(index))}" aria-label="Move layer up">↑</button><button type="button" class="quiet-button" data-stack-down="${escapeHtml(String(index))}" aria-label="Move layer down">↓</button><button type="button" class="quiet-button" data-stack-remove="${escapeHtml(String(index))}" aria-label="Remove layer">×</button></span>`;
+    return `<div class="workflow-stack-item"><span class="workflow-stack-index">${String(index + 1).padStart(2, "0")}</span><div><strong>${escapeHtml(workflow.label || id)}</strong><small>${escapeHtml(id)} · ${Object.keys(workflow.stages || {}).length} stages</small></div>${controls}</div>`;
+  }).join("");
+  const available = valid.filter(([id]) => !launchWorkflowStack.includes(id));
+  add.innerHTML = available.length
+    ? available.map(([id, workflow]) => `<option value="${escapeHtml(id)}">${escapeHtml(workflow.label || id)}</option>`).join("")
+    : '<option value="">All workflows are stacked</option>';
+  add.disabled = !available.length;
+  $("#workflow-stack-add").disabled = !available.length;
+  summary.textContent = `${launchWorkflowStack.length} layer${launchWorkflowStack.length === 1 ? "" : "s"}${cadencePath ? ` · ${cadencePath}` : ""}`;
+  $$("[data-stack-up]", list).forEach((button) => button.addEventListener("click", () => {
+    const index = Number(button.dataset.stackUp);
+    if (index > 1) [launchWorkflowStack[index - 1], launchWorkflowStack[index]] = [launchWorkflowStack[index], launchWorkflowStack[index - 1]];
+    renderWorkflowStack();
+  }));
+  $$("[data-stack-down]", list).forEach((button) => button.addEventListener("click", () => {
+    const index = Number(button.dataset.stackDown);
+    if (index >= 1 && index < launchWorkflowStack.length - 1) [launchWorkflowStack[index], launchWorkflowStack[index + 1]] = [launchWorkflowStack[index + 1], launchWorkflowStack[index]];
+    renderWorkflowStack();
+  }));
+  $$("[data-stack-remove]", list).forEach((button) => button.addEventListener("click", () => {
+    launchWorkflowStack.splice(Number(button.dataset.stackRemove), 1);
+    renderWorkflowStack();
+  }));
 }
 
 function populateNewRun() {
@@ -1251,7 +1316,11 @@ function populateNewRun() {
   const initialWorkflow = bootstrap.workflows?.[selectedWorkflow]
     ? selectedWorkflow
     : (bootstrap.workflows?.["continuous-development"] ? "continuous-development" : Object.keys(bootstrap.workflows || {})[0]);
-  if (initialWorkflow) $("#new-workflow").value = initialWorkflow;
+  if (initialWorkflow) {
+    $("#new-workflow").value = initialWorkflow;
+    if (!launchWorkflowStack.length || !bootstrap.workflows?.[launchWorkflowStack[0]]) launchWorkflowStack = [initialWorkflow];
+  }
+  renderWorkflowStack();
   renderProjectFacts();
   renderNewRunPreflight();
   syncContinuousLoopControls();
@@ -1268,7 +1337,7 @@ function syncContinuousLoopControls() {
     ? "Available in Auto mode — step mode still pauses after every agent turn."
     : toggle.checked
       ? `Relay will run ${cycles} complete idea → build → audit cycles, then stop with the next idea ready. Safety, failure, and permission gates still stop immediately.`
-      : "Off — Relay stops for your approval before starting the next idea.";
+      : "Off — Relay pauses at approval points between completed work and the next idea.";
   $(".continuous-loop-control").classList.toggle("unavailable", !autoMode);
 }
 
@@ -1861,14 +1930,15 @@ function showProjectForm() {
   const form = document.createElement("article");
   form.id = "project-add-form";
   form.className = "project-card";
-  form.innerHTML = `<label>ID<input data-field="id" placeholder="my-repo"></label><label>Repository root<input data-field="root" placeholder="C:\\src\\my-repo"></label><label>Instruction files<input data-field="instructions" placeholder="AGENTS.md, docs/plan.md"></label><label>Implementation write paths<input data-field="write-paths" value="." placeholder="src, tests, docs"></label><label>Local project check (routine checks run automatically)<input data-field="validation" value="python -m pytest -q" placeholder="python -m pytest -q"></label><button type="button" class="primary-button">Save repository</button>`;
+  form.innerHTML = `<label>ID<input data-field="id" placeholder="my-repo"></label><label>Repository root<input data-field="root" placeholder="C:\\src\\my-repo"></label><label>Instruction files<input data-field="instructions" placeholder="AGENTS.md, docs/plan.md"></label><label>Implementation write paths<input data-field="write-paths" value="." placeholder="src, tests, docs"></label><label>Disposable evidence paths<input data-field="evidence-excludes" value=".relay-tmp" placeholder=".relay-tmp, test-output"></label><label>Local project check (routine checks run automatically)<input data-field="validation" value="python -m pytest -q" placeholder="python -m pytest -q"></label><button type="button" class="primary-button">Save repository</button>`;
   $("button", form).addEventListener("click", async () => {
     const id = $('[data-field="id"]',form).value.trim();
     const root = $('[data-field="root"]',form).value.trim();
     const instructions = $('[data-field="instructions"]',form).value.split(",").map((value)=>value.trim()).filter(Boolean);
     const writePaths = $('[data-field="write-paths"]',form).value.split(",").map((value)=>value.trim()).filter(Boolean);
+    const evidenceExcludes = $('[data-field="evidence-excludes"]',form).value.split(",").map((value)=>value.trim()).filter(Boolean);
     const validation = $('[data-field="validation"]',form).value.trim();
-    const payload = {id,root,read_only:true,instruction_files:instructions,validations:[{id:"local-checks",environment:"local",command:validation,required:true}],implementation:{enabled:true,write_allowlist:writePaths,commit_on_accept:true,allow_no_validations:false,validation_requires_approval:true}};
+    const payload = {id,root,read_only:true,instruction_files:instructions,validations:[{id:"local-checks",environment:"local",command:validation,required:true}],implementation:{enabled:true,write_allowlist:writePaths,evidence_exclude_paths:evidenceExcludes,commit_on_accept:true,allow_no_validations:false,validation_requires_approval:true}};
     try {
       await api("/api/project",{method:"POST",body:JSON.stringify(payload)});
       await loadBootstrap();
@@ -1896,7 +1966,8 @@ async function createRun() {
       enabled: $("#new-continuous-loop").checked,
       target_cycles: Number($("#new-continuous-loop-cycles").value),
     };
-    const result = await api("/api/runs", {method:"POST",body:JSON.stringify({project:$("#new-project").value,workflow:workflowId,run_mode:$("#new-run-mode").value,continuous_loop:continuousLoop,request,...adjustments})});
+    if (!launchWorkflowStack.length || launchWorkflowStack[0] !== workflowId) launchWorkflowStack = [workflowId, ...launchWorkflowStack.filter((id) => id !== workflowId)];
+    const result = await api("/api/runs", {method:"POST",body:JSON.stringify({project:$("#new-project").value,workflow:workflowId,workflow_stack:launchWorkflowStack,run_mode:$("#new-run-mode").value,continuous_loop:continuousLoop,request,...adjustments})});
     $("#new-run-dialog").close();
     $("#new-request").value = "";
     $("#new-continuous-loop").checked = false;
@@ -1932,6 +2003,8 @@ async function saveWorkflowAs() {
     stagePromptCache.clear();
     await loadBootstrap();
     $("#new-workflow").value = saved.id;
+    launchWorkflowStack = [saved.id, ...launchWorkflowStack.filter((value) => value !== base && value !== saved.id)];
+    renderWorkflowStack();
     renderNewRunPreflight();
     nameInput.value = "";
     $("#workflow-saveas-form").hidden = true;
@@ -2012,7 +2085,19 @@ function bindStaticEvents() {
   $("#new-run-mode").addEventListener("change", syncContinuousLoopControls);
   $("#new-continuous-loop").addEventListener("change", syncContinuousLoopControls);
   $("#new-continuous-loop-cycles").addEventListener("change", syncContinuousLoopControls);
-  $("#new-workflow").addEventListener("change", () => { clearLaunchAdjustments(); showNewRunError(""); renderNewRunPreflight(); });
+  $("#new-workflow").addEventListener("change", () => {
+    clearLaunchAdjustments();
+    showNewRunError("");
+    if (!launchWorkflowStack.length) launchWorkflowStack = [$("#new-workflow").value];
+    else launchWorkflowStack[0] = $("#new-workflow").value;
+    renderWorkflowStack();
+    renderNewRunPreflight();
+  });
+  $("#workflow-stack-add").addEventListener("click", () => {
+    const id = $("#new-workflow-add").value;
+    if (id && !launchWorkflowStack.includes(id)) launchWorkflowStack.push(id);
+    renderWorkflowStack();
+  });
   $("#workflow-saveas-toggle").addEventListener("click", () => {
     const form = $("#workflow-saveas-form");
     form.hidden = !form.hidden;

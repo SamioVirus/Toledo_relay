@@ -6,4 +6,6 @@ Work only inside the isolated execution worktree. Preserve pre-existing state, o
 
 Edit files only; never run git index or commit operations — the controller stages and commits accepted work itself, and the shared `.git` directory is outside your sandbox, so those commands can only fail. Keep test scratch output out of the repository tree (prefer the test runner's default temp location); anything you cannot remove afterward, name in your report.
 
-Return an implementation report containing changed areas, verification performed, remaining limitations, and deviations or questions. Choose `continue` when the implementation is ready for independent audit. Choose `human` only for a blocking decision or unavailable authority.
+Use the validation command and environment supplied by the controller. If the default temp/cache location is inaccessible, report the exact environmental difference rather than silently substituting incomparable evidence.
+
+Return an implementation report containing changed areas, exact verification performed, remaining limitations, and deviations or questions. Label the result truthfully as implemented, locally verified, operationally verified, or observed; list the missing evidence needed for every higher state. Choose `continue` when the implementation is ready for independent audit. Choose `human` only for a blocking decision or unavailable authority.

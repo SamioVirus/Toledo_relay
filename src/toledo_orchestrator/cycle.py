@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -14,6 +15,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
 
 from .catalog import load_catalog, validate_selection
+from .cadence import (
+    build_backbone,
+    build_handoff,
+    complete_station,
+    record_handoff,
+    validate_cadence_path,
+    verify_recorded_handoff,
+)
 from .core import (
     ClaudeAdapter,
     CodexAdapter,
@@ -71,6 +80,9 @@ from .worktree import (
 
 
 T = TypeVar("T")
+PROMPT_ARTIFACT_LIMIT = 2_000_000
+INLINE_EVIDENCE_PATH_LIMIT = 200
+INLINE_EVIDENCE_HASH_LIMIT = 50
 
 
 def _locked(method: Callable[..., T]) -> Callable[..., T]:
@@ -173,6 +185,13 @@ class CycleOrchestrator:
             raise ValueError(f"project definition is unavailable: {state['project']}")
         return project
 
+    def _collect_worktree_evidence(self, state: dict[str, Any]):
+        project = self._project(state)
+        return collect_worktree_evidence(
+            Path(state["execution_worktree"]),
+            project.evidence_exclude_paths,
+        )
+
     def _profile(self, state: dict[str, Any], profile_id: str, override: dict[str, Any] | None = None) -> ProfileDefinition:
         if override and isinstance(override.get("profile_value"), dict):
             return ProfileDefinition.from_value(profile_id, override["profile_value"])
@@ -245,12 +264,63 @@ class CycleOrchestrator:
                 values.add(str(turn["session_id"]))
         return values
 
+    def _seal_prompt_library(
+        self,
+        run_dir: Path,
+        prompt_library: dict[str, dict[str, str]],
+        workflow: WorkflowDefinition,
+        *,
+        override_bytes: dict[str, bytes] | None = None,
+        path_prefix: str | None = None,
+    ) -> None:
+        """Snapshot one workflow's instructions into the run manifest.
+
+        A stack changes the active workflow at an explicit layer boundary. The
+        current prompt name remains addressable by ``_prompt_file`` while old
+        records stay in the manifest under a namespaced key, so historical
+        turns remain inspectable and hash-verifiable.
+        """
+        prompt_names = {
+            "orchestrator-law.md",
+            "strict-contract.md",
+            *(stage.prompt_file for stage in workflow.stages.values()),
+            *(
+                fragment
+                for stage in workflow.stages.values()
+                for fragment in stage.direction.values()
+            ),
+        }
+        for prompt_name in sorted(prompt_names):
+            if override_bytes and prompt_name in override_bytes:
+                data = override_bytes[prompt_name]
+                source_label = "operator-override"
+            else:
+                source = self._prompt_source(workflow, prompt_name)
+                data = source.read_bytes()
+                source_label = str(source.resolve())
+            relative = Path("prompt-library")
+            if path_prefix:
+                relative /= path_prefix
+            relative /= prompt_name
+            digest = atomic_write(run_dir / relative, data)
+            key = prompt_name if not path_prefix else f"{path_prefix}:{prompt_name}"
+            prompt_library[key] = {
+                "path": str(relative).replace("\\", "/"),
+                "sha256": digest,
+                "source": source_label,
+            }
+            if path_prefix:
+                # The active workflow is always retrieved by the bare prompt
+                # filename. Keep the namespaced record as history as well.
+                prompt_library[prompt_name] = prompt_library[key]
+
     def create_run(
         self,
         request: bytes,
         project: str,
         workflow: str = "continuous-development",
         *,
+        workflow_stack: list[str] | None = None,
         run_mode: str = "auto",
         profile_overrides: dict[str, dict[str, Any]] | None = None,
         round_overrides: dict[str, Any] | None = None,
@@ -273,8 +343,31 @@ class CycleOrchestrator:
             raise ValueError("continuous loop requires auto run mode")
         if project not in self.projects:
             raise ValueError(f"unknown project: {project}")
-        if workflow not in self.workflows:
-            raise ValueError(f"unknown continuous workflow: {workflow}")
+        if workflow_stack is None:
+            stack = [workflow]
+        else:
+            if not isinstance(workflow_stack, list) or not workflow_stack:
+                raise ValueError("workflow_stack must be a non-empty list")
+            stack = [str(item).strip() for item in workflow_stack]
+            if any(not item for item in stack):
+                raise ValueError("workflow_stack entries must be non-empty")
+            if len(stack) > 8:
+                raise ValueError("workflow_stack cannot contain more than 8 layers")
+            if len(set(stack)) != len(stack):
+                raise ValueError("workflow_stack cannot repeat a workflow")
+            if workflow != "continuous-development" and workflow != stack[0]:
+                raise ValueError("workflow must match the first workflow_stack layer")
+            workflow = stack[0]
+        if any(item not in self.workflows for item in stack):
+            unknown = next(item for item in stack if item not in self.workflows)
+            raise ValueError(f"unknown workflow in workflow_stack: {unknown}")
+        stack_definitions = [self.workflows[item] for item in stack]
+        if len(stack_definitions) > 1:
+            validate_cadence_path(definition.cadence for definition in stack_definitions)
+        cadence_backbone = build_backbone(
+            (workflow_id, definition.cadence)
+            for workflow_id, definition in zip(stack, stack_definitions)
+        )
         project_definition = self.projects[project]
         project_check = project_definition.check()
         if project_check.get("dirty"):
@@ -321,16 +414,6 @@ class CycleOrchestrator:
             # from_value re-validates the whole adjusted workflow, including the
             # rule that stages sharing a session slot keep one provider.
             workflow_definition = WorkflowDefinition.from_value(value)
-        prompt_names = {
-            "orchestrator-law.md",
-            "strict-contract.md",
-            *(stage.prompt_file for stage in workflow_definition.stages.values()),
-            *(
-                fragment
-                for stage in workflow_definition.stages.values()
-                for fragment in stage.direction.values()
-            ),
-        }
         stage_prompt_files = {stage.prompt_file for stage in workflow_definition.stages.values()}
         override_bytes = validate_prompt_overrides(prompt_overrides, stage_prompt_files)
         # Every override is validated above; only now does the run leave a trace
@@ -342,29 +425,27 @@ class CycleOrchestrator:
         execution_worktree = self.runtime_dir / "worktrees" / run_id
         execution_branch = f"codex/orchestrator/{run_id}"
         prompt_library: dict[str, dict[str, str]] = {}
-        for prompt_name in sorted(prompt_names):
-            if prompt_name in override_bytes:
-                # A per-run instruction edit is sealed into the run's own
-                # prompt library; the configured prompt files are untouched.
-                data = override_bytes[prompt_name]
-                source_label = "operator-override"
-            else:
-                source = self._prompt_source(workflow_definition, prompt_name)
-                data = source.read_bytes()
-                source_label = str(source.resolve())
-            relative = Path("prompt-library") / prompt_name
-            digest = atomic_write(run_dir / relative, data)
-            prompt_library[prompt_name] = {
-                "path": str(relative).replace("\\", "/"),
-                "sha256": digest,
-                "source": source_label,
-            }
+        self._seal_prompt_library(
+            run_dir,
+            prompt_library,
+            workflow_definition,
+            override_bytes=override_bytes,
+        )
+        workflow_snapshots = {
+            layer_id: self.workflows[layer_id].snapshot()
+            for layer_id in stack
+        }
+        workflow_snapshots[workflow] = workflow_definition.snapshot()
         state: dict[str, Any] = {
             "schema_version": "toledo_orchestrator.run.v2",
             "run_id": run_id,
             "project": project,
             "workflow": workflow,
             "workflow_snapshot": workflow_definition.snapshot(),
+            "workflow_stack": stack,
+            "workflow_stack_index": 0,
+            "workflow_stack_snapshots": workflow_snapshots,
+            "cadence_backbone": cadence_backbone,
             "project_snapshot": project_definition.snapshot(),
             "prompt_library": prompt_library,
             "project_root": str(project_definition.root),
@@ -378,6 +459,7 @@ class CycleOrchestrator:
                 "enabled": continuous_loop_enabled,
                 "target_cycles": continuous_loop_cycles,
                 "completed_cycles": 0,
+                "station_base_cycle": 0,
                 "status": "running" if continuous_loop_enabled else "disabled",
             },
             "current_turn": 0,
@@ -411,6 +493,7 @@ class CycleOrchestrator:
             "abandoned_validations": [],
             "errors": [],
             "degraded": False,
+            "stack_handoff": None,
         }
         self._save(run_id, state)
         try:
@@ -423,6 +506,7 @@ class CycleOrchestrator:
         self._event(state, "run.created", title="Run created", details={
             "project": project,
             "workflow": workflow,
+            "workflow_stack": stack,
             "source_revision": source_revision,
             "execution_worktree": str(execution_worktree),
             "execution_branch": execution_branch,
@@ -618,9 +702,57 @@ class CycleOrchestrator:
 
     def _artifact_text(self, state: dict[str, Any], relative: str) -> str:
         data = self._artifact_bytes(state, relative)
-        if len(data) > 2_000_000:
+        if len(data) > PROMPT_ARTIFACT_LIMIT:
             raise ValueError(f"artifact exceeds the prompt transport limit: {relative}:{len(data)}")
         return decode_text_artifact(data, relative)
+
+    def _implementation_evidence_context(
+        self,
+        state: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> str:
+        """Pack review evidence without discarding or rewriting authoritative data."""
+
+        metadata = dict(evidence)
+        changed_paths = list(metadata.get("changed_paths") or [])
+        file_hashes = list(metadata.get("file_hashes") or [])
+        if len(changed_paths) > INLINE_EVIDENCE_PATH_LIMIT:
+            roots: dict[str, int] = {}
+            for path in changed_paths:
+                root = str(path).replace("\\", "/").split("/", 1)[0]
+                roots[root] = roots.get(root, 0) + 1
+            metadata["changed_paths"] = changed_paths[:INLINE_EVIDENCE_PATH_LIMIT]
+            metadata["changed_paths_summary"] = {
+                "total": len(changed_paths),
+                "inline": INLINE_EVIDENCE_PATH_LIMIT,
+                "omitted": len(changed_paths) - INLINE_EVIDENCE_PATH_LIMIT,
+                "top_level_paths": dict(sorted(roots.items())),
+            }
+        if len(file_hashes) > INLINE_EVIDENCE_HASH_LIMIT:
+            metadata["file_hashes"] = file_hashes[:INLINE_EVIDENCE_HASH_LIMIT]
+            metadata["file_hashes_summary"] = {
+                "total": len(file_hashes),
+                "inline": INLINE_EVIDENCE_HASH_LIMIT,
+                "omitted": len(file_hashes) - INLINE_EVIDENCE_HASH_LIMIT,
+                "note": "The sealed run record retains every hash.",
+            }
+        summary = json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True)
+        patch_record = evidence.get("patch") or {}
+        patch_path = str(patch_record.get("path") or "")
+        if not patch_path:
+            return summary
+        patch = self._artifact_bytes(state, patch_path)
+        if len(patch) <= PROMPT_ARTIFACT_LIMIT:
+            return summary + "\n\n# Exact patch\n" + decode_text_artifact(patch, patch_path)
+        return (
+            summary
+            + "\n\n# Exact patch (verified, stored out of line)\n"
+            + f"The sealed patch is {len(patch)} bytes, above the {PROMPT_ARTIFACT_LIMIT}-byte inline transport budget. "
+            + f"Its SHA-256 is {patch_record.get('sha256')}. No content was summarized or discarded in storage.\n"
+            + f"Inspect the authoritative worktree directly: {state['execution_worktree']}\n"
+            + "Use `git diff --binary HEAD --` for the exact current patch and `git status --short` for its paths. "
+            + "The controller will verify that exact worktree against the sealed hash again before acceptance."
+        )
 
     def _context_section(
         self,
@@ -662,11 +794,67 @@ class CycleOrchestrator:
             evidence = state.get("current_implementation_evidence")
             if not evidence:
                 return "Implementation evidence", "None."
-            summary = json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True)
-            patch = evidence.get("patch", {}).get("path")
-            if patch:
-                summary += "\n\n# Exact patch\n" + self._artifact_text(state, patch)
-            return "Implementation evidence", summary
+            return "Implementation evidence", self._implementation_evidence_context(state, evidence)
+        if token == "stack-handoff":
+            handoff = state.get("stack_handoff")
+            if not isinstance(handoff, dict):
+                return "Previous workflow layer", "None. This is the first layer in the run."
+            lines = [
+                f"Previous layer: {handoff.get('workflow') or 'unknown'}",
+                f"Completed cycle: {handoff.get('cycle') or 'unknown'}",
+                f"Accepted revision: {handoff.get('working_revision') or 'unknown'}",
+            ]
+            if handoff.get("source_cadence") and handoff.get("target_cadence"):
+                lines.append(
+                    "Cadence rail: "
+                    f"{handoff['source_cadence']} → {handoff['target_cadence']} "
+                    f"({handoff.get('direction') or 'adjacent'})"
+                )
+            cadence_handoff_file = handoff.get("cadence_handoff_file")
+            cadence_handoff_sha256 = handoff.get("cadence_handoff_sha256")
+            if bool(cadence_handoff_file) != bool(cadence_handoff_sha256):
+                raise ValueError("cadence handoff artifact reference is incomplete")
+            if cadence_handoff_file:
+                cadence_text = self._artifact_text(state, str(cadence_handoff_file))
+                try:
+                    cadence_packet = json.loads(cadence_text)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("cadence handoff artifact is not valid JSON") from exc
+                if not isinstance(cadence_packet, dict):
+                    raise ValueError("cadence handoff artifact must contain an object")
+                backbone = state.get("cadence_backbone")
+                if not isinstance(backbone, dict):
+                    raise ValueError("cadence handoff artifact has no persisted backbone")
+                verified_packet = verify_recorded_handoff(
+                    backbone,
+                    cadence_packet,
+                    artifact_file=str(cadence_handoff_file),
+                    artifact_sha256=str(cadence_handoff_sha256),
+                )
+                for field, expected in verified_packet.items():
+                    if handoff.get(field) != expected:
+                        raise ValueError(
+                            f"cadence handoff projection does not match sealed field: {field}"
+                        )
+                lines.append(
+                    "Verified cadence handoff artifact: "
+                    f"{cadence_handoff_file} "
+                    f"(sha256 {cadence_handoff_sha256})"
+                )
+            for label, key in (("Completion receipt", "completion_receipt"), ("Approved handoff", "approved_handoff")):
+                relative = handoff.get(key)
+                if not relative:
+                    lines.append(f"{label}: None")
+                    continue
+                try:
+                    lines.append(f"{label} ({relative}):\n{self._artifact_text(state, str(relative))}")
+                except (OSError, ValueError):
+                    lines.append(f"{label}: stored at {relative}; inspect the sealed artifact directly")
+            lines.append(
+                "Treat this as prior evidence, not as permission to assume the next layer is complete. "
+                "Re-derive the current layer's claim from the repository and the sealed artifacts."
+            )
+            return "Previous workflow layer", "\n".join(lines)
         return None
 
     def _compose_direction_text(self, state: dict[str, Any], stage: StageDefinition) -> str:
@@ -719,6 +907,13 @@ class CycleOrchestrator:
                 "Follow these instruction files before acting:\n"
                 + "\n".join(f"- {item}" for item in project.instruction_files)
             )
+            if project.evidence_exclude_paths:
+                sections.append(
+                    "# Disposable validation workspace\n"
+                    "The following repository-relative paths are excluded from implementation evidence only while untracked. "
+                    "Use them for disposable test/runtime output when an in-worktree scratch path is required; never place source work there:\n"
+                    + "\n".join(f"- {item}" for item in project.evidence_exclude_paths)
+                )
             abandoned = state.get("abandoned_invocations") or []
             if abandoned:
                 sections.append(
@@ -1037,7 +1232,7 @@ class CycleOrchestrator:
         identity_error = self._worktree_identity_error(state)
         if identity_error:
             raise ValueError(identity_error)
-        current = collect_worktree_evidence(worktree)
+        current = self._collect_worktree_evidence(state)
         assert_allowed_changes(project, current.changed_paths)
         expected = pending["pre_validation_evidence"]
         if sha256(current.patch) != expected["patch"]["sha256"] or list(current.changed_paths) != list(expected["changed_paths"]):
@@ -1073,7 +1268,7 @@ class CycleOrchestrator:
         identity_error = self._worktree_identity_error(state)
         if identity_error:
             raise ValueError(f"validation changed worktree identity: {identity_error}")
-        evidence = collect_worktree_evidence(worktree)
+        evidence = self._collect_worktree_evidence(state)
         assert_allowed_changes(project, evidence.changed_paths)
         sealed = seal_worktree_evidence(
             self._run_dir(state["run_id"]), state["cycle"], int(pending["turn"]), evidence
@@ -1172,7 +1367,7 @@ class CycleOrchestrator:
             raise ValueError("pending acceptance patch hash changed")
         observed_revision = current_revision(worktree)
         if observed_revision == base_revision:
-            current = collect_worktree_evidence(worktree)
+            current = self._collect_worktree_evidence(state)
             if sha256(current.patch) != expected_patch_hash:
                 raise ValueError("pending acceptance worktree no longer matches the reviewed patch")
             accepted_revision = commit_accepted_changes(
@@ -1180,13 +1375,14 @@ class CycleOrchestrator:
                 str(pending["message"]),
                 expected_patch,
                 self._run_dir(state["run_id"]) / "empty-git-hooks",
+                self._project(state).evidence_exclude_paths,
             )
         else:
             if parent_revision(worktree, observed_revision) != base_revision:
                 raise ValueError("pending acceptance commit is not a direct child of the reviewed revision")
             if sha256(revision_patch(worktree, base_revision, observed_revision)) != expected_patch_hash:
                 raise ValueError("pending acceptance commit does not match the reviewed patch")
-            if collect_worktree_evidence(worktree).changed_paths:
+            if self._collect_worktree_evidence(state).changed_paths:
                 raise ValueError("pending acceptance commit left uncommitted changes")
             accepted_revision = observed_revision
         self._finalize_acceptance(
@@ -1434,7 +1630,7 @@ class CycleOrchestrator:
             return state
         if stage.phase == "implementation":
             try:
-                pre_validation_evidence = collect_worktree_evidence(worktree)
+                pre_validation_evidence = self._collect_worktree_evidence(state)
                 assert_allowed_changes(project, pre_validation_evidence.changed_paths)
                 self._prepare_validation(state, stage, directive, pre_validation_evidence)
                 approval_commands = [
@@ -1841,6 +2037,181 @@ class CycleOrchestrator:
             }
         )
 
+    @staticmethod
+    def _stack_remaining(state: dict[str, Any]) -> bool:
+        stack = state.get("workflow_stack")
+        index = state.get("workflow_stack_index", 0)
+        return isinstance(stack, list) and int(index or 0) + 1 < len(stack)
+
+    def _advance_stack_layer(self, state: dict[str, Any], *, reason: str) -> bool:
+        """Move a sealed run to its next workflow layer on the same worktree.
+
+        This is deliberately an explicit boundary: the completed layer is
+        closed, a stack handoff is recorded, and the next layer receives a new
+        cycle plus a launch-time workflow snapshot. No layer silently changes
+        provider/session semantics in the middle of a cycle.
+        """
+        stack = state.get("workflow_stack")
+        index = int(state.get("workflow_stack_index", 0) or 0)
+        if not isinstance(stack, list) or index + 1 >= len(stack):
+            return False
+        current_cycle = self._cycle(state)
+        previous_workflow = str(state.get("workflow") or "")
+        previous_definition = self._workflow(state)
+        current_cycle["status"] = "complete"
+        current_cycle["end_turn"] = state["current_turn"]
+        next_index = index + 1
+        next_workflow_id = str(stack[next_index])
+        snapshots = state.get("workflow_stack_snapshots") or {}
+        snapshot_value = snapshots.get(next_workflow_id)
+        if not isinstance(snapshot_value, dict):
+            raise ValueError(f"workflow stack snapshot is missing: {next_workflow_id}")
+        next_workflow = WorkflowDefinition.from_value(snapshot_value)
+        request_source = self._artifact_text(state, state["cycles"][0]["request_file"])
+        request_text = (
+            f"{request_source}\n\n"
+            f"Stack layer {next_index + 1} of {len(stack)}: {next_workflow.label}.\n"
+            "Treat the previous workflow layer as evidence to audit, not as a claim to inherit. "
+            "The stack handoff context names the sealed artifacts and the accepted revision.\n"
+        ).encode("utf-8")
+        next_number = int(state["cycle"]) + 1
+        request_path = (
+            self._run_dir(state["run_id"])
+            / "cycles"
+            / f"cycle.{next_number:04d}"
+            / "request.md"
+        )
+        request_hash = atomic_write(request_path, request_text)
+        request_relative = str(request_path.relative_to(self._run_dir(state["run_id"]))).replace("\\", "/")
+        state["cycle"] = next_number
+        loop = state.get("continuous_loop")
+        if isinstance(loop, dict):
+            if loop.get("enabled"):
+                loop["station_base_cycle"] = next_number - 1
+                loop["completed_cycles"] = 0
+                if loop.get("status") in {"target_reached", "manual_extension"}:
+                    loop["status"] = "running"
+                self._event(
+                    state,
+                    "continuous_loop.station_reset",
+                    title="Continuous loop reset for next station",
+                    details={
+                        "station": next_index,
+                        "workflow": next_workflow_id,
+                        "target_cycles": loop.get("target_cycles"),
+                    },
+                )
+            else:
+                loop["status"] = "disabled"
+        state["cycles"].append(self._new_cycle(next_number, request_path.relative_to(self._run_dir(state["run_id"])), request_hash))
+        state["artifacts"][request_relative] = {
+            "sha256": request_hash,
+            "type": "request",
+            "cycle": next_number,
+            "source_turn": state["current_turn"],
+        }
+        # A cadence-aware stack carries a compact typed rail packet in addition
+        # to the legacy stack_handoff projection. Older runs without cadence
+        # metadata keep the original behavior and remain recoverable.
+        handoff_value: dict[str, Any] = {
+            "workflow": previous_workflow,
+            "cycle": current_cycle.get("number"),
+            "working_revision": state.get("working_revision"),
+            "completion_receipt": current_cycle.get("completion_receipt"),
+            "approved_handoff": current_cycle.get("approved_handoff"),
+            "reason": reason,
+        }
+        if previous_definition.cadence and next_workflow.cadence:
+            handoff = build_handoff(
+                run_id=str(state["run_id"]),
+                source_workflow=previous_workflow,
+                target_workflow=next_workflow_id,
+                source_cadence=previous_definition.cadence,
+                target_cadence=next_workflow.cadence,
+                source_layer_index=index,
+                target_layer_index=next_index,
+                source_cycle=int(current_cycle["number"]),
+                target_cycle=next_number,
+                source_turn=int(state["current_turn"]),
+                working_revision=str(state["working_revision"]),
+                completion_receipt=current_cycle.get("completion_receipt"),
+                approved_handoff=current_cycle.get("approved_handoff"),
+                request_file=request_relative,
+                request_sha256=request_hash,
+            )
+            handoff_payload = handoff.as_dict()
+            handoff_relative = Path("handoffs") / f"cadence-handoff.{next_index:04d}.json"
+            handoff_sha256 = write_json(self._run_dir(state["run_id"]) / handoff_relative, handoff_payload)
+            handoff_file = str(handoff_relative).replace("\\", "/")
+            state["artifacts"][handoff_file] = {
+                "sha256": handoff_sha256,
+                "type": "cadence-handoff",
+                "source_cycle": int(current_cycle["number"]),
+                "target_cycle": next_number,
+                "source_turn": state["current_turn"],
+            }
+            handoff_value.update(handoff_payload)
+            handoff_value.update({
+                "cadence_handoff_file": handoff_file,
+                "cadence_handoff_sha256": handoff_sha256,
+            })
+            backbone = state.get("cadence_backbone")
+            if isinstance(backbone, dict):
+                record_handoff(
+                    backbone,
+                    handoff_payload,
+                    artifact_file=handoff_file,
+                    artifact_sha256=handoff_sha256,
+                )
+        state["stack_handoff"] = handoff_value
+        # Preserve old prompt records under a stable history key before the
+        # next layer claims the bare prompt filenames.
+        prompt_library = state.setdefault("prompt_library", {})
+        for name, record in list(prompt_library.items()):
+            if ":" not in str(name) and isinstance(record, dict):
+                prompt_library[f"{previous_workflow}:{name}"] = record
+        self._seal_prompt_library(
+            self._run_dir(state["run_id"]),
+            prompt_library,
+            next_workflow,
+            path_prefix=next_workflow_id,
+        )
+        state["workflow_stack_index"] = next_index
+        state["workflow"] = next_workflow_id
+        state["workflow_snapshot"] = next_workflow.snapshot()
+        state["current_stage"] = next_workflow.start_stage
+        state["status"] = "running"
+        state["pending_human_decision"] = None
+        state["pending_validation"] = None
+        state["validation_inflight"] = None
+        state["pending_completion"] = None
+        state["pending_commit"] = None
+        state["pending_round_extension"] = None
+        state["pending_repair_stage"] = None
+        state["pending_baseline_acceptance"] = None
+        state["current_implementation_evidence"] = None
+        state["completion_receipt"] = None
+        state["validations"] = {}
+        state["baseline_validations"] = None
+        state["next_turn_override"] = None
+        state["inflight"] = None
+        self._event(
+            state,
+            "workflow_stack.layer_started",
+            title=f"Stack layer {next_index + 1}: {next_workflow.label}",
+            details={
+                "workflow": next_workflow_id,
+                "layer_index": next_index,
+                "layer_count": len(stack),
+                "source_workflow": previous_workflow,
+                "source_cycle": current_cycle["number"],
+                "request": request_relative,
+                "working_revision": state["working_revision"],
+            },
+        )
+        self._pause_for_step(state)
+        return True
+
     def _complete_project_state(self, state: dict[str, Any], *, reason: str) -> None:
         cycle = self._cycle(state)
         cycle["status"] = "complete"
@@ -1857,6 +2228,9 @@ class CycleOrchestrator:
         state["pending_baseline_acceptance"] = None
         state["next_turn_override"] = None
         state["inflight"] = None
+        backbone = state.get("cadence_backbone")
+        if isinstance(backbone, dict):
+            complete_station(backbone, int(state.get("workflow_stack_index", 0) or 0))
         self._event(
             state,
             "run.completed_by_operator",
@@ -1875,6 +2249,18 @@ class CycleOrchestrator:
         decode_text_artifact(note, "project completion note")
         reason = str(state.get("pending_human_decision") or "project_complete")
         payload = note if note.strip() else b"Project completed here.\n"
+        if self._stack_remaining(state):
+            self._record_decision(
+                state,
+                payload=payload,
+                choice="complete",
+                reason=reason,
+                title="Human: advance workflow stack",
+            )
+            if not self._advance_stack_layer(state, reason="project_complete"):
+                raise ValueError("workflow stack boundary could not be advanced")
+            self._save(run_id, state)
+            return self.run_to_stop(run_id)
         self._record_decision(
             state,
             payload=payload,
@@ -2099,7 +2485,7 @@ class CycleOrchestrator:
     ) -> None:
         project = self._project(state)
         worktree = Path(state["execution_worktree"])
-        current_evidence = collect_worktree_evidence(worktree)
+        current_evidence = self._collect_worktree_evidence(state)
         try:
             assert_allowed_changes(project, current_evidence.changed_paths)
         except ValueError as error:
@@ -2134,6 +2520,7 @@ class CycleOrchestrator:
                     str(state["pending_commit"]["message"]),
                     current_evidence.patch,
                     self._run_dir(state["run_id"]) / "empty-git-hooks",
+                    project.evidence_exclude_paths,
                 )
             except ValueError as error:
                 state["status"] = "paused"
@@ -2328,12 +2715,131 @@ class CycleOrchestrator:
         )
         self._pause_for_step(state)
 
-    def _auto_continue_continuous_loop(self, state: dict[str, Any]) -> bool:
-        """Accept only the next-task boundary while a bounded loop is active.
+    def _accept_baseline_failure(
+        self,
+        state: dict[str, Any],
+        pending: dict[str, Any],
+    ) -> None:
+        """Record unchanged baseline debt and accept the reviewed implementation."""
 
-        Every validation, repair, provider failure, ambiguity, and permission
-        boundary remains a normal pause.  This automation has exactly one
-        authority: use the sealed next-task proposal to begin the next cycle.
+        state["pending_baseline_acceptance"] = None
+        review_stage = self._workflow(state).stages[str(pending["stage"])]
+        classification = pending.get("classification") or {}
+        evidence = state.get("current_implementation_evidence") or {}
+        debt = {
+            "schema_version": "toledo_orchestrator.baseline_debt.v1",
+            "cycle": state["cycle"],
+            "decided_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "base_revision": classification.get("baseline_revision"),
+            "patch_sha256": evidence.get("patch", {}).get("sha256"),
+            "classification": classification,
+            "note": "Accepted with a pre-existing validation failure recorded as baseline debt.",
+        }
+        relative = Path("artifacts") / f"cycle.{state['cycle']:04d}.baseline-debt.json"
+        digest = write_json(self._run_dir(state["run_id"]) / relative, debt)
+        normalized = str(relative).replace("\\", "/")
+        state["artifacts"][normalized] = {
+            "sha256": digest,
+            "type": "baseline-debt",
+            "cycle": state["cycle"],
+        }
+        self._event(
+            state,
+            "validation.baseline.debt_accepted",
+            title="Baseline debt accepted",
+            details={
+                "file": normalized,
+                "sha256": digest,
+                "baseline_revision": classification.get("baseline_revision"),
+            },
+        )
+        state["status"] = "running"
+        self._accept_implementation(
+            state,
+            review_stage,
+            str(pending["next_stage"]),
+            evidence,
+        )
+
+    @staticmethod
+    def _oversized_implementation_evidence_repair_available(state: dict[str, Any]) -> bool:
+        evidence = state.get("current_implementation_evidence")
+        patch_path = str((evidence or {}).get("patch", {}).get("path") or "")
+        errors = state.get("errors") or []
+        return bool(
+            state.get("pending_human_decision") == "artifact_integrity_failed"
+            and patch_path.endswith(".implementation.patch")
+            and errors
+            and str(errors[-1]).startswith("artifact exceeds the prompt transport limit:")
+            and patch_path.replace("\\", "/") in str(errors[-1]).replace("\\", "/")
+        )
+
+    def _reseal_filtered_implementation_evidence(self, state: dict[str, Any]) -> None:
+        """Replace legacy polluted evidence with the configured reviewable snapshot."""
+
+        if not self._oversized_implementation_evidence_repair_available(state):
+            raise ValueError("the paused artifact is not eligible for automatic evidence repair")
+        previous = dict(state["current_implementation_evidence"])
+        patch_name = Path(str(previous["patch"]["path"])).name
+        match = re.fullmatch(r"cycle\.(\d+)\.turn\.(\d+)\.implementation\.patch", patch_name)
+        if not match or int(match.group(1)) != int(state["cycle"]):
+            raise ValueError("implementation evidence path does not match the active cycle")
+        evidence = self._collect_worktree_evidence(state)
+        assert_allowed_changes(self._project(state), evidence.changed_paths)
+        sealed = seal_worktree_evidence(
+            self._run_dir(state["run_id"]),
+            state["cycle"],
+            int(match.group(2)),
+            evidence,
+        )
+        sealed["validations"] = previous.get("validations") or state.get("validations") or {}
+        state["current_implementation_evidence"] = sealed
+        self._event(
+            state,
+            "implementation.evidence.resealed",
+            title="Implementation evidence repacked",
+            details={
+                "previous_patch_sha256": previous.get("patch", {}).get("sha256"),
+                "patch_sha256": sealed.get("patch", {}).get("sha256"),
+                "changed_paths": sealed.get("changed_paths"),
+                "excluded_untracked": sealed.get("excluded_untracked"),
+                "reason": "legacy oversized implementation evidence",
+            },
+        )
+
+    def continuous_loop_auto_resume_available(self, run_id: str) -> bool:
+        """Return whether an idle paused run is waiting at a safe loop approval."""
+
+        state = self.state(run_id)
+        config = state.get("continuous_loop")
+        if not isinstance(config, dict) or not config.get("enabled"):
+            return False
+        if (
+            "station_base_cycle" not in config
+            and int(state.get("workflow_stack_index", 0) or 0) > 0
+        ):
+            return False
+        shared = (
+            config.get("status") == "running"
+            and state.get("run_mode") == "auto"
+            and state.get("status") == "paused"
+        )
+        return bool(
+            shared
+            and (
+                state.get("pending_human_decision")
+                in {"validation_baseline_failure_decision", "next_task_approval"}
+                or self._oversized_implementation_evidence_repair_available(state)
+            )
+        )
+
+    def _auto_continue_continuous_loop(self, state: dict[str, Any]) -> bool:
+        """Take safe recommended approvals while a bounded loop is active.
+
+        Accepted reviewed work may be committed with an unchanged baseline
+        failure recorded for the next task, and a sealed next-task proposal may
+        begin the next cycle. Consequential validation, repair limits, provider
+        failures, ambiguity, receipts, and recovery states still pause.
         """
 
         config = state.get("continuous_loop")
@@ -2341,14 +2847,50 @@ class CycleOrchestrator:
             return False
         if config.get("status") != "running":
             return False
-        if state.get("status") != "paused" or state.get("pending_human_decision") != "next_task_approval":
+        if (
+            "station_base_cycle" not in config
+            and int(state.get("workflow_stack_index", 0) or 0) > 0
+        ):
+            return False
+        if state.get("status") != "paused":
             return False
         if state.get("run_mode") != "auto":
             raise ValueError("continuous loop requires auto run mode")
         target = int(config.get("target_cycles") or 0)
         if target not in {3, 4, 5}:
             raise ValueError("continuous loop target is invalid")
-        completed = int(state["cycle"])
+        reason = state.get("pending_human_decision")
+        if reason == "artifact_integrity_failed" and self._oversized_implementation_evidence_repair_available(state):
+            self._reseal_filtered_implementation_evidence(state)
+            state["pending_human_decision"] = None
+            state["status"] = "running"
+            self._save(state["run_id"], state)
+            return True
+        if reason == "validation_baseline_failure_decision":
+            pending = state.get("pending_baseline_acceptance")
+            if not isinstance(pending, dict):
+                raise ValueError("the baseline acceptance context is missing")
+            classification = pending.get("classification")
+            if not isinstance(classification, dict) or classification.get("overall") != "unchanged_baseline":
+                raise ValueError("continuous loop may accept only a confirmed unchanged baseline failure")
+            follow_up = self._baseline_failure_follow_up(state)
+            self._record_decision(
+                state,
+                payload=follow_up,
+                choice="yes",
+                reason="validation_baseline_failure_decision",
+                title="Relay: continuous loop",
+                follow_up="baseline_failure",
+                actor="relay",
+            )
+            state["pending_human_decision"] = None
+            self._accept_baseline_failure(state, pending)
+            self._save(state["run_id"], state)
+            return True
+        if reason != "next_task_approval":
+            return False
+        base = int(config.get("station_base_cycle") or 0)
+        completed = int(state["cycle"]) - base
         config["completed_cycles"] = completed
         if completed >= target:
             config["status"] = "target_reached"
@@ -2474,7 +3016,9 @@ class CycleOrchestrator:
             choice=choice,
             reason=reason,
             title=(
-                "Human: project complete"
+                "Human: advance workflow stack"
+                if reason == "next_task_approval" and choice == "no" and self._stack_remaining(state)
+                else "Human: project complete"
                 if reason == "next_task_approval" and choice == "no"
                 else None
             ),
@@ -2483,6 +3027,9 @@ class CycleOrchestrator:
         state["pending_human_decision"] = None
         if reason == "next_task_approval":
             if choice == "no":
+                if self._advance_stack_layer(state, reason=reason):
+                    self._save(run_id, state)
+                    return self.run_to_stop(run_id)
                 self._complete_project_state(state, reason=reason)
                 self._save(run_id, state)
                 return state
@@ -2569,7 +3116,7 @@ class CycleOrchestrator:
                     raise ValueError(identity_error)
                 assert_allowed_changes(
                     self._project(state),
-                    collect_worktree_evidence(Path(state["execution_worktree"])).changed_paths,
+                    self._collect_worktree_evidence(state).changed_paths,
                 )
             except ValueError as error:
                 state["status"] = "paused"
@@ -2615,7 +3162,7 @@ class CycleOrchestrator:
                     raise ValueError(identity_error)
                 assert_allowed_changes(
                     self._project(state),
-                    collect_worktree_evidence(Path(state["execution_worktree"])).changed_paths,
+                    self._collect_worktree_evidence(state).changed_paths,
                 )
             except ValueError as error:
                 state["status"] = "paused"
@@ -2633,10 +3180,10 @@ class CycleOrchestrator:
             pending = state.get("pending_baseline_acceptance")
             if not isinstance(pending, dict):
                 raise ValueError("the baseline acceptance context is missing")
-            state["pending_baseline_acceptance"] = None
             workflow = self._workflow(state)
             review_stage = workflow.stages[str(pending["stage"])]
             if choice == "no":
+                state["pending_baseline_acceptance"] = None
                 # Deliberate stop without commit — not a cancellation label.
                 cycle = self._cycle(state)
                 cycle["status"] = "stopped"
@@ -2648,6 +3195,7 @@ class CycleOrchestrator:
                 self._save(run_id, state)
                 return state
             if choice == "other":
+                state["pending_baseline_acceptance"] = None
                 repair_stage = self._repair_stage(review_stage)
                 if not repair_stage:
                     raise ValueError("this stage has no configured repair stage")
@@ -2655,27 +3203,7 @@ class CycleOrchestrator:
                 state["status"] = "running"
                 self._save(run_id, state)
                 return self.run_to_stop(run_id)
-            classification = pending.get("classification") or {}
-            evidence = state.get("current_implementation_evidence") or {}
-            debt = {
-                "schema_version": "toledo_orchestrator.baseline_debt.v1",
-                "cycle": state["cycle"],
-                "decided_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "base_revision": classification.get("baseline_revision"),
-                "patch_sha256": evidence.get("patch", {}).get("sha256"),
-                "classification": classification,
-                "note": "Accepted with a pre-existing validation failure recorded as baseline debt.",
-            }
-            relative = Path("artifacts") / f"cycle.{state['cycle']:04d}.baseline-debt.json"
-            digest = write_json(self._run_dir(run_id) / relative, debt)
-            normalized = str(relative).replace("\\", "/")
-            state["artifacts"][normalized] = {"sha256": digest, "type": "baseline-debt", "cycle": state["cycle"]}
-            self._event(state, "validation.baseline.debt_accepted", title="Baseline debt accepted", details={
-                "file": normalized, "sha256": digest,
-                "baseline_revision": classification.get("baseline_revision"),
-            })
-            state["status"] = "running"
-            self._accept_implementation(state, review_stage, str(pending["next_stage"]), evidence)
+            self._accept_baseline_failure(state, pending)
             self._save(run_id, state)
             return self.run_to_stop(run_id) if state["status"] == "running" else state
 
@@ -2745,7 +3273,7 @@ class CycleOrchestrator:
                 identity_error = self._worktree_identity_error(state)
                 if identity_error:
                     raise ValueError(identity_error)
-                evidence = collect_worktree_evidence(Path(state["execution_worktree"]))
+                evidence = self._collect_worktree_evidence(state)
                 assert_allowed_changes(self._project(state), evidence.changed_paths)
             except ValueError as error:
                 state["status"] = "paused"

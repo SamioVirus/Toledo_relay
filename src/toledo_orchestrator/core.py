@@ -24,6 +24,7 @@ FENCE = re.compile(r"```orchestrator\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE)
 SENTINEL = re.compile(r"^ORCHESTRATOR_DIRECTIVE_V2:\s*(\{[^\r\n]*\})\s*$", re.MULTILINE)
 SENTINEL_LINE = re.compile(r"^ORCHESTRATOR_DIRECTIVE_V2:.*(?:\r?\n|$)", re.MULTILINE)
 RUN_ID = re.compile(r"run_\d{8}T\d{6}Z_[0-9a-f]{8}")
+WINDOWS_ATOMIC_REPLACE_RETRIES = 7 if os.name == "nt" else 0
 
 
 T = TypeVar("T")
@@ -48,7 +49,22 @@ def atomic_write(path: Path, data: bytes) -> str:
     with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
         handle.write(data)
         temp = Path(handle.name)
-    os.replace(temp, path)
+    try:
+        for attempt in range(WINDOWS_ATOMIC_REPLACE_RETRIES + 1):
+            try:
+                os.replace(temp, path)
+                break
+            except PermissionError:
+                if attempt >= WINDOWS_ATOMIC_REPLACE_RETRIES:
+                    raise
+                # Windows readers, indexers, and security scanners can briefly
+                # deny an otherwise-valid atomic replacement. Preserve the
+                # same-temp/same-directory atomicity and retry only that narrow
+                # error with a sub-two-second bounded backoff.
+                time.sleep(min(0.02 * (2 ** attempt), 0.5))
+    finally:
+        if temp.exists():
+            temp.unlink()
     return sha256(data)
 
 

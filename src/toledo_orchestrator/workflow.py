@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .cadence import validate_cadence
 from .director import DIRECTION_CONDITIONS
 
 
@@ -20,6 +21,7 @@ CONTEXT_TOKENS = frozenset({
     "approved-handoff",
     "completion-receipt",
     "implementation-evidence",
+    "stack-handoff",
 })
 
 
@@ -166,6 +168,7 @@ class WorkflowDefinition:
     next_task_revision_stage: str
     session_slots: tuple[str, ...]
     prompt_namespaces: tuple[str, ...]
+    cadence: str | None = None
 
     @classmethod
     def from_file(cls, path: Path) -> "WorkflowDefinition":
@@ -246,6 +249,7 @@ class WorkflowDefinition:
             raise ValueError("workflow prompt_namespaces must contain unique non-empty names")
         if any(not IDENTIFIER.fullmatch(item) for item in prompt_namespaces):
             raise ValueError("workflow prompt_namespaces must use lowercase identifiers")
+        cadence = validate_cadence(value.get("cadence"))
         slot_providers: dict[str, str] = {}
         for stage in stages.values():
             if stage.session_slot not in session_slots:
@@ -326,6 +330,7 @@ class WorkflowDefinition:
             next_task_revision_stage=next_task_revision_stage,
             session_slots=session_slots,
             prompt_namespaces=prompt_namespaces,
+            cadence=cadence,
         )
 
     def snapshot(self) -> dict[str, Any]:
@@ -340,6 +345,7 @@ class WorkflowDefinition:
             "next_task_revision_stage": self.next_task_revision_stage,
             "session_slots": list(self.session_slots),
             "prompt_namespaces": list(self.prompt_namespaces),
+            "cadence": self.cadence,
             "profiles": {
                 key: {
                     "label": profile.label,
@@ -397,6 +403,7 @@ class WorkflowDefinition:
             "implementation_round_cap": self.implementation_round_cap,
             "session_slots": list(self.session_slots),
             "prompt_namespaces": list(self.prompt_namespaces),
+            "cadence": self.cadence,
             "profiles": {key: vars(value) for key, value in self.profiles.items()},
             "stages": {
                 key: {

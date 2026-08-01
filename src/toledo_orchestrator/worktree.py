@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,13 +15,21 @@ class WorktreeEvidence:
     changed_paths: tuple[str, ...]
     patch: bytes
     status: str
+    excluded_untracked_count: int = 0
+    excluded_untracked_roots: tuple[tuple[str, int], ...] = ()
 
 
-def _git(root: Path, *args: str, timeout: int = 60) -> subprocess.CompletedProcess[bytes]:
+def _git(
+    root: Path,
+    *args: str,
+    timeout: int = 60,
+    input_data: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     result = subprocess.run(
         ["git", "-C", str(root), *args],
         capture_output=True,
         timeout=timeout,
+        input=input_data,
     )
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
@@ -59,30 +68,73 @@ def revision_patch(root: Path, base: str, target: str = "HEAD") -> bytes:
     return _git(root, "diff", "--binary", base, target, "--").stdout
 
 
-def collect_worktree_evidence(root: Path) -> WorktreeEvidence:
-    # Intent-to-add exposes new files to `git diff` without staging their content.
-    _git(root, "add", "-N", "--", ".")
-    status_bytes = _git(root, "status", "--short").stdout
-    status = status_bytes.decode("utf-8", errors="replace")
-    paths: list[str] = []
-    for line in status.splitlines():
-        value = line[3:].strip() if len(line) >= 4 else ""
-        if " -> " in value:
-            value = value.split(" -> ", 1)[1]
-        if value:
-            paths.append(value.replace("\\", "/"))
+def _normalized_prefixes(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sorted({value.replace("\\", "/").strip("/") for value in values}))
+
+
+def _under_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
+    normalized = path.replace("\\", "/").lstrip("./")
+    return any(normalized == prefix or normalized.startswith(prefix + "/") for prefix in prefixes)
+
+
+def collect_worktree_evidence(
+    root: Path,
+    evidence_exclude_paths: tuple[str, ...] = (),
+) -> WorktreeEvidence:
+    """Collect tracked changes plus relevant untracked files.
+
+    Project evidence exclusions apply only to untracked files. A tracked file is
+    always reviewable even if its path later falls under an excluded scratch
+    directory, preventing configuration from hiding an accepted source change.
+    """
+
+    prefixes = _normalized_prefixes(evidence_exclude_paths)
+    tracked = tuple(
+        value.decode("utf-8", errors="surrogateescape").replace("\\", "/")
+        for value in _git(root, "diff", "--name-only", "-z", "HEAD", "--").stdout.split(b"\0")
+        if value
+    )
+    untracked = tuple(
+        value.decode("utf-8", errors="surrogateescape").replace("\\", "/")
+        for value in _git(root, "ls-files", "--others", "--exclude-standard", "-z").stdout.split(b"\0")
+        if value
+    )
+    included_untracked = tuple(path for path in untracked if not _under_prefix(path, prefixes))
+    excluded_untracked = tuple(path for path in untracked if _under_prefix(path, prefixes))
+    tracked_status = _git(root, "status", "--short", "--untracked-files=no").stdout.decode(
+        "utf-8", errors="replace"
+    )
+    if included_untracked:
+        # Intent-to-add exposes selected new files to `git diff` without staging
+        # their content. Feeding NUL-delimited paths avoids command-line limits.
+        pathspec = b"\0".join(path.encode("utf-8", errors="surrogateescape") for path in included_untracked) + b"\0"
+        _git(
+            root,
+            "add",
+            "-N",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+            timeout=120,
+            input_data=pathspec,
+        )
+    status = tracked_status + "".join(f"?? {path}\n" for path in included_untracked)
+    paths = tuple(sorted(set(tracked + included_untracked)))
     patch = _git(root, "diff", "--binary", "HEAD", "--").stdout
     # Evidence collection must be side-effect-free: drop the intent-to-add
     # entries once the snapshot is taken. The per-worktree index lives under
     # the project's shared .git directory, outside the sandboxed implementer's
     # writable workspace, so an entry left behind here is one the implementer
     # can see (`git status` reports "A") but can never remove itself.
-    _git(root, "reset", "-q")
+    if included_untracked:
+        _git(root, "reset", "-q")
+    roots = Counter(path.split("/", 1)[0] for path in excluded_untracked)
     return WorktreeEvidence(
         revision=current_revision(root),
-        changed_paths=tuple(sorted(set(paths))),
+        changed_paths=paths,
         patch=patch,
         status=status,
+        excluded_untracked_count=len(excluded_untracked),
+        excluded_untracked_roots=tuple(sorted(roots.items())),
     )
 
 
@@ -126,6 +178,11 @@ def seal_worktree_evidence(
         "patch": {"path": str(patch_path.relative_to(run_dir)), "sha256": patch_hash},
         "status": {"path": str(status_path.relative_to(run_dir)), "sha256": status_hash},
         "file_hashes": untracked,
+        "excluded_untracked": {
+            "count": evidence.excluded_untracked_count,
+            "top_level_paths": dict(evidence.excluded_untracked_roots),
+            "policy": "project evidence exclusions; untracked files only",
+        },
     }
 
 
@@ -136,13 +193,30 @@ def read_worktree_path(run_dir: Path) -> str:
     return str(state["execution_worktree"])
 
 
-def commit_accepted_changes(root: Path, message: str, expected_patch: bytes, hooks_dir: Path) -> str:
-    evidence = collect_worktree_evidence(root)
+def commit_accepted_changes(
+    root: Path,
+    message: str,
+    expected_patch: bytes,
+    hooks_dir: Path,
+    evidence_exclude_paths: tuple[str, ...] = (),
+) -> str:
+    evidence = collect_worktree_evidence(root, evidence_exclude_paths)
     if not evidence.changed_paths:
         if expected_patch:
             raise ValueError("reviewed patch is non-empty but the worktree has no changes")
         return evidence.revision
-    _git(root, "add", "-A")
+    stage_paths = b"\0".join(
+        path.encode("utf-8", errors="surrogateescape") for path in evidence.changed_paths
+    ) + b"\0"
+    _git(
+        root,
+        "add",
+        "-A",
+        "--pathspec-from-file=-",
+        "--pathspec-file-nul",
+        timeout=120,
+        input_data=stage_paths,
+    )
     staged_patch = _git(root, "diff", "--cached", "--binary", "HEAD", "--").stdout
     if staged_patch != expected_patch:
         _git(root, "reset")
@@ -164,7 +238,7 @@ def commit_accepted_changes(root: Path, message: str, expected_patch: bytes, hoo
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         raise ValueError(f"accepted implementation commit failed: {detail}")
     accepted = current_revision(root)
-    if collect_worktree_evidence(root).changed_paths:
+    if collect_worktree_evidence(root, evidence_exclude_paths).changed_paths:
         raise ValueError("accepted implementation commit left a dirty execution worktree")
     return accepted
 

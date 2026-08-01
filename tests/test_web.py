@@ -700,6 +700,7 @@ def test_run_create_forwards_bounded_continuous_loop_settings(tmp_path: Path):
                 "request": "Run three ideas",
                 "project": "jobs",
                 "workflow": "continuous-development",
+                "workflow_stack": ["continuous-development", "strategy-council"],
                 "run_mode": "auto",
                 "continuous_loop": {"enabled": True, "target_cycles": 3},
             },
@@ -709,6 +710,7 @@ def test_run_create_forwards_bounded_continuous_loop_settings(tmp_path: Path):
         assert received["continuous_loop_enabled"] is True
         assert received["continuous_loop_cycles"] == 3
         assert received["run_mode"] == "auto"
+        assert received["workflow_stack"] == ["continuous-development", "strategy-council"]
     finally:
         server.shutdown()
         server.server_close()

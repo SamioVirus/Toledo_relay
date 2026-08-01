@@ -120,6 +120,9 @@ def _run_summaries(engine: CycleOrchestrator, workers: RunWorkers) -> list[dict[
         values.append({
             "run_id": run_id,
             "workflow": state.get("workflow"),
+            "workflow_stack": state.get("workflow_stack") or [state.get("workflow")],
+            "workflow_stack_index": state.get("workflow_stack_index", 0),
+            "cadence_backbone": state.get("cadence_backbone"),
             "project": state.get("project"),
             "status": state.get("status"),
             "cycle": state.get("cycle", 1),
@@ -129,6 +132,24 @@ def _run_summaries(engine: CycleOrchestrator, workers: RunWorkers) -> list[dict[
             "worker": workers.status(run_id),
         })
     return values
+
+
+def _resume_safe_continuous_loops(engine: CycleOrchestrator, workers: RunWorkers) -> None:
+    """Resume only persisted continuous runs paused at deterministic safe approvals."""
+
+    for path in sorted(engine.runs_dir.glob("run_*/run.json")):
+        run_id = path.parent.name
+        try:
+            if not engine.continuous_loop_auto_resume_available(run_id):
+                continue
+            workers.start(
+                run_id,
+                lambda run_id=run_id: engine.run_to_stop(run_id),
+                lambda error, run_id=run_id: engine.record_background_failure(run_id, error),
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            # A malformed or unsafe run remains paused for explicit inspection.
+            continue
 
 
 def _timeline_compatible(state: dict[str, Any]) -> dict[str, Any]:
@@ -363,12 +384,16 @@ def make_handler(
                     continuous_loop = value.get("continuous_loop") or {}
                     if not isinstance(continuous_loop, dict):
                         raise ValueError("continuous_loop must be an object")
+                    workflow_stack = value.get("workflow_stack")
+                    if workflow_stack is not None and not isinstance(workflow_stack, list):
+                        raise ValueError("workflow_stack must be a list")
                     continuous_loop_enabled = continuous_loop.get("enabled", False)
                     continuous_loop_cycles = continuous_loop.get("target_cycles", 3)
                     run_id = engine.create_run(
                         request,
                         str(value.get("project", "toledo")),
                         str(value.get("workflow", "continuous-development")),
+                        workflow_stack=workflow_stack,
                         run_mode=str(value.get("run_mode", "auto")),
                         profile_overrides=overrides,
                         round_overrides=round_overrides,
@@ -574,6 +599,7 @@ def serve(runtime_dir: Path, host: str = "127.0.0.1", port: int = 8765, open_bro
     print(f"Toledo Orchestrator UI: {url}")
     print(f"Server start: {started_at} revision: {revision}")
     print("Press Ctrl+C to stop.")
+    _resume_safe_continuous_loops(engine, workers)
     if open_browser:
         webbrowser.open(url)
     try:

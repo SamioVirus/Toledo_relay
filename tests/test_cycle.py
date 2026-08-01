@@ -11,13 +11,14 @@ from typing import Any
 
 import pytest
 
-from toledo_orchestrator.core import ClaudeAdapter, CodexAdapter, ProviderAdapter, ProviderResult, sha256, write_json
+from toledo_orchestrator.core import ClaudeAdapter, CodexAdapter, ProviderAdapter, ProviderResult, atomic_write, sha256, write_json
 from toledo_orchestrator.catalog import CATALOG_SCHEMA
 from toledo_orchestrator.configuration import load_configured_workflows
 from toledo_orchestrator.cycle import CycleOrchestrator
 from toledo_orchestrator.project import ProjectDefinition, ValidationDefinition
 from toledo_orchestrator.stance import CURATED_STANCES
 from toledo_orchestrator.workflow import WorkflowDefinition, load_workflows
+from toledo_orchestrator.worktree import collect_worktree_evidence, seal_worktree_evidence
 
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -289,10 +290,218 @@ def test_continuous_cycle_preserves_a_and_b_and_starts_fresh_c(tmp_path: Path, w
     cleaned = app.cleanup_worktree(run_id)
     assert cleaned["execution_worktree_removed"] is True
     assert not Path(terminal["execution_worktree"]).exists()
+
+
+def test_workflow_stack_advances_on_explicit_layer_boundary(tmp_path: Path, writable_project: ProjectDefinition):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Initial plan")),
+        ("planning-revise", response("continue", "Revised plan")),
+        ("implementation", response("continue", "Implemented once")),
+        ("implementation-repair", response("continue", "Implemented repair")),
+        ("strategy-propose", response("continue", "Strategy plan")),
+        ("strategy-operator", response("continue", "Handoff package")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", response("continue", "Plan finding")),
+        ("planning-review", response("ready", "Plan approved")),
+        ("implementation-review", response("continue", "Implementation defect")),
+        ("implementation-review", response("ready", "Implementation accepted")),
+        ("next-task", response("human", "Proposed next task")),
+        ("strategy-review", response("ready", "Strategy approved")),
+        ("strategy-audit", response("ready", "Strategy verified")),
+        ("strategy-next-task", response("human", "Next layer proposal")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(
+        b"Build the useful thing",
+        "test",
+        workflow_stack=["continuous-development", "strategy-council"],
+    )
+    first_pause = app.run_to_stop(run_id)
+    assert first_pause["status"] == "paused"
+    assert first_pause["pending_human_decision"] == "next_task_approval"
+    second_pause = app.decide(run_id, "no")
+    assert second_pause["status"] == "paused"
+    assert second_pause["pending_human_decision"] == "next_task_approval"
+    assert second_pause["workflow"] == "strategy-council"
+    assert second_pause["workflow_stack_index"] == 1
+    assert second_pause["workflow_stack"] == ["continuous-development", "strategy-council"]
+    assert len(second_pause["cycles"]) == 2
+    assert second_pause["cycles"][0]["status"] == "complete"
+    assert second_pause["cycles"][1]["completion_receipt"]
+    assert second_pause["stack_handoff"]["workflow"] == "continuous-development"
+    assert any(event["kind"] == "workflow_stack.layer_started" for event in second_pause["events"])
+    assert b"Previous workflow layer" in next(
+        item["prompt"] for item in codex.invocations if item["route"] == "strategy-propose"
+    )
+    terminal = app.decide(run_id, "no")
+    assert terminal["status"] == "complete"
+    branch = terminal["execution_branch"]
+    cleaned = app.cleanup_worktree(run_id)
+    assert cleaned["execution_worktree_removed"] is True
+    assert not Path(terminal["execution_worktree"]).exists()
     assert subprocess.run(
         ["git", "-C", str(writable_project.root), "show-ref", "--verify", f"refs/heads/{branch}"],
         capture_output=True,
     ).returncode == 0
+
+
+def test_workflow_stack_runs_strategy_proof_and_ui_layers_in_order(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("continue", "Initial plan")),
+        ("planning-revise", response("continue", "Revised plan")),
+        ("implementation", response("continue", "Implemented once")),
+        ("implementation-repair", response("continue", "Implemented repair")),
+        ("strategy-propose", response("continue", "Strategy plan")),
+        ("strategy-operator", response("continue", "Strategy package")),
+        ("test-propose", response("continue", "Proof plan")),
+        ("test-run", response("continue", "Proof executed")),
+        ("ui-propose", response("continue", "UI plan")),
+        ("ui-build", response("continue", "UI built")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", response("continue", "Plan finding")),
+        ("planning-review", response("ready", "Plan approved")),
+        ("implementation-review", response("continue", "Implementation defect")),
+        ("implementation-review", response("ready", "Implementation accepted")),
+        ("next-task", response("human", "Strategy layer next")),
+        ("strategy-review", response("ready", "Strategy approved")),
+        ("strategy-audit", response("ready", "Strategy verified")),
+        ("strategy-next-task", response("human", "Proof layer next")),
+        ("test-review", response("ready", "Proof plan approved")),
+        ("test-audit", response("ready", "Proof verified")),
+        ("test-next-task", response("human", "UI layer next")),
+        ("ui-review", response("ready", "UI plan approved")),
+        ("ui-critic", response("ready", "UI verified")),
+        ("ui-next-task", response("human", "Final next task")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(
+        b"Build the useful thing",
+        "test",
+        workflow_stack=["continuous-development", "strategy-council", "test-proof-gate", "ui-studio"],
+    )
+    state = app.run_to_stop(run_id)
+    assert state["workflow"] == "continuous-development"
+    assert state["workflow_stack_index"] == 0
+    for expected_index, expected_workflow in enumerate(
+        ("strategy-council", "test-proof-gate", "ui-studio"),
+        start=1,
+    ):
+        state = app.decide(run_id, "no")
+        assert state["status"] == "paused"
+        assert state["pending_human_decision"] == "next_task_approval"
+        assert state["workflow"] == expected_workflow
+        assert state["workflow_stack_index"] == expected_index
+        assert state["cycles"][expected_index - 1]["status"] == "complete"
+        assert state["cycles"][expected_index]["completion_receipt"]
+    terminal = app.decide(run_id, "no")
+    assert terminal["status"] == "complete"
+    assert terminal["workflow"] == "ui-studio"
+    assert terminal["workflow_stack_index"] == 3
+    assert [item["route"] for item in codex.invocations] == [
+        "planning-propose", "planning-revise", "implementation", "implementation-repair",
+        "strategy-propose", "strategy-operator", "test-propose", "test-run", "ui-propose", "ui-build",
+    ]
+    assert [item["route"] for item in claude.invocations] == [
+        "planning-review", "planning-review", "implementation-review", "implementation-review", "next-task",
+        "strategy-review", "strategy-audit", "strategy-next-task", "test-review", "test-audit",
+        "test-next-task", "ui-review", "ui-critic", "ui-next-task",
+    ]
+    assert len([event for event in terminal["events"] if event["kind"] == "workflow_stack.layer_started"]) == 3
+
+
+def test_cadence_station_stack_seals_weekly_daily_hourly_rails(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("strategy-propose", response("continue", "Weekly strategy")),
+        ("strategy-operator", response("continue", "Weekly package")),
+        ("test-propose", response("continue", "Daily proof plan")),
+        ("test-run", response("continue", "Daily proof run")),
+        ("ui-propose", response("continue", "Hourly surface plan")),
+        ("ui-build", response("continue", "Hourly surface build")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("strategy-review", response("ready", "Weekly strategy approved")),
+        ("strategy-audit", response("ready", "Weekly strategy verified")),
+        ("strategy-next-task", response("human", "Daily dispatch next")),
+        ("test-review", response("ready", "Daily proof approved")),
+        ("test-audit", response("ready", "Daily proof verified")),
+        ("test-next-task", response("human", "Hourly station next")),
+        ("ui-review", response("ready", "Hourly surface approved")),
+        ("ui-critic", response("ready", "Hourly surface verified")),
+        ("ui-next-task", response("human", "Backbone next")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(
+        b"Repair the cadence backbone",
+        "test",
+        workflow="weekly-governance",
+        workflow_stack=["weekly-governance", "daily-dispatch", "hourly-station"],
+    )
+    state = app.run_to_stop(run_id)
+    assert state["pending_human_decision"] == "next_task_approval"
+
+    state = app.decide(run_id, "no")
+    assert state["workflow"] == "daily-dispatch"
+    assert state["stack_handoff"]["source_cadence"] == "weekly"
+    assert state["stack_handoff"]["target_cadence"] == "daily"
+    assert state["stack_handoff"]["direction"] == "downward"
+    assert b"Cadence rail: weekly" in next(
+        item["prompt"] for item in codex.invocations if item["route"] == "test-propose"
+    )
+    first_handoff = state["cadence_backbone"]["handoffs"][0]
+    first_payload = json.loads(app.artifact(run_id, first_handoff["artifact_file"]))
+    assert first_payload["schema_version"] == "toledo_orchestrator.cadence_handoff.v1"
+    assert first_payload["request_sha256"] == state["cycles"][1]["request_sha256"]
+    context = app._context_section(state, "stack-handoff")
+    assert context is not None
+    assert "Verified cadence handoff artifact" in context[1]
+
+    handoff_path = app._run_dir(run_id) / first_handoff["artifact_file"]
+    sealed_bytes = handoff_path.read_bytes()
+    handoff_path.write_bytes(sealed_bytes + b"\n")
+    try:
+        with pytest.raises(ValueError, match="artifact hash mismatch"):
+            app._context_section(state, "stack-handoff")
+    finally:
+        handoff_path.write_bytes(sealed_bytes)
+
+    mismatched_projection = json.loads(json.dumps(state))
+    mismatched_projection["stack_handoff"]["request_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="projection does not match sealed field"):
+        app._context_section(mismatched_projection, "stack-handoff")
+
+    state = app.decide(run_id, "no")
+    assert state["workflow"] == "hourly-station"
+    assert state["stack_handoff"]["source_cadence"] == "daily"
+    assert state["stack_handoff"]["target_cadence"] == "hourly"
+    assert state["stack_handoff"]["direction"] == "downward"
+    terminal = app.decide(run_id, "no")
+    assert terminal["status"] == "complete"
+    assert [station["status"] for station in terminal["cadence_backbone"]["stations"]] == [
+        "complete", "complete", "complete"
+    ]
+    assert [handoff["direction"] for handoff in terminal["cadence_backbone"]["handoffs"]] == [
+        "downward", "downward"
+    ]
+    app.cleanup_worktree(run_id)
+
+
+def test_cadence_stack_rejects_weekly_to_hourly_skip(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    app = make_cycle(tmp_path, writable_project, SessionAdapter("codex", []), SessionAdapter("claude", []))
+    with pytest.raises(ValueError, match="adjacent stations"):
+        app.create_run(
+            b"Do not skip the daily station",
+            "test",
+            workflow="weekly-governance",
+            workflow_stack=["weekly-governance", "hourly-station"],
+        )
 
 
 def test_other_revises_next_task_in_same_reviewer_session(tmp_path: Path, writable_project: ProjectDefinition):
@@ -399,6 +608,7 @@ def test_continuous_loop_runs_exact_bounded_cycle_count_then_pauses(
         "enabled": True,
         "target_cycles": 3,
         "completed_cycles": 3,
+        "station_base_cycle": 0,
         "status": "target_reached",
     }
     assert [cycle["status"] for cycle in state["cycles"]] == ["complete", "complete", "active"]
@@ -423,6 +633,152 @@ def test_continuous_loop_runs_exact_bounded_cycle_count_then_pauses(
     assert extended["pending_human_decision"] == "next_task_approval"
     assert extended["continuous_loop"]["status"] == "manual_extension"
     assert sum(item.get("actor") == "relay" for item in extended["decisions"]) == 2
+
+
+def test_continuous_loop_station_budget_resets_at_stack_boundary(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Weekly plan one")),
+        ("implementation", sentinel("continue", "Weekly build one")),
+        ("planning-propose", sentinel("continue", "Weekly plan two")),
+        ("implementation", sentinel("continue", "Weekly build two")),
+        ("planning-propose", sentinel("continue", "Weekly plan three")),
+        ("implementation", sentinel("continue", "Weekly build three")),
+        ("strategy-propose", sentinel("continue", "Daily plan one")),
+        ("strategy-operator", sentinel("continue", "Daily dispatch one")),
+        ("strategy-propose", sentinel("continue", "Daily plan two")),
+        ("strategy-operator", sentinel("continue", "Daily dispatch two")),
+        ("strategy-propose", sentinel("continue", "Daily plan three")),
+        ("strategy-operator", sentinel("continue", "Daily dispatch three")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Weekly plan one ready")),
+        ("implementation-review", sentinel("ready", "Weekly build one ready")),
+        ("next-task", sentinel("human", "Weekly next one")),
+        ("planning-review", sentinel("ready", "Weekly plan two ready")),
+        ("implementation-review", sentinel("ready", "Weekly build two ready")),
+        ("next-task", sentinel("human", "Weekly next two")),
+        ("planning-review", sentinel("ready", "Weekly plan three ready")),
+        ("implementation-review", sentinel("ready", "Weekly build three ready")),
+        ("next-task", sentinel("human", "Daily dispatch proposal")),
+        ("strategy-review", sentinel("ready", "Daily plan one ready")),
+        ("strategy-audit", sentinel("ready", "Daily dispatch one ready")),
+        ("strategy-next-task", sentinel("human", "Daily next one")),
+        ("strategy-review", sentinel("ready", "Daily plan two ready")),
+        ("strategy-audit", sentinel("ready", "Daily dispatch two ready")),
+        ("strategy-next-task", sentinel("human", "Daily next two")),
+        ("strategy-review", sentinel("ready", "Daily plan three ready")),
+        ("strategy-audit", sentinel("ready", "Daily dispatch three ready")),
+        ("strategy-next-task", sentinel("human", "Daily terminal proposal")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(
+        b"Run each station within its own budget",
+        "test",
+        workflow_stack=["continuous-development", "strategy-council"],
+        continuous_loop_enabled=True,
+        continuous_loop_cycles=3,
+    )
+
+    first_station = app.run_to_stop(run_id)
+    assert first_station["workflow_stack_index"] == 0
+    assert first_station["cycle"] == 3
+    assert first_station["continuous_loop"]["station_base_cycle"] == 0
+    assert first_station["continuous_loop"]["completed_cycles"] == 3
+    assert sum(event["kind"] == "continuous_loop.target_reached" for event in first_station["events"]) == 1
+
+    second_station = app.decide(run_id, "no")
+    assert second_station["workflow"] == "strategy-council"
+    assert second_station["workflow_stack_index"] == 1
+    assert second_station["cycle"] == 6
+    assert second_station["continuous_loop"] == {
+        "enabled": True,
+        "target_cycles": 3,
+        "completed_cycles": 3,
+        "station_base_cycle": 3,
+        "status": "target_reached",
+    }
+    assert sum(event["kind"] == "continuous_loop.target_reached" for event in second_station["events"]) == 2
+    resets = [event for event in second_station["events"] if event["kind"] == "continuous_loop.station_reset"]
+    assert len(resets) == 1
+    reset_artifact = json.loads(app.artifact(run_id, f"events/{resets[0]['id']}.json"))
+    assert reset_artifact["station"] == 1
+    assert reset_artifact["workflow"] == "strategy-council"
+    assert len([item for item in codex.invocations if item["route"] in {"planning-propose", "implementation"}]) == 6
+    assert len([item for item in codex.invocations if item["route"] in {"strategy-propose", "strategy-operator"}]) == 6
+
+    terminal = app.decide(run_id, "no")
+    assert terminal["status"] == "complete"
+    app.cleanup_worktree(run_id)
+
+
+def test_continuous_loop_boundary_resets_completed_count_before_next_station(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan one")),
+        ("implementation", sentinel("continue", "Build one")),
+        ("planning-propose", sentinel("continue", "Plan two")),
+        ("implementation", sentinel("continue", "Build two")),
+        ("planning-propose", sentinel("continue", "Plan three")),
+        ("implementation", sentinel("continue", "Build three")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Plan one ready")),
+        ("implementation-review", sentinel("ready", "Build one ready")),
+        ("next-task", sentinel("human", "Next one")),
+        ("planning-review", sentinel("ready", "Plan two ready")),
+        ("implementation-review", sentinel("ready", "Build two ready")),
+        ("next-task", sentinel("human", "Next two")),
+        ("planning-review", sentinel("ready", "Plan three ready")),
+        ("implementation-review", sentinel("ready", "Build three ready")),
+        ("next-task", sentinel("human", "Next station")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(
+        b"Reset the station budget",
+        "test",
+        workflow_stack=["continuous-development", "strategy-council"],
+        continuous_loop_enabled=True,
+        continuous_loop_cycles=3,
+    )
+    state = app.run_to_stop(run_id)
+    assert state["continuous_loop"]["completed_cycles"] == 3
+
+    mutable = app.state(run_id)
+    mutable["continuous_loop"]["status"] = "manual_extension"
+    assert app._advance_stack_layer(mutable, reason="test_boundary")
+    assert mutable["continuous_loop"]["station_base_cycle"] == 3
+    assert mutable["continuous_loop"]["completed_cycles"] == 0
+    assert mutable["continuous_loop"]["status"] == "running"
+
+
+def test_legacy_stack_station_loop_remains_paused_without_station_origin(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    app = make_cycle(
+        tmp_path,
+        writable_project,
+        SessionAdapter("codex", []),
+        SessionAdapter("claude", []),
+    )
+    run_id = app.create_run(
+        b"Keep legacy station behavior safe",
+        "test",
+        workflow_stack=["continuous-development", "strategy-council"],
+        continuous_loop_enabled=True,
+        continuous_loop_cycles=3,
+    )
+    state = app.state(run_id)
+    state["workflow_stack_index"] = 1
+    state["status"] = "paused"
+    state["pending_human_decision"] = "next_task_approval"
+    state["continuous_loop"].pop("station_base_cycle")
+    app._save(run_id, state)
+
+    assert not app.continuous_loop_auto_resume_available(run_id)
+    assert not app._auto_continue_continuous_loop(app.state(run_id))
 
 
 @pytest.mark.parametrize(
@@ -458,6 +814,38 @@ def test_continuous_loop_rejects_unbounded_or_incompatible_settings(
         )
 
     assert not app.runs_dir.exists() or not list(app.runs_dir.iterdir())
+
+
+def test_continuous_loop_auto_resume_is_limited_to_safe_approval_gates(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    app = make_cycle(
+        tmp_path,
+        writable_project,
+        SessionAdapter("codex", []),
+        SessionAdapter("claude", []),
+    )
+    run_id = app.create_run(
+        b"Task",
+        "test",
+        continuous_loop_enabled=True,
+        continuous_loop_cycles=3,
+    )
+    state = app.state(run_id)
+    state["status"] = "paused"
+    for reason in ("validation_baseline_failure_decision", "next_task_approval"):
+        state["pending_human_decision"] = reason
+        app._save(run_id, state)
+        assert app.continuous_loop_auto_resume_available(run_id)
+    for reason in (
+        "validation_execution_approval",
+        "provider_invocation_failed",
+        "validation_receipt_required",
+        "implementation_changed_after_review",
+    ):
+        state["pending_human_decision"] = reason
+        app._save(run_id, state)
+        assert not app.continuous_loop_auto_resume_available(run_id)
 
 
 def test_step_mode_pauses_before_d_and_accepts_d_override(tmp_path: Path, writable_project: ProjectDefinition):
@@ -1921,6 +2309,41 @@ def test_run_uses_sealed_prompt_after_package_prompt_changes(
     assert state["pending_human_decision"] == "provider_requested_human"
 
 
+def test_default_relay_prompts_preserve_continuity_and_truthful_evidence_states():
+    import toledo_orchestrator.cycle as cycle_module
+
+    prompts = Path(cycle_module.__file__).with_name("prompts")
+    law = (prompts / "orchestrator-law.md").read_text(encoding="utf-8")
+    plan = (prompts / "planning-kickoff.md").read_text(encoding="utf-8")
+    review = (prompts / "implementation-review.md").read_text(encoding="utf-8")
+    next_task = (prompts / "next-task.md").read_text(encoding="utf-8")
+
+    assert "A component archive is not a repository archive" in law
+    assert "implemented" in law and "operationally verified" in law and "observed" in law
+    assert "continuity ledger" in plan
+    assert "deterministic invariant or test" in plan
+    assert "Do not choose the nicer number" in review
+    assert "privacy/retention classification" in review
+    assert "baseline debt discovered but not caused by this cycle" in next_task
+    assert "original-objective" in next_task
+    assert "required-proof" in next_task
+    assert "new-objective" in next_task
+
+
+def test_specialized_workflows_use_distinct_evidence_contracts():
+    import toledo_orchestrator.cycle as cycle_module
+
+    prompts = Path(cycle_module.__file__).with_name("prompts")
+    workflows = load_workflows()
+    assert workflows["strategy-council"].profiles["strategy-planner"].effort == "xhigh"
+    assert workflows["strategy-council"].profiles["strategy-reviewer"].model == "claude-sonnet-5"
+    assert workflows["test-proof-gate"].profiles["test-runner"].effort == "medium"
+    assert workflows["ui-studio"].profiles["ui-planner"].model == "gpt-5.6-sol"
+    assert "rejected alternative" in (prompts / "strategy-council-planner.md").read_text(encoding="utf-8")
+    assert "baseline" in (prompts / "test-proof-planner.md").read_text(encoding="utf-8")
+    assert "desktop and mobile" in (prompts / "ui-studio-builder.md").read_text(encoding="utf-8")
+
+
 def test_workflow_rejects_workspace_write_profile_on_planning_stage():
     value = load_workflows()["continuous-development"].snapshot()
     value["profiles"]["codex-planning"]["permission"] = "workspace-write"
@@ -1981,6 +2404,83 @@ def test_registered_artifact_hashes_are_enforced_before_transport(
     assert codex.invocations == []
 
 
+def test_oversized_implementation_patch_uses_verified_out_of_line_context(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    app = make_cycle(
+        tmp_path,
+        writable_project,
+        SessionAdapter("codex", []),
+        SessionAdapter("claude", []),
+    )
+    run_id = app.create_run(b"Task", "test")
+    state = app.state(run_id)
+    relative = "evidence/oversized.implementation.patch"
+    patch = b"diff --git a/x b/x\n" + b"+x\n" * 700_000
+    digest = atomic_write(app._run_dir(run_id) / relative, patch)
+    evidence = {
+        "changed_paths": [f"src/file-{index}.py" for index in range(250)],
+        "file_hashes": [{"path": f"src/file-{index}.py", "sha256": "a" * 64} for index in range(75)],
+        "patch": {"path": relative, "sha256": digest},
+    }
+    state["current_implementation_evidence"] = evidence
+
+    context = app._implementation_evidence_context(state, evidence)
+
+    assert "verified, stored out of line" in context
+    assert "No content was summarized or discarded in storage" in context
+    assert "git diff --binary HEAD --" in context
+    assert '"omitted": 50' in context
+    assert sha256((app._run_dir(run_id) / relative).read_bytes()) == digest
+
+
+def test_continuous_loop_repacks_legacy_oversized_evidence_with_untracked_exclusions(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    project = replace(writable_project, evidence_exclude_paths=("scratch",))
+    app = make_cycle(
+        tmp_path,
+        project,
+        SessionAdapter("codex", []),
+        SessionAdapter("claude", []),
+    )
+    run_id = app.create_run(
+        b"Task",
+        "test",
+        continuous_loop_enabled=True,
+        continuous_loop_cycles=3,
+    )
+    state = app.state(run_id)
+    worktree = Path(state["execution_worktree"])
+    (worktree / "source.py").write_text("meaningful = True\n", encoding="utf-8")
+    (worktree / "scratch").mkdir()
+    (worktree / "scratch" / "generated.txt").write_bytes(b"x" * 2_100_000)
+    old = seal_worktree_evidence(
+        app._run_dir(run_id),
+        1,
+        1,
+        collect_worktree_evidence(worktree),
+    )
+    old["validations"] = {"tests": {"state": "passed"}}
+    state["current_implementation_evidence"] = old
+    state["current_stage"] = "implementation-review"
+    state["status"] = "paused"
+    state["pending_human_decision"] = "artifact_integrity_failed"
+    state["errors"].append(
+        f"artifact exceeds the prompt transport limit: {old['patch']['path']}:{len((app._run_dir(run_id) / old['patch']['path']).read_bytes())}"
+    )
+    app._save(run_id, state)
+
+    assert app.continuous_loop_auto_resume_available(run_id)
+    assert app._auto_continue_continuous_loop(app.state(run_id))
+    repaired = app.state(run_id)
+    assert repaired["status"] == "running"
+    assert repaired["pending_human_decision"] is None
+    assert repaired["current_implementation_evidence"]["changed_paths"] == ["source.py"]
+    assert repaired["current_implementation_evidence"]["excluded_untracked"]["count"] == 1
+    assert repaired["current_implementation_evidence"]["validations"]["tests"]["state"] == "passed"
+
+
 def test_validation_definitions_reject_traversal_duplicates_and_empty_commands(
     writable_project: ProjectDefinition
 ):
@@ -2005,6 +2505,10 @@ def test_validation_definitions_reject_traversal_duplicates_and_empty_commands(
             validations=(ValidationDefinition("tests", "  ", "local"),),
             allow_no_validations=False,
         )
+    with pytest.raises(ValueError, match="escapes root"):
+        replace(writable_project, evidence_exclude_paths=("../outside",))
+    with pytest.raises(ValueError, match="must name a repository subpath"):
+        replace(writable_project, evidence_exclude_paths=(".",))
 
 
 def test_implementation_human_pauses_before_host_validation(tmp_path: Path, writable_project: ProjectDefinition):

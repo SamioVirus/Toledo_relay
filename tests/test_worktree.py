@@ -58,3 +58,32 @@ def test_collect_evidence_is_repeatable_after_reset(repo: Path) -> None:
     second = collect_worktree_evidence(repo)
     assert first.changed_paths == second.changed_paths
     assert first.patch == second.patch
+
+
+def test_evidence_exclusions_remove_only_untracked_scratch(repo: Path) -> None:
+    scratch = repo / "scratch"
+    scratch.mkdir()
+    (scratch / "runtime.json").write_text("generated\n", encoding="utf-8")
+    (repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+    evidence = collect_worktree_evidence(repo, ("scratch",))
+
+    assert evidence.changed_paths == ("tracked.txt",)
+    assert b"runtime.json" not in evidence.patch
+    assert evidence.excluded_untracked_count == 1
+    assert evidence.excluded_untracked_roots == (("scratch", 1),)
+
+
+def test_evidence_exclusions_never_hide_tracked_changes(repo: Path) -> None:
+    generated = repo / "scratch"
+    generated.mkdir()
+    tracked = generated / "tracked.txt"
+    tracked.write_text("original\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "tracked scratch fixture")
+    tracked.write_text("changed\n", encoding="utf-8")
+
+    evidence = collect_worktree_evidence(repo, ("scratch",))
+
+    assert evidence.changed_paths == ("scratch/tracked.txt",)
+    assert b"scratch/tracked.txt" in evidence.patch

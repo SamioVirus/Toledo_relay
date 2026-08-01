@@ -67,6 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run")
     run.add_argument("--project", required=True)
     run.add_argument("--workflow", required=True)
+    run.add_argument(
+        "--stack", action="append", default=[], metavar="WORKFLOW",
+        help="append one or more workflow layers after --workflow",
+    )
     run.add_argument("--request-file", type=Path, required=True)
     run.add_argument("--step", action="store_true", help="pause after each provider turn")
     run.add_argument(
@@ -145,6 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     project_add.add_argument("--root", type=Path, required=True)
     project_add.add_argument("--instruction-file", action="append", default=[])
     project_add.add_argument("--write-path", action="append", default=[])
+    project_add.add_argument("--evidence-exclude-path", action="append", default=[".relay-tmp"])
     project_add.add_argument("--validation", action="append", type=_validation_value, default=[])
     project_add.add_argument("--no-implementation", action="store_true")
     project_add.add_argument("--allow-no-validations", action="store_true")
@@ -180,8 +185,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         request = args.request_file.read_bytes()
         if args.workflow == "dev-review":
-            if args.step or args.continuous_loop:
-                raise ValueError("--step and --continuous-loop are available only for continuous v2 workflows")
+            if args.step or args.continuous_loop or args.stack:
+                raise ValueError("--step, --stack, and --continuous-loop are available only for continuous v2 workflows")
             engine = _base(args.runtime_dir)
             run_id = engine.create_run(request, args.project, args.workflow)
         else:
@@ -192,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                 request,
                 args.project,
                 args.workflow,
+                workflow_stack=[args.workflow, *args.stack] if args.stack else None,
                 run_mode="step" if args.step else "auto",
                 continuous_loop_enabled=args.continuous_loop is not None,
                 continuous_loop_cycles=args.continuous_loop or 3,
@@ -315,6 +321,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status": state.get("status"),
                 "cycle": state.get("cycle"),
                 "current_turn": state.get("current_turn"),
+                "cadence_backbone": state.get("cadence_backbone"),
             })
         _emit(values)
         return 0
@@ -349,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
             "implementation": {
                 "enabled": not args.no_implementation,
                 "write_allowlist": (args.write_path or ["."]) if not args.no_implementation else [],
+                "evidence_exclude_paths": args.evidence_exclude_path if not args.no_implementation else [],
                 "commit_on_accept": True,
                 "allow_no_validations": args.allow_no_validations,
                 "validation_requires_approval": True,

@@ -54,8 +54,10 @@ Both preserve a fresh implementation C, the same physical B session across revie
 Add another repository from the CLI:
 
 ```powershell
-python -m toledo_orchestrator project-add --id my-repo --root "C:\src\my-repo" --instruction-file AGENTS.md --write-path . --validation "tests|local|python -m pytest -q"
+python -m toledo_orchestrator project-add --id my-repo --root "C:\src\my-repo" --instruction-file AGENTS.md --write-path . --evidence-exclude-path .relay-tmp --validation "tests|local|python -m pytest -q"
 ```
+
+Implementation projects may declare `implementation.evidence_exclude_paths` for disposable in-worktree test output. Exclusions apply only to untracked files; tracked changes are always sealed and reviewed. Prefer a dedicated path such as `.relay-tmp` rather than a source directory.
 
 Repository selection is easy but intentionally run-scoped: choose the project when starting a run. To change repositories, start a separate run so an existing branch, worktree, evidence chain, or provider session can never be silently retargeted.
 
@@ -67,11 +69,35 @@ python -m toledo_orchestrator run --project toledo --workflow continuous-develop
 
 The source checkout must be clean so the selected committed revision cannot silently omit local work. The command runs until it completes or reaches a human/failure gate. It creates a dedicated execution worktree and durable branch named `codex/orchestrator/<run-id>` from that revision. Planning/review turns remain read-only; only the implementation profile receives workspace-write access inside that worktree. Accepted changes are committed on the execution branch but are never merged, pushed, deployed, or copied into the user's source checkout automatically.
 
-For a bounded self-running sequence, enable **Continuous loop** in New Cycle and choose 3, 4, or 5 cycles, or use `--continuous-loop 3` on the CLI. Relay auto-accepts only each sealed next-task proposal, then runs a fresh idea → plan/review → implementation/audit cycle. It stops after the selected number of completed cycles with the following idea ready for human review. Risky-command approval, validation failures, provider failures, ambiguity, repair caps, and all other safety/recovery gates still stop immediately; this option cannot approve them.
+For a bounded self-running sequence, enable **Continuous loop** in New Cycle and choose 3, 4, or 5 cycles, or use `--continuous-loop 3` on the CLI. Relay takes safe recommended approvals: it commits a reviewed implementation, records and carries an unchanged older test failure into the next task when present, accepts each sealed next-task proposal, and then runs a fresh idea → plan/review → implementation/audit cycle. It stops after the selected number of completed cycles with the following idea ready for human review. Consequential-command approval, new validation regressions, provider failures, ambiguity, repair caps, required receipts, and recovery gates still stop immediately.
 
 ```powershell
 python -m toledo_orchestrator run --project toledo --workflow continuous-development --request-file "C:\path\to\request.md" --continuous-loop 3
 ```
+
+### Specialized workflow layers
+
+The New Cycle dialog can add, remove, and reorder workflow layers before launch. Layers share one isolated worktree but not an implicit session: each layer receives a launch-time workflow/prompt snapshot, closes at its next-task gate, and starts the next layer only when you explicitly continue. The same stack is available from the CLI:
+
+```powershell
+python -m toledo_orchestrator run --project toledo --workflow continuous-development --stack strategy-council --stack test-proof-gate --stack ui-studio --request-file "C:\path\to\request.md"
+```
+
+The packaged specialist routes are:
+
+- `strategy-council`: high-reasoning strategic reconstruction and adversarial review;
+- `test-proof-gate`: medium-reasoning proof planning, bounded execution, and receipt audit;
+- `ui-studio`: responsive UI planning, implementation, and render/accessibility critique.
+
+The cadence stations are explicit workflow presets for the same stack transport:
+
+- `weekly-governance`: weekly strategy station, inheriting the quality-first Sol strategy route;
+- `daily-dispatch`: daily proof/repair station, inheriting the balanced Terra proof route;
+- `hourly-station`: hourly visible-surface station, inheriting the Sol UI route.
+
+Cadence-aware stacks may stay at one station or move only across adjacent `weekly <-> daily <-> hourly` stations. Each move produces a sealed `toledo_orchestrator.cadence_handoff.v1` artifact in the run; downstream stack context verifies the registered artifact hash and its exact backbone projection before use.
+
+Keep the cheap continuous loop as the scout. Add Strategy Council for consequential architecture, Test & Proof when evidence is the bottleneck, and UI Studio only when a user-visible surface is part of the requested outcome.
 
 Use step mode when you want a deliberate control point before every provider turn:
 
@@ -97,7 +123,7 @@ python -m toledo_orchestrator decide RUN_ID --choice other --text "Make the next
 ```
 
 - `yes` seals the proposal as the next cycle request and starts fresh D/E/F logical sessions (then G/H/I, and so on).
-- `no` ends the continuous run.
+- `no` ends the continuous run, or advances to the next explicitly stacked layer when one remains.
 - `other` returns the exact feedback to whichever strategic session produced the proposal and reopens the gate with its revision.
 
 Configured local validations use a high-threshold approval policy: routine tests, linters, compilers, read-only assertions, and smoke reads run automatically in the isolated worktree. Relay pauses only when a command clearly advertises consequential effects such as destructive file or Git changes, software installation, elevated/system operations, container or infrastructure mutation, deployment, publishing, or external writes. The approval gate explains the detected risk in plain language and still exposes the exact command. Required remote validations pause for a patch- and revision-bound receipt:

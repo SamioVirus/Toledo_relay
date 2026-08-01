@@ -105,6 +105,59 @@ def test_unchanged_baseline_failure_pauses_for_closure_and_accepts_with_debt(
     assert b"FAILED tests/test_math.py::test_fixture" in next_task_prompt
 
 
+def test_continuous_loop_auto_commits_unchanged_baseline_and_carries_it_forward(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    project = _validating_project(writable_project, (
+        "import os, sys\n"
+        "sys.stdout.write('FAILED tests/test_math.py::test_fixture - FileNotFoundError: %s\\n'"
+        " % os.path.join(os.getcwd(), 'fixture.json'))\n"
+        "sys.exit(2)\n"
+    ))
+    codex = SessionAdapter("codex", [
+        ("planning-propose", response("ready", "Plan one")),
+        ("implementation", response("ready", "Built one")),
+        ("planning-propose", response("ready", "Plan two")),
+        ("implementation", response("ready", "Built two")),
+        ("planning-propose", response("ready", "Plan three")),
+        ("implementation", response("ready", "Built three")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("planning-review", response("ready", "Plan one approved")),
+        ("implementation-review", response("ready", "Build one accepted")),
+        ("next-task", response("human", "Cycle two request")),
+        ("planning-review", response("ready", "Plan two approved")),
+        ("implementation-review", response("ready", "Build two accepted")),
+        ("next-task", response("human", "Cycle three request")),
+        ("planning-review", response("ready", "Plan three approved")),
+        ("implementation-review", response("ready", "Build three accepted")),
+        ("next-task", response("human", "Cycle four request")),
+    ])
+    app = make_cycle(tmp_path, project, codex, claude)
+
+    state = app.run_to_stop(app.create_run(
+        b"Build despite a known-broken baseline",
+        "test",
+        continuous_loop_enabled=True,
+        continuous_loop_cycles=3,
+    ))
+
+    assert state["cycle"] == 3
+    assert state["pending_human_decision"] == "next_task_approval"
+    assert state["continuous_loop"]["status"] == "target_reached"
+    baseline_decisions = [
+        item for item in state["decisions"]
+        if item.get("reason") == "validation_baseline_failure_decision"
+    ]
+    assert len(baseline_decisions) == 3
+    assert all(item.get("actor") == "relay" for item in baseline_decisions)
+    assert all(item.get("follow_up") == "baseline_failure" for item in baseline_decisions)
+    debts = [value for value in state["artifacts"].values() if value.get("type") == "baseline-debt"]
+    assert len(debts) == 3
+    next_task_prompts = [item["prompt"] for item in claude.invocations if item["route"] == "next-task"]
+    assert all(b"Make the recorded older issue the next task" in prompt for prompt in next_task_prompts)
+
+
 def test_new_regression_still_routes_to_repair_and_round_cap(
     tmp_path: Path, writable_project: ProjectDefinition
 ):

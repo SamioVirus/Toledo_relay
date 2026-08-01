@@ -1,0 +1,6 @@
+{
+  "id": "daily-dispatch",
+  "extends": "test-proof-gate",
+  "label": "Daily Dispatch - proof and repair station",
+  "cadence": "daily"
+}

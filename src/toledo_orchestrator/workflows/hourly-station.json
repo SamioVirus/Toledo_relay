@@ -1,0 +1,6 @@
+{
+  "id": "hourly-station",
+  "extends": "ui-studio",
+  "label": "Hourly Station - visible surface",
+  "cadence": "hourly"
+}

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import toledo_orchestrator.core as core_module
+
 from toledo_orchestrator.core import (
     ClaudeAdapter,
     CodexAdapter,
@@ -92,6 +94,32 @@ def test_atomic_storage_is_byte_exact_for_utf8_and_crlf(tmp_path: Path):
     assert atomic_write(target, payload) == sha256(payload)
     assert target.read_bytes() == payload
     assert not target.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
+def test_atomic_storage_retries_transient_windows_replace_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    target = tmp_path / "run.json"
+    real_replace = core_module.os.replace
+    attempts = 0
+    sleeps: list[float] = []
+
+    def flaky_replace(source, destination):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError(5, "transient replace lock")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(core_module, "WINDOWS_ATOMIC_REPLACE_RETRIES", 3)
+    monkeypatch.setattr(core_module.os, "replace", flaky_replace)
+    monkeypatch.setattr(core_module.time, "sleep", sleeps.append)
+
+    assert atomic_write(target, b"stable\n") == sha256(b"stable\n")
+    assert target.read_bytes() == b"stable\n"
+    assert attempts == 3
+    assert sleeps == [0.02, 0.04]
+    assert list(tmp_path.glob(".run.json.*")) == []
 
 
 def test_directive_requires_a_final_block_and_reports_unknown_fields():
