@@ -2087,6 +2087,8 @@ class CycleOrchestrator:
         loop = state.get("continuous_loop")
         if isinstance(loop, dict):
             if loop.get("enabled"):
+                previous_station_base_cycle = loop.get("station_base_cycle")
+                previous_completed_cycles = loop.get("completed_cycles")
                 loop["station_base_cycle"] = next_number - 1
                 loop["completed_cycles"] = 0
                 if loop.get("status") in {"target_reached", "manual_extension"}:
@@ -2099,6 +2101,10 @@ class CycleOrchestrator:
                         "station": next_index,
                         "workflow": next_workflow_id,
                         "target_cycles": loop.get("target_cycles"),
+                        "previous_station_base_cycle": previous_station_base_cycle,
+                        "previous_completed_cycles": previous_completed_cycles,
+                        "station_base_cycle": loop["station_base_cycle"],
+                        "completed_cycles": loop["completed_cycles"],
                     },
                 )
             else:

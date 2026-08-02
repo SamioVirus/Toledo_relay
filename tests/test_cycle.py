@@ -579,6 +579,10 @@ def test_weekly_daily_cadence_boundary_resets_continuous_loop_budget(
     assert reset_artifact["station"] == 1
     assert reset_artifact["workflow"] == "daily-dispatch"
     assert reset_artifact["target_cycles"] == 3
+    assert reset_artifact["previous_station_base_cycle"] == weekly["continuous_loop"]["station_base_cycle"]
+    assert reset_artifact["previous_completed_cycles"] == weekly["continuous_loop"]["completed_cycles"]
+    assert reset_artifact["station_base_cycle"] == daily["continuous_loop"]["station_base_cycle"]
+    assert reset_artifact["completed_cycles"] == daily["continuous_loop"]["completed_cycles"]
 
     handoff = daily["cadence_backbone"]["handoffs"][0]
     handoff_bytes = app.artifact(run_id, handoff["artifact_file"])
