@@ -222,6 +222,37 @@ def test_claude_transcript_fixture_preserves_work_session_and_usage():
     assert extract_directive(result_text(result)).next == "continue"
 
 
+def test_claude_configured_model_is_observed_with_auxiliary_model_usage(monkeypatch, tmp_path: Path):
+    adapter = ClaudeAdapter(executable="claude-test")
+    payload = {
+        "session_id": "claude-session-multi-model",
+        "modelUsage": {
+            "claude-haiku-4-5-20251001": {"outputTokens": 1},
+            "claude-sonnet-5": {"outputTokens": 2},
+        },
+        "result": "Independent review finding.\nORCHESTRATOR_DIRECTIVE_V2: {\"next\":\"continue\"}",
+        "subtype": "success",
+    }
+    monkeypatch.setattr(
+        adapter,
+        "_run",
+        lambda command, prompt, cwd, timeout: (json.dumps(payload).encode("utf-8"), b"", 0, 10),
+    )
+
+    result = adapter.invoke_configured(
+        "claude-review",
+        b"review",
+        tmp_path,
+        model="claude-sonnet-5",
+        reasoning="medium",
+        session_action="new",
+    )
+
+    assert result.observed_model == "claude-sonnet-5"
+    assert result.observation_source == "claude-modelUsage-configured"
+    assert set(result.model_usage) == {"claude-haiku-4-5-20251001", "claude-sonnet-5"}
+
+
 def test_codex_rollout_observation_is_best_effort_and_reads_effective_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home = tmp_path / "codex-home"
     session_id = "019f57ad-4863-7671-b450-ad0d9c3cd25e"

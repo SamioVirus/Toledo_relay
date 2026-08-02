@@ -207,6 +207,9 @@ def test_local_web_api_serves_ui_requires_nonce_and_blocks_artifact_traversal(tm
             assert "Continuous loop finished" in javascript
             assert "Safety, failure, and permission gates still stop immediately." in javascript
             assert 'runStatusLabel(status)' in javascript
+            assert "Number(loop?.completed_cycles || 0)" in javascript
+            assert "Number(state.cycle || 1)" not in javascript
+            assert "station.status" in javascript
 
         status, bootstrap = request_json(base + "/api/bootstrap")
         assert status == 200 and bootstrap["nonce"] == "test-nonce"

@@ -266,11 +266,20 @@ function renderRun() {
   const strip = $("#run-status-strip");
   strip.hidden = false;
   const loop = state.continuous_loop;
+  const targetCycles = Number(loop?.target_cycles || 1);
+  const completedCycles = Math.min(
+    Number(loop?.completed_cycles || 0),
+    targetCycles,
+  );
   const loopStatus = loop?.enabled
-    ? `<span>loop ${Math.min(Number(state.cycle || 1), Number(loop.target_cycles || 1))}/${Number(loop.target_cycles || 1)}${loop.status === "target_reached" ? " complete" : ""}</span>`
+    ? `<span>loop ${completedCycles}/${targetCycles}${loop.status === "target_reached" ? " complete" : ""}</span>`
     : "";
   const stack = Array.isArray(state.workflow_stack) ? state.workflow_stack : [];
-  const cadencePath = (state.cadence_backbone?.stations || []).map((station) => station.cadence).filter(Boolean).join(" → ");
+  const cadencePath = (state.cadence_backbone?.stations || []).map((station) => {
+    const cadence = String(station.cadence || "").trim();
+    const status = String(station.status || "").trim();
+    return cadence && status ? `${cadence} ${status}` : cadence;
+  }).filter(Boolean).join(" → ");
   const stackStatus = stack.length > 1 ? `<span>stack ${Number(state.workflow_stack_index || 0) + 1}/${stack.length}${cadencePath ? ` · ${escapeHtml(cadencePath)}` : ""}</span>` : "";
   strip.innerHTML = `<span>${escapeHtml(runStatusLabel(state.status))}</span>${loopStatus}${stackStatus}<span>${escapeHtml(stage.title || state.current_stage || "")}</span><span>${escapeHtml(profile.provider || "")}</span><span>${escapeHtml(profile.model || "")}</span><span>${escapeHtml(profile.effort || "")}</span><span>$${cost.toFixed(2)}</span><span>${state.worker?.active ? "worker active" : "worker idle"}</span>`;
   $("#run-header").innerHTML = `<div><p class="eyebrow">${escapeHtml(runStatusLabel(state.status).toUpperCase())}</p><h2>${escapeHtml(heading || "Project completed")}</h2></div><div class="run-facts" id="run-facts"><span class="fact">${escapeHtml(state.project)}</span><span class="fact">${escapeHtml((state.working_revision || state.source_revision || "").slice(0, 8))}</span><button class="quiet-button run-action" id="export-run" title="Download the full conversation and transport prompts as plain text">Export plain text</button><button class="quiet-button run-action" id="copy-run" title="Copy the same full plain-text conversation">Copy all</button>${canRecover ? '<button class="accept-button run-action" id="recover-run">Recover run</button>' : ''}</div>`;

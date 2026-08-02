@@ -73,6 +73,21 @@ class SessionAdapter(ProviderAdapter):
         return {"provider": self.provider, "ready": True, "generation": "fixture"}
 
 
+class EffortObservingSessionAdapter(SessionAdapter):
+    def __init__(self, provider: str, scripted: list[tuple[str, str]]) -> None:
+        super().__init__(provider, scripted)
+        self.observer_calls = 0
+
+    def invoke_configured_with_effort_observation(
+        self, route: str, prompt: bytes, working_directory: Path, **kwargs: Any
+    ) -> ProviderResult:
+        self.observer_calls += 1
+        result = super().invoke_configured(route, prompt, working_directory, **kwargs)
+        result.observed_reasoning = kwargs["reasoning"]
+        result.reasoning_observation_source = "fixture-stop-hook"
+        return result
+
+
 class ReviewMutatingAdapter(SessionAdapter):
     def invoke_configured(self, route: str, prompt: bytes, working_directory: Path, **kwargs: Any) -> ProviderResult:
         result = super().invoke_configured(route, prompt, working_directory, **kwargs)
@@ -243,7 +258,7 @@ def test_continuous_cycle_preserves_a_and_b_and_starts_fresh_c(tmp_path: Path, w
         ("implementation", response("continue", "Implemented once")),
         ("implementation-repair", response("continue", "Implemented repair")),
     ], writer=True)
-    claude = SessionAdapter("claude", [
+    claude = EffortObservingSessionAdapter("claude", [
         ("planning-review", response("continue", "Plan finding")),
         ("planning-review", response("ready", "Plan approved")),
         ("implementation-review", response("continue", "Implementation defect")),
@@ -273,6 +288,8 @@ def test_continuous_cycle_preserves_a_and_b_and_starts_fresh_c(tmp_path: Path, w
     assert claude.invocations[-1]["route"] == "next-task"
     assert claude.invocations[-1]["model"] == "claude-fable-5"
     assert all(item["session_id"] == "claude-session-1" for item in claude.invocations)
+    assert claude.observer_calls == len(claude.invocations)
+    assert all(turn["observed_reasoning"] == turn["configured_reasoning"] for turn in state["turns"] if turn["provider"] == "claude")
 
     handoff = state["cycles"][0]["approved_handoff"]
     assert app.artifact(run_id, handoff).decode("utf-8") == "Revised plan"

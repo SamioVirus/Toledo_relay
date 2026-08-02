@@ -1519,7 +1519,10 @@ class CycleOrchestrator:
         self._save(run_id, state)
         adapter = self.adapters[profile.provider]
         known_session_ids = self._provider_session_ids(state, profile.provider)
-        result = adapter.invoke_configured(
+        invoke_configured = adapter.invoke_configured
+        if profile.provider == "claude":
+            invoke_configured = getattr(adapter, "invoke_configured_with_effort_observation", invoke_configured)
+        result = invoke_configured(
             stage.id,
             prompt,
             worktree,
@@ -1592,7 +1595,7 @@ class CycleOrchestrator:
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
             self._save(run_id, state)
-            correction = adapter.invoke_configured(
+            correction = invoke_configured(
                 stage.id,
                 correction_prompt,
                 worktree,

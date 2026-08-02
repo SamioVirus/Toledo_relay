@@ -567,6 +567,15 @@ class ClaudeAdapter(ProviderAdapter):
         result.configured_model = model
         result.configured_reasoning = reasoning
         result.session_action = session_action
+        # Claude's first result can include an auxiliary model (currently the
+        # lightweight helper) alongside the configured model.  The result
+        # envelope does not always expose a singular `model` field, so prefer
+        # the explicitly configured key when the provider's modelUsage map
+        # contains it.  This is still provider-reported evidence; it does not
+        # turn a missing or conflicting map into a false observation.
+        if not result.observed_model and model in result.model_usage:
+            result.observed_model = model
+            result.observation_source = "claude-modelUsage-configured"
         return result
 
     def check(self) -> dict[str, Any]:
