@@ -504,6 +504,91 @@ def test_cadence_stack_rejects_weekly_to_hourly_skip(
         )
 
 
+def test_weekly_daily_cadence_boundary_resets_continuous_loop_budget(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("strategy-propose", sentinel("continue", "Weekly plan one")),
+        ("strategy-operator", sentinel("continue", "Weekly dispatch one")),
+        ("strategy-propose", sentinel("continue", "Weekly plan two")),
+        ("strategy-operator", sentinel("continue", "Weekly dispatch two")),
+        ("strategy-propose", sentinel("continue", "Weekly plan three")),
+        ("strategy-operator", sentinel("continue", "Weekly dispatch three")),
+        ("test-propose", sentinel("human", "Daily proof needs host-side evidence")),
+    ], writer=True)
+    claude = SessionAdapter("claude", [
+        ("strategy-review", sentinel("ready", "Weekly plan one ready")),
+        ("strategy-audit", sentinel("ready", "Weekly dispatch one ready")),
+        ("strategy-next-task", sentinel("human", "Weekly next one")),
+        ("strategy-review", sentinel("ready", "Weekly plan two ready")),
+        ("strategy-audit", sentinel("ready", "Weekly dispatch two ready")),
+        ("strategy-next-task", sentinel("human", "Weekly next two")),
+        ("strategy-review", sentinel("ready", "Weekly plan three ready")),
+        ("strategy-audit", sentinel("ready", "Weekly dispatch three ready")),
+        ("strategy-next-task", sentinel("human", "Daily dispatch next")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+
+    with pytest.raises(ValueError, match="adjacent stations"):
+        app.create_run(
+            b"Reject a direct weekly-to-hourly move",
+            "test",
+            workflow="weekly-governance",
+            workflow_stack=["weekly-governance", "hourly-station"],
+            continuous_loop_enabled=True,
+            continuous_loop_cycles=3,
+        )
+
+    run_id = app.create_run(
+        b"Prove the weekly-to-daily station budget reset",
+        "test",
+        workflow="weekly-governance",
+        workflow_stack=["weekly-governance", "daily-dispatch", "hourly-station"],
+        continuous_loop_enabled=True,
+        continuous_loop_cycles=3,
+    )
+    weekly = app.run_to_stop(run_id)
+    assert weekly["workflow"] == "weekly-governance"
+    assert weekly["cadence_backbone"]["stations"][0]["status"] == "active"
+    assert weekly["continuous_loop"]["status"] == "target_reached"
+    assert weekly["continuous_loop"]["station_base_cycle"] == 0
+    assert weekly["continuous_loop"]["completed_cycles"] == 3
+    assert sum(event["kind"] == "continuous_loop.target_reached" for event in weekly["events"]) == 1
+
+    daily = app.decide(run_id, "no")
+    assert daily["workflow"] == "daily-dispatch"
+    assert daily["workflow_stack_index"] == 1
+    assert daily["cadence_backbone"]["stations"] == [
+        {"cadence": "weekly", "index": 0, "status": "complete", "workflow": "weekly-governance"},
+        {"cadence": "daily", "index": 1, "status": "active", "workflow": "daily-dispatch"},
+        {"cadence": "hourly", "index": 2, "status": "pending", "workflow": "hourly-station"},
+    ]
+    assert daily["continuous_loop"] == {
+        "enabled": True,
+        "target_cycles": 3,
+        "completed_cycles": 0,
+        "station_base_cycle": 3,
+        "status": "running",
+    }
+    resets = [
+        event for event in daily["events"]
+        if event["kind"] == "continuous_loop.station_reset"
+    ]
+    assert len(resets) == 1
+    reset_artifact = json.loads(app.artifact(run_id, f"events/{resets[0]['id']}.json"))
+    assert reset_artifact["station"] == 1
+    assert reset_artifact["workflow"] == "daily-dispatch"
+    assert reset_artifact["target_cycles"] == 3
+
+    handoff = daily["cadence_backbone"]["handoffs"][0]
+    handoff_bytes = app.artifact(run_id, handoff["artifact_file"])
+    assert handoff["source_cadence"] == "weekly"
+    assert handoff["target_cadence"] == "daily"
+    assert handoff["artifact_sha256"] == sha256(handoff_bytes)
+    assert daily["artifacts"][handoff["artifact_file"]]["sha256"] == sha256(handoff_bytes)
+    assert app._context_section(daily, "stack-handoff") is not None
+
+
 def test_other_revises_next_task_in_same_reviewer_session(tmp_path: Path, writable_project: ProjectDefinition):
     codex = SessionAdapter("codex", [
         ("planning-propose", response("continue", "Plan")),
