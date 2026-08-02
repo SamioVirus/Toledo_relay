@@ -993,6 +993,87 @@ def test_step_mode_transports_exact_optional_owner_direction(
     assert direction not in codex.invocations[-1]["prompt"]
 
 
+def test_operator_can_seal_verified_evidence_at_implementation_round_cap(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan the evidence-only task")),
+        ("implementation", sentinel("continue", "No source change is required")),
+        ("implementation-repair", sentinel("continue", "No repair is warranted")),
+        ("implementation-repair", sentinel("continue", "The same evidence remains valid")),
+    ])
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "The plan is bounded")),
+        ("implementation-review", sentinel("continue", "Audit the evidence")),
+        ("implementation-review", sentinel("continue", "No new defect is shown")),
+        ("implementation-review", sentinel("continue", "No new defect is shown")),
+        ("next-task", sentinel("human", "Wait for the operator's next-task decision")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Seal the evidence-only station", "test")
+
+    paused = app.run_to_stop(run_id)
+    assert paused["pending_human_decision"] == "implementation_round_cap_reached"
+    assert paused["current_stage"] == "implementation-review"
+    assert paused["pending_round_extension"]["target"] == "implementation-repair"
+    assert paused["current_implementation_evidence"]["changed_paths"] == []
+
+    direction = b"The evidence is sufficient; seal it and move to the next-task gate.\n"
+    accepted = app.decide(run_id, "other", direction, follow_up="seal_evidence")
+
+    assert accepted["status"] == "paused"
+    assert accepted["pending_human_decision"] == "next_task_approval"
+    assert accepted["current_stage"] == "next-task"
+    assert accepted["completion_receipt"]
+    assert accepted["pending_round_extension"] is None
+    assert accepted["working_revision"] == accepted["source_revision"]
+    decision = accepted["decisions"][-1]
+    assert decision["choice"] == "other"
+    assert decision["follow_up"] == "seal_evidence"
+    assert app.artifact(run_id, decision["file"]).decode("utf-8") == direction.decode("utf-8")
+    assert any(
+        event["kind"] == "implementation.evidence.sealed_by_operator"
+        for event in accepted["events"]
+    )
+    assert direction in claude.invocations[-1]["prompt"]
+    assert len([item for item in codex.invocations if item["route"] == "implementation-repair"]) == 2
+
+
+def test_seal_evidence_rejects_failed_required_validation(
+    tmp_path: Path, writable_project: ProjectDefinition
+):
+    codex = SessionAdapter("codex", [
+        ("planning-propose", sentinel("continue", "Plan")),
+        ("implementation", sentinel("continue", "No source change")),
+        ("implementation-repair", sentinel("continue", "No repair")),
+        ("implementation-repair", sentinel("continue", "No repair")),
+    ])
+    claude = SessionAdapter("claude", [
+        ("planning-review", sentinel("ready", "Plan ready")),
+        ("implementation-review", sentinel("continue", "Audit")),
+        ("implementation-review", sentinel("continue", "Audit again")),
+        ("implementation-review", sentinel("continue", "Audit again")),
+    ])
+    app = make_cycle(tmp_path, writable_project, codex, claude)
+    run_id = app.create_run(b"Do not bypass a failed validation", "test")
+    paused = app.run_to_stop(run_id)
+    paused["current_implementation_evidence"]["validations"] = {
+        "unit-tests": {"required": True, "state": "failed"}
+    }
+    app._save(run_id, paused)
+
+    with pytest.raises(ValueError, match="failed required validation"):
+        app.decide(
+            run_id,
+            "other",
+            b"Do not seal failed evidence.\n",
+            follow_up="seal_evidence",
+        )
+    unchanged = app.state(run_id)
+    assert unchanged["pending_human_decision"] == "implementation_round_cap_reached"
+    assert not any(decision.get("follow_up") == "seal_evidence" for decision in unchanged["decisions"])
+
+
 def test_planner_close_variant_resumes_a_after_b_accepts_c(
     tmp_path: Path, writable_project: ProjectDefinition
 ):

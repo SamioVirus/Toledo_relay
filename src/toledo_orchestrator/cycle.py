@@ -2961,6 +2961,57 @@ class CycleOrchestrator:
             + "\n"
         ).encode("utf-8")
 
+    def _validate_seal_evidence_follow_up(
+        self,
+        state: dict[str, Any],
+        reason: str,
+    ) -> tuple[StageDefinition, str, dict[str, Any]]:
+        """Validate an explicit operator acceptance at an implementation cap.
+
+        A round cap is a safe pause, not proof that another repair is useful.
+        This path lets an operator accept the current sealed evidence when the
+        worktree, validation results, and review-stage snapshot still agree.
+        It never turns a failed or indeterminate validation into an acceptance.
+        """
+        if reason != "implementation_round_cap_reached":
+            raise ValueError("seal_evidence is available only at an implementation round cap")
+        pending_round = state.get("pending_round_extension")
+        if not isinstance(pending_round, dict) or pending_round.get("reason") != reason:
+            raise ValueError("the implementation round-cap context is missing")
+        workflow = self._workflow(state)
+        stage_id = str(state.get("current_stage") or "")
+        stage = workflow.stages.get(stage_id)
+        if stage is None or stage.phase != "implementation-review":
+            raise ValueError("seal_evidence requires the implementation review stage")
+        if str(pending_round.get("stage") or "") != stage.id:
+            raise ValueError("the round-cap stage does not match the current review stage")
+        next_stage = workflow.next_task_stage
+        if not next_stage or next_stage not in workflow.stages:
+            raise ValueError("the workflow has no next-task stage for sealed evidence")
+        if state.get("pending_validation") or state.get("validation_inflight"):
+            raise ValueError("cannot seal evidence while validation is pending or running")
+        evidence = state.get("current_implementation_evidence")
+        if not isinstance(evidence, dict):
+            raise ValueError("implementation evidence is missing")
+        validations = evidence.get("validations") or {}
+        if pending_required_validations(validations):
+            raise ValueError("cannot seal evidence while a required validation receipt is pending")
+        if not required_local_validations_passed(validations):
+            raise ValueError("cannot seal evidence with a failed required validation")
+        if state.get("pending_commit"):
+            raise ValueError("cannot seal evidence while an acceptance commit is pending")
+        identity_error = self._worktree_identity_error(state)
+        if identity_error:
+            raise ValueError(identity_error)
+        current = self._collect_worktree_evidence(state)
+        assert_allowed_changes(self._project(state), current.changed_paths)
+        expected_patch = str((evidence.get("patch") or {}).get("sha256") or "")
+        if not expected_patch or expected_patch != sha256(current.patch):
+            raise ValueError("implementation evidence no longer matches the worktree patch")
+        if list(current.changed_paths) != list(evidence.get("changed_paths", [])):
+            raise ValueError("implementation evidence no longer matches the worktree paths")
+        return stage, next_stage, evidence
+
     @_locked
     def decide(
         self,
@@ -2980,28 +3031,36 @@ class CycleOrchestrator:
             raise ValueError("use the advance command to start the next step")
         if reason == "validation_receipt_required" and choice == "yes":
             raise ValueError("attach the required validation receipt with the validate command")
+        seal_stage: StageDefinition | None = None
+        seal_next_stage: str | None = None
+        seal_evidence: dict[str, Any] | None = None
         if follow_up:
-            if follow_up != "baseline_failure":
+            if follow_up == "seal_evidence":
+                if choice != "other":
+                    raise ValueError("seal_evidence requires choice=other")
+                seal_stage, seal_next_stage, seal_evidence = self._validate_seal_evidence_follow_up(state, reason)
+            elif follow_up != "baseline_failure":
                 raise ValueError("unknown decision follow-up")
-            workflow = self._workflow(state)
-            allowed = (
-                reason == "validation_baseline_failure_decision" and choice == "yes"
-            ) or (
-                reason == "next_task_approval" and choice == "other"
-            ) or (
-                reason == "provider_invocation_failed"
-                and choice == "yes"
-                and state.get("current_stage") in {
-                    workflow.next_task_stage,
-                    workflow.next_task_revision_stage,
-                }
-            )
-            if not allowed:
-                raise ValueError("the older issue cannot be carried forward from this decision")
-            if text.strip():
-                raise ValueError("decision text cannot accompany a structured follow-up")
-            text = self._baseline_failure_follow_up(state)
-            decode_text_artifact(text, "decision")
+            else:
+                workflow = self._workflow(state)
+                allowed = (
+                    reason == "validation_baseline_failure_decision" and choice == "yes"
+                ) or (
+                    reason == "next_task_approval" and choice == "other"
+                ) or (
+                    reason == "provider_invocation_failed"
+                    and choice == "yes"
+                    and state.get("current_stage") in {
+                        workflow.next_task_stage,
+                        workflow.next_task_revision_stage,
+                    }
+                )
+                if not allowed:
+                    raise ValueError("the older issue cannot be carried forward from this decision")
+                if text.strip():
+                    raise ValueError("decision text cannot accompany a structured follow-up")
+                text = self._baseline_failure_follow_up(state)
+                decode_text_artifact(text, "decision")
         if choice == "other" and not text.strip():
             raise ValueError("the other decision requires explanatory text")
         if choice != "other" and text.strip() and not follow_up:
@@ -3022,6 +3081,9 @@ class CycleOrchestrator:
             choice=choice,
             reason=reason,
             title=(
+                "Human: seal current evidence"
+                if follow_up == "seal_evidence"
+                else
                 "Human: advance workflow stack"
                 if reason == "next_task_approval" and choice == "no" and self._stack_remaining(state)
                 else "Human: project complete"
@@ -3031,6 +3093,26 @@ class CycleOrchestrator:
             follow_up=follow_up,
         )
         state["pending_human_decision"] = None
+        if follow_up == "seal_evidence":
+            assert seal_stage is not None and seal_next_stage is not None and seal_evidence is not None
+            state["pending_round_extension"] = None
+            state["pending_repair_stage"] = None
+            state["status"] = "running"
+            self._accept_implementation(state, seal_stage, seal_next_stage, seal_evidence)
+            if state.get("completion_receipt"):
+                self._event(
+                    state,
+                    "implementation.evidence.sealed_by_operator",
+                    title="Evidence sealed by operator",
+                    details={
+                        "stage": seal_stage.id,
+                        "next_stage": seal_next_stage,
+                        "completion_receipt": state["completion_receipt"],
+                        "accepted_revision": state["working_revision"],
+                    },
+                )
+            self._save(run_id, state)
+            return self.run_to_stop(run_id)
         if reason == "next_task_approval":
             if choice == "no":
                 if self._advance_stack_layer(state, reason=reason):

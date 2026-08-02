@@ -93,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     decide = commands.add_parser("decide")
     decide.add_argument("run_id")
     decide.add_argument("--choice", required=True, choices=("yes", "no", "other"))
+    decide.add_argument("--follow-up", choices=("baseline_failure", "seal_evidence"))
     decide.add_argument("--text")
     decide.add_argument("--text-file", type=Path)
     advance = commands.add_parser("advance")
@@ -245,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.text and args.text_file:
                 raise ValueError("use either --text or --text-file")
             payload = args.text_file.read_bytes() if args.text_file else (args.text or "").encode("utf-8")
-            _emit(engine.decide(args.run_id, args.choice, payload))
+            _emit(engine.decide(args.run_id, args.choice, payload, args.follow_up))
             return 0
         if args.command == "advance":
             if not isinstance(engine, CycleOrchestrator):

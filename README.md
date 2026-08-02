@@ -126,6 +126,14 @@ python -m toledo_orchestrator decide RUN_ID --choice other --text "Make the next
 - `no` ends the continuous run, or advances to the next explicitly stacked layer when one remains.
 - `other` returns the exact feedback to whichever strategic session produced the proposal and reopens the gate with its revision.
 
+At an implementation round cap, an operator may accept an intact evidence snapshot without sending the run back through another repair round. This is a typed, human-only action: it requires the implementation-review gate, no pending required validation, and a worktree that still matches the sealed evidence:
+
+```powershell
+python -m toledo_orchestrator decide RUN_ID --choice other --follow-up seal_evidence --text "The evidence is sufficient; seal it and continue to the next-task gate."
+```
+
+The controller rechecks the worktree and validation evidence, creates the ordinary completion receipt, and resumes at the workflow's next-task stage. It rejects failed, pending, or drifted evidence.
+
 Configured local validations use a high-threshold approval policy: routine tests, linters, compilers, read-only assertions, and smoke reads run automatically in the isolated worktree. Relay pauses only when a command clearly advertises consequential effects such as destructive file or Git changes, software installation, elevated/system operations, container or infrastructure mutation, deployment, publishing, or external writes. The approval gate explains the detected risk in plain language and still exposes the exact command. Required remote validations pause for a patch- and revision-bound receipt:
 
 ```powershell
