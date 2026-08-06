@@ -1,5 +1,20 @@
 # Evidence log
 
+## 2026-08-05 — Self-contained Relay skill, dual-app installation, and canonical GitHub distribution
+
+- Replaced the narrow `relay-operator` package with the valid skill identifier `relay-use-skill` and user-facing label `relay_use_skill`. The package now carries its own Relay architecture, installation/update, repository registration, workflow, default-prompt, live model-selection, supervision/gate, recovery, evidence, and maintenance contracts without depending on Toledo control docs outside the skill.
+- Added `manage_skill.py` to fetch and compare canonical `main`, permit only safe clean fast-forward updates, and install one repository-owned skill through verified links into Codex, Claude, and Agent Skills discovery directories. The live installations at `~/.codex/skills/relay-use-skill`, `~/.claude/skills/relay-use-skill`, and `~/.agents/skills/relay-use-skill` all resolve to the canonical checkout; verified legacy app links were removed.
+- Made `https://github.com/SamioVirus/Toledo_relay` the public distribution source. Root agent instructions, the maintenance reference, README, and synchronization tests require operator-visible Relay changes to update the skill when needed and reach a canonical GitHub branch before being called delivered. The previously empty public repository was initialized from the existing committed `main` history after a bounded tracked-path and secret-pattern scan; the only pattern match was an intentional fake test credential.
+- Published the skill's required bounded agent bridge in the same change: workflow listing, `agent-brief`, and validated workflow-variant save-as commands with focused coverage. No provider run, existing Relay run mutation, merge, deployment, secret write, or runtime-artifact publication occurred.
+- Verification: skill validator passed through the canonical, Codex, Claude, and Agent Skills paths; focused bridge/synchronization suite `7 passed`; full Relay suite `201 passed in 129.93s`; Python compilation and `git diff --check` passed.
+
+## 2026-08-03 — Restored local Gemma quick-take service without touching the active run
+
+- **Observed cause**: Relay was healthy, but Ollama was not listening on `127.0.0.1:11434`; the local `gemma4:12b-it-qat` model was installed and available once Ollama was started. The screenshot's `Gemma 4 is writing…` state was the non-blocking sidecar status, not a controller wait.
+- **Bounded repair**: Started the existing local Ollama app only. No Relay restart and no `recover`, `decide`, `advance`, or other authoritative run mutation was issued. The latest active-run quick-take retry was triggered only through the existing read-side projection and writes its normal sidecar artifact.
+- **Proof**: The exact Relay `OllamaSummaryClient` returned a non-empty Gemma digest in `40,955 ms` using `gemma4:12b-it-qat`; latest active-run sidecar `turn.0075.summary.json` reached `ready` in `9,839 ms` with the recorded source hash intact. The run remained `running` at current turn `75`.
+- **Verification**: `python -m pytest tests/test_turn_summaries.py -q` → `10 passed`; Python compile, JavaScript syntax, and `git diff --check` passed. Existing unrelated working-tree changes were preserved.
+
 ## 2026-07-18 — Explicit project completion after accepted implementation
 
 - Post-implementation human gates now offer a positive terminal outcome instead of forcing the operator to request another task or misuse cancellation. `Complete project` is available only when the current cycle has a sealed completion receipt and the run is paused at next-task selection, next-task approval, or a failed next-task provider turn.

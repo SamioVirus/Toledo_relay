@@ -1,0 +1,4 @@
+interface:
+  display_name: "relay_use_skill"
+  short_description: "Install, operate, and maintain Toledo Relay"
+  default_prompt: "Use $relay-use-skill to make sure Relay is current, send this task through the right workflow, supervise it, and report verified evidence."

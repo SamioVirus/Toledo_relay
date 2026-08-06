@@ -13,6 +13,29 @@ Codex implementation C   <->  Claude review session B
 
 Session identity, provider session ID, model/effort profile, repository, permission, and workflow stage are independent controls. Provider history improves continuity; exact prompts, outputs, handoffs, patches, validations, decisions, and completion receipts remain authoritative files under `%LOCALAPPDATA%\ToledoOrchestrator`.
 
+## AI-agent handoff
+
+The repository-owned `relay-use-skill` package under `skills/relay-use-skill` is the self-contained operating surface for Codex and Claude. It explains Relay's authority model, installation and GitHub freshness checks, repository registration, workflows, default prompts, live model selection, supervision, gates, recovery, evidence, and maintenance. Its user-facing app label is `relay_use_skill`; invoke it as `$relay-use-skill`.
+
+Install the same canonical folder into both apps:
+
+```powershell
+python skills/relay-use-skill/scripts/manage_skill.py install --target codex --target claude --target agents --remove-legacy
+python skills/relay-use-skill/scripts/manage_skill.py status
+```
+
+The app entries are links rather than copies, so the controller and skill evolve in the same Git commit. The management script fetches `https://github.com/SamioVirus/Toledo_relay` for freshness and only permits a clean, non-divergent fast-forward update.
+
+Agents should use the bounded machine view instead of interpreting the full run state:
+
+```powershell
+python -m toledo_orchestrator workflows
+python -m toledo_orchestrator agent-brief RUN_ID
+python -m toledo_orchestrator workflow-save-as --spec-file C:\path\workflow.json
+```
+
+The skill deliberately uses the local CLI rather than MCP. Add an MCP surface only when a concrete remote or hosted-tool requirement cannot be met by the file-authoritative CLI.
+
 ## Local UI
 
 Install the package in editable mode and launch the loopback-only UI:
@@ -31,18 +54,11 @@ Each successful substantive turn also gets a collapsed **Quick take**: a one- or
 ```powershell
 python -m toledo_orchestrator check
 python -m toledo_orchestrator profiles --workflow continuous-development
-python -m toledo_orchestrator profile-set --profile codex-planning --model gpt-5.6-sol --effort xhigh
+python -m toledo_orchestrator profile-set --profile PROFILE --model LIVE_MODEL_ID --effort SUPPORTED_EFFORT
 python -m toledo_orchestrator projects
 ```
 
-The packaged A/B/C defaults reflect the owner's current workflow and remain editable under the runtime configuration directory:
-
-- Planning A: Codex `gpt-5.6-sol`, `xhigh`, read-only.
-- Planning review B: Claude `claude-fable-5`, `xhigh`, read-only.
-- Implementation C: Codex `gpt-5.6-terra`, `high`, isolated workspace-write.
-- Implementation review B: Claude `claude-opus-5`, `max`, read-only.
-
-Friendly display labels are separate from exact CLI arguments. `profile-set` and the UI write runtime-local overrides; Python code and packaged defaults remain unchanged.
+Packaged profiles reflect the reviewed route at their source revision and remain editable under the runtime configuration directory. Never select model IDs or effort values from README prose: inspect `check`, `workflows`, and `profiles` at execution time, then verify requested-versus-observed metadata from successful turns. Friendly display labels are separate from exact CLI arguments. `profile-set` and the UI write runtime-local overrides; Python code and packaged defaults remain unchanged.
 
 Two inherited workflow variants cover both strategic-closure patterns observed in the owner's manual process:
 
@@ -169,6 +185,6 @@ python -m toledo_orchestrator run --project toledo --workflow dev-review --reque
 
 See [session-cycle-design.md](docs/session-cycle-design.md) for the reusable interaction principles extracted from the manual A/B/C transcripts.
 
-## Durability
+## Durability and publishing
 
-The working repository remains outside OneDrive. Its `origin` is the bare mirror at `C:\Users\sammo\OneDrive\Documents\toledo-orchestrator.git`. Push each accepted orchestrator code commit with `git push origin main`. Runtime run artifacts remain private and outside Git.
+The canonical public source is `https://github.com/SamioVirus/Toledo_relay`. A local bare mirror may remain as a secondary durability remote. Every accepted Relay change must keep `skills/relay-use-skill` synchronized when the operator contract changes, pass `tests/test_relay_skill_sync.py` and the skill validator, and be pushed to a branch in the canonical GitHub repository before it is called delivered. Runtime run artifacts, provider streams, secrets, and private requests remain outside Git.
