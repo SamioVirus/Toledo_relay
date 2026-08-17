@@ -13,6 +13,29 @@ Codex implementation C   <->  Claude review session B
 
 Session identity, provider session ID, model/effort profile, repository, permission, and workflow stage are independent controls. Provider history improves continuity; exact prompts, outputs, handoffs, patches, validations, decisions, and completion receipts remain authoritative files under `%LOCALAPPDATA%\ToledoOrchestrator`.
 
+## AI-agent handoff
+
+The repository-owned `relay-use-skill` package under `skills/relay-use-skill` is the self-contained operating surface for Codex and Claude. It explains Relay's authority model, installation and GitHub freshness checks, repository registration, workflows, default prompts, live model selection, supervision, gates, recovery, evidence, and maintenance. Its user-facing app label is `relay_use_skill`; invoke it as `$relay-use-skill`.
+
+Install the same canonical folder into both apps:
+
+```powershell
+python skills/relay-use-skill/scripts/manage_skill.py install --target codex --target claude --target agents --remove-legacy
+python skills/relay-use-skill/scripts/manage_skill.py status
+```
+
+The app entries are links rather than copies, so the controller and skill evolve in the same Git commit. The management script fetches `https://github.com/SamioVirus/Toledo_relay` for freshness and only permits a clean, non-divergent fast-forward update.
+
+Agents should use the bounded machine view instead of interpreting the full run state:
+
+```powershell
+python -m toledo_orchestrator workflows
+python -m toledo_orchestrator agent-brief RUN_ID
+python -m toledo_orchestrator workflow-save-as --spec-file C:\path\workflow.json
+```
+
+The skill deliberately uses the local CLI rather than MCP. Add an MCP surface only when a concrete remote or hosted-tool requirement cannot be met by the file-authoritative CLI.
+
 ## Local UI
 
 Install the package in editable mode and launch the loopback-only UI:
@@ -31,18 +54,13 @@ Each successful substantive turn also gets a collapsed **Quick take**: a one- or
 ```powershell
 python -m toledo_orchestrator check
 python -m toledo_orchestrator profiles --workflow continuous-development
-python -m toledo_orchestrator profile-set --profile codex-planning --model gpt-5.6-sol --effort xhigh
+python -m toledo_orchestrator profile-set --profile PROFILE --model LIVE_MODEL_ID --effort SUPPORTED_EFFORT
 python -m toledo_orchestrator projects
 ```
 
-The packaged A/B/C defaults reflect the owner's current workflow and remain editable under the runtime configuration directory:
+Packaged profiles reflect the reviewed route at their source revision and remain editable under the runtime configuration directory. Never select model IDs or effort values from README prose: inspect `check`, `workflows`, and `profiles` at execution time, then verify requested-versus-observed metadata from successful turns. Friendly display labels are separate from exact CLI arguments. `profile-set` and the UI write runtime-local overrides; Python code and packaged defaults remain unchanged.
 
-- Planning A: Codex `gpt-5.6-sol`, `xhigh`, read-only.
-- Planning review B: Claude `claude-fable-5`, `xhigh`, read-only.
-- Implementation C: Codex `gpt-5.6-terra`, `high`, isolated workspace-write.
-- Implementation review B: Claude `claude-opus-5`, `max`, read-only.
-
-Friendly display labels are separate from exact CLI arguments. `profile-set` and the UI write runtime-local overrides; Python code and packaged defaults remain unchanged.
+A fresh checkout includes a deliberately unconfigured `toledo` project placeholder. It contains no repository instructions or validations, points at `C:\path\to\your\repo`, and keeps implementation disabled. Register a real repository with `project-add` before running a workflow; the command writes the project definition to the runtime configuration directory rather than this checkout.
 
 Two inherited workflow variants cover both strategic-closure patterns observed in the owner's manual process:
 
@@ -64,7 +82,7 @@ Repository selection is easy but intentionally run-scoped: choose the project wh
 ## Running the continuous workflow
 
 ```powershell
-python -m toledo_orchestrator run --project toledo --workflow continuous-development --request-file "C:\path\to\request.md"
+python -m toledo_orchestrator run --project my-repo --workflow continuous-development --request-file "C:\path\to\request.md"
 ```
 
 The source checkout must be clean so the selected committed revision cannot silently omit local work. The command runs until it completes or reaches a human/failure gate. It creates a dedicated execution worktree and durable branch named `codex/orchestrator/<run-id>` from that revision. Planning/review turns remain read-only; only the implementation profile receives workspace-write access inside that worktree. Accepted changes are committed on the execution branch but are never merged, pushed, deployed, or copied into the user's source checkout automatically.
@@ -72,7 +90,7 @@ The source checkout must be clean so the selected committed revision cannot sile
 For a bounded self-running sequence, enable **Continuous loop** in New Cycle and choose 3, 4, or 5 cycles, or use `--continuous-loop 3` on the CLI. Relay takes safe recommended approvals: it commits a reviewed implementation, records and carries an unchanged older test failure into the next task when present, accepts each sealed next-task proposal, and then runs a fresh idea → plan/review → implementation/audit cycle. It stops after the selected number of completed cycles with the following idea ready for human review. Consequential-command approval, new validation regressions, provider failures, ambiguity, repair caps, required receipts, and recovery gates still stop immediately.
 
 ```powershell
-python -m toledo_orchestrator run --project toledo --workflow continuous-development --request-file "C:\path\to\request.md" --continuous-loop 3
+python -m toledo_orchestrator run --project my-repo --workflow continuous-development --request-file "C:\path\to\request.md" --continuous-loop 3
 ```
 
 ### Specialized workflow layers
@@ -80,7 +98,7 @@ python -m toledo_orchestrator run --project toledo --workflow continuous-develop
 The New Cycle dialog can add, remove, and reorder workflow layers before launch. Layers share one isolated worktree but not an implicit session: each layer receives a launch-time workflow/prompt snapshot, closes at its next-task gate, and starts the next layer only when you explicitly continue. The same stack is available from the CLI:
 
 ```powershell
-python -m toledo_orchestrator run --project toledo --workflow continuous-development --stack strategy-council --stack test-proof-gate --stack ui-studio --request-file "C:\path\to\request.md"
+python -m toledo_orchestrator run --project my-repo --workflow continuous-development --stack strategy-council --stack test-proof-gate --stack ui-studio --request-file "C:\path\to\request.md"
 ```
 
 The packaged specialist routes are:
@@ -102,7 +120,7 @@ Keep the cheap continuous loop as the scout. Add Strategy Council for consequent
 Use step mode when you want a deliberate control point before every provider turn:
 
 ```powershell
-python -m toledo_orchestrator run --project toledo --workflow continuous-development --request-file "C:\path\to\request.md" --step
+python -m toledo_orchestrator run --project my-repo --workflow continuous-development --request-file "C:\path\to\request.md" --step
 python -m toledo_orchestrator profile-set --profile codex-planning --model MODEL --effort EFFORT
 python -m toledo_orchestrator override RUN_ID --model MODEL --effort EFFORT --session-action continue
 python -m toledo_orchestrator advance RUN_ID --text "Use your judgment; fix real issues and push back on empty fear."
@@ -164,11 +182,17 @@ Workflow graphs are declarative. Stage prompt labels, prompt files, context, ses
 The original CLI-only workflow remains available:
 
 ```powershell
-python -m toledo_orchestrator run --project toledo --workflow dev-review --request-file .\request.md
+python -m toledo_orchestrator run --project my-repo --workflow dev-review --request-file .\request.md
 ```
 
 See [session-cycle-design.md](docs/session-cycle-design.md) for the reusable interaction principles extracted from the manual A/B/C transcripts.
 
-## Durability
+## Durability and publishing
 
-The working repository remains outside OneDrive. Its `origin` is the bare mirror at `C:\Users\sammo\OneDrive\Documents\toledo-orchestrator.git`. Push each accepted orchestrator code commit with `git push origin main`. Runtime run artifacts remain private and outside Git.
+The canonical public source is `https://github.com/SamioVirus/Toledo_relay`. A local bare mirror may remain as a secondary durability remote. Every accepted Relay change must keep `skills/relay-use-skill` synchronized when the operator contract changes, pass `tests/test_relay_skill_sync.py` and the skill validator, and be pushed to a branch in the canonical GitHub repository before it is called delivered. Runtime run artifacts, provider streams, secrets, and private requests remain outside Git.
+
+## Provider access and privacy
+
+Relay launches provider CLIs locally; it does not ship provider credentials or proxy a hosted provider account. Use only accounts and repositories you are authorized to use. If you build a product or service around Relay, use the provider's supported API, team, enterprise, or cloud authorization path. Do not route another person's consumer subscription login through Relay or share account credentials.
+
+Relay records exact prompts, provider responses, raw streams, and validation evidence in its local runtime directory (`%LOCALAPPDATA%\ToledoOrchestrator` on Windows). Treat that directory as private, keep it out of Git, and redact or remove it before sharing a run. See [SECURITY.md](SECURITY.md) for the public-release boundary.

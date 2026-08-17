@@ -9,8 +9,10 @@ from .configuration import (
     load_configured_projects,
     load_configured_workflows,
     save_project_value,
+    save_workflow_variant,
     update_profile,
 )
+from .agent_bridge import build_agent_brief
 from .core import Orchestrator
 from .cycle import CycleOrchestrator
 
@@ -82,6 +84,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status = commands.add_parser("status")
     status.add_argument("run_id")
+    agent_brief = commands.add_parser("agent-brief")
+    agent_brief.add_argument("run_id")
     show = commands.add_parser("show")
     show.add_argument("run_id")
     show.add_argument("--turn", type=int, required=True)
@@ -114,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("run_id")
     validate.add_argument("--receipt-file", type=Path, required=True)
     commands.add_parser("runs")
+    commands.add_parser("workflows")
     profiles = commands.add_parser("profiles")
     profiles.add_argument("--workflow", default="continuous-development")
     profile_set = commands.add_parser("profile-set")
@@ -123,6 +128,8 @@ def build_parser() -> argparse.ArgumentParser:
     profile_set.add_argument("--effort")
     profile_set.add_argument("--permission", choices=("read-only", "workspace-write"))
     profile_set.add_argument("--label")
+    workflow_save_as = commands.add_parser("workflow-save-as")
+    workflow_save_as.add_argument("--spec-file", type=Path, required=True)
     commands.add_parser("projects")
     commands.add_parser("catalog-research")
     pong = commands.add_parser("pong")
@@ -205,10 +212,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         _emit(engine.run_to_stop(run_id))
         return 0
-    if args.command in {"status", "show", "resume", "decide", "advance", "override", "recover", "validate", "artifact", "export", "cleanup"}:
+    if args.command in {"status", "agent-brief", "show", "resume", "decide", "advance", "override", "recover", "validate", "artifact", "export", "cleanup"}:
         engine, state = _state_engine(args.runtime_dir, args.run_id)
         if args.command == "status":
             _emit(state)
+            return 0
+        if args.command == "agent-brief":
+            run_dir = Path(engine.runs_dir) / args.run_id
+            _emit(build_agent_brief(state, run_dir))
             return 0
         if args.command == "show":
             sys.stdout.write(engine.show_turn(args.run_id, args.turn))
@@ -326,6 +337,39 @@ def main(argv: list[str] | None = None) -> int:
             })
         _emit(values)
         return 0
+    if args.command == "workflows":
+        workflows = load_configured_workflows(cycle.runtime_dir)
+        values = [{
+            "id": "dev-review",
+            "label": "Read-only development review",
+            "cadence": None,
+            "start_stage": "codex-propose",
+            "planning_round_cap": 3,
+            "implementation_round_cap": None,
+            "profiles": {},
+        }]
+        values.extend([
+            {
+                "id": workflow.id,
+                "label": workflow.label,
+                "cadence": workflow.cadence,
+                "start_stage": workflow.start_stage,
+                "planning_round_cap": workflow.planning_round_cap,
+                "implementation_round_cap": workflow.implementation_round_cap,
+                "profiles": {
+                    key: {
+                        "provider": profile.provider,
+                        "model": profile.model,
+                        "effort": profile.effort,
+                        "permission": profile.permission,
+                    }
+                    for key, profile in workflow.profiles.items()
+                },
+            }
+            for workflow in workflows.values()
+        ])
+        _emit(values)
+        return 0
     if args.command == "profiles":
         workflows = load_configured_workflows(cycle.runtime_dir)
         if args.workflow not in workflows:
@@ -343,6 +387,30 @@ def main(argv: list[str] | None = None) -> int:
             label=args.label,
         )
         _emit(value.public_summary()["profiles"][args.profile])
+        return 0
+    if args.command == "workflow-save-as":
+        spec = json.loads(args.spec_file.read_text(encoding="utf-8"))
+        if not isinstance(spec, dict):
+            raise ValueError("workflow spec must be a JSON object")
+        from .catalog import load_catalog, validate_selection
+
+        catalog = load_catalog(cycle.runtime_dir, refresh=False)
+        validate_profile = (
+            (lambda **kwargs: validate_selection(catalog, **kwargs))
+            if catalog.get("models")
+            else None
+        )
+        workflow = save_workflow_variant(
+            cycle.runtime_dir,
+            str(spec.get("base_workflow", "")),
+            str(spec.get("id", "")),
+            str(spec.get("label", "")),
+            profile_overrides=spec.get("profile_overrides") or None,
+            round_overrides=spec.get("round_overrides") or None,
+            prompt_overrides=spec.get("prompt_overrides") or None,
+            validate_profile=validate_profile,
+        )
+        _emit(workflow.public_summary())
         return 0
     if args.command == "projects":
         _emit({key: value.check() for key, value in load_configured_projects(cycle.runtime_dir).items()})
