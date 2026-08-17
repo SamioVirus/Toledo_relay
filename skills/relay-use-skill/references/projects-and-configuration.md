@@ -21,6 +21,8 @@ The source must have a committed revision and be clean before an implementation 
 
 ## Register a project
 
+The packaged `toledo` project is intentionally an unconfigured placeholder. It is not an operating target: register an actual repository before running a workflow. The saved definition belongs in Relay's runtime configuration directory, so configuring a project does not modify the source checkout.
+
 Use `project-add` to save a runtime-local project definition:
 
 ```powershell

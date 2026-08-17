@@ -219,7 +219,7 @@ Hand this to the implementing agent (Codex Field Operator, a Claude Code session
 
 You are implementing the approved plan in the sections above.
 
-Repo: `C:\Users\sammo\src\toledo-orchestrator` - stdlib-only Python plus a vanilla-JS UI. Byte contract: UTF-8 without BOM, atomic temp-file plus `os.replace` writes, never shell-redirect bytes. Commit to `main`, then `git push origin main` (the OneDrive bare mirror is the backup).
+Repo: `<repo-root>` - stdlib-only Python plus a vanilla-JS UI. Byte contract: UTF-8 without BOM, atomic temp-file plus `os.replace` writes, never shell-redirect bytes. Commit to a task branch and push the canonical GitHub remote after review.
 
 ### Non-negotiable constraints
 

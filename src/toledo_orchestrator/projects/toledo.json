@@ -1,40 +1,10 @@
 {
   "id": "toledo",
-  "root": "C:\\Users\\sammo\\OneDrive\\Documents\\Toledo",
+  "root": "C:\\path\\to\\your\\repo",
   "read_only": true,
   "implementation": {
-    "enabled": true,
-    "write_allowlist": [
-      "."
-    ],
-    "evidence_exclude_paths": [
-      ".relay-tmp",
-      ".pytest-tmp-codex",
-      "t",
-      "d",
-      "r"
-    ],
-    "commit_on_accept": true,
-    "allow_no_validations": false,
-    "validation_requires_approval": true
+    "enabled": false
   },
-  "instruction_files": [
-    "AGENTS.md",
-    "docs/agent-control/65-transport-first-orchestrator-implementation-plan.md",
-    "docs/agent-control/66-session-aware-continuous-orchestrator.md"
-  ],
-  "validations": [
-    {
-      "id": "unit-tests",
-      "command": "python -m pytest -q",
-      "environment": "local",
-      "required": true
-    },
-    {
-      "id": "compose-config",
-      "command": "docker compose config",
-      "environment": "vps",
-      "required": false
-    }
-  ]
+  "instruction_files": [],
+  "validations": []
 }
