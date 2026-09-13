@@ -2871,6 +2871,15 @@ def test_create_run_round_and_prompt_overrides_bind_to_run_snapshot(
     assert "Do exactly this." in planner_prompt
 
 
+def test_strict_transport_contract_uses_outcome_directive(tmp_path: Path, writable_project: ProjectDefinition):
+    app = make_cycle(tmp_path, writable_project, SessionAdapter("codex", []), SessionAdapter("claude", []))
+    run_id = app.create_run(b"Task", "test")
+    contract = app._prompt_file(app.state(run_id), "strict-contract.md")
+    assert '`ORCHESTRATOR_DIRECTIVE_V2: {"next":"VALUE"}`' in contract
+    assert "Choose `continue` only when a concrete unresolved issue" in contract
+    assert "Choose `ready` when the current stage's substantive work is accepted" in contract
+
+
 def test_create_run_rejects_bad_round_and_prompt_overrides(
     tmp_path: Path, writable_project: ProjectDefinition
 ):

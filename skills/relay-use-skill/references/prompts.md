@@ -20,6 +20,8 @@ Relay separates:
 
 The controller renders and snapshots exact transport bytes before generation. Provider session history is continuity, not authority. Later stages receive only declared context artifacts.
 
+The final transport directive must express the current stage outcome: use `continue` only for a concrete unresolved issue that needs the configured repair/revision path, and `ready` when the stage's work is accepted. Do not treat the directive example as a fixed `continue` instruction.
+
 ## Default prompt families
 
 Shared controller contracts:
